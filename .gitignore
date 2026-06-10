@@ -1,0 +1,27 @@
+.venv
+.vscode
+.idea/
+artifacts/
+Dataset/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environment / Secrets
+.env
+
+# Model Checkpoints & Logs
+*.pt
+*.pth
+*.ckpt
+logs/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

@@ -1,0 +1,115 @@
+experiment_name: piano_cover_v2_segment_diffusion
+seed: 7
+
+runtime:
+  work_dir: artifacts/piano_cover_v2_diffusion
+  autoencoder_work_dir: artifacts/piano_cover_v2_autoencoder
+  autoencoder_checkpoint:
+  num_workers: 4
+  log_every_steps: 20
+  save_every_steps: 500
+
+wandb:
+  enabled: true
+  project: piano-cover-v2
+  entity:
+  name:
+  group:
+  tags: []
+  mode: online
+
+dataset:
+  dataset_json: dataset.json
+  original_midi_dir: Dataset/original_midis/merged
+  piano_midi_dir: Dataset/pianos_midi
+  piano_to_performer_json: piano_to_performer.json
+  train_fraction: 0.9
+  val_fraction: 0.05
+  test_fraction: 0.05
+
+source_chunks:
+  window_seconds: 2.0
+  hop_seconds: 0.5
+  max_notes_per_chunk: 256
+  min_duration_seconds: 0.03
+  max_chunks_per_song: 512
+
+target_roll:
+  frame_seconds: 0.05
+  phrase_seconds: 1.28
+  phrase_hop_seconds: 0.64
+  pitch_min: 21
+  pitch_max: 108
+  min_duration_seconds: 0.03
+  max_phrases_per_song: 512
+  onset_threshold: 0.5
+  sustain_threshold: 0.5
+  pedal_threshold: 0.5
+
+source_model:
+  d_model: 256
+  note_feature_dim: 4
+  num_programs: 129
+  num_source_track_roles: 4
+  num_chunk_queries: 4
+  chunk_encoder_layers: 2
+  song_encoder_layers: 4
+  num_heads: 4
+  ff_multiplier: 4
+  dropout: 0.1
+
+autoencoder_model:
+  d_model: 256
+  latent_dim: 64
+  num_latent_queries: 4
+  encoder_layers: 4
+  decoder_layers: 4
+  num_heads: 4
+  ff_multiplier: 4
+  dropout: 0.1
+  kl_beta: 1.0e-6
+  onset_positive_class_weight: 0.2
+  onset_negative_class_weight: 0.8
+  onset_loss_weight: 1.0
+  sustain_loss_weight: 1.0
+  pedal_loss_weight: 1.0
+  velocity_loss_weight: 1.0
+
+diffusion_model:
+  d_model: 256
+  latent_dim: 64
+  num_layers: 6
+  num_heads: 4
+  ff_multiplier: 4
+  dropout: 0.1
+  performer_dropout: 0.1
+  num_train_timesteps: 1000
+  beta_start: 1.0e-3
+  beta_end: 0.02
+  sampling_steps: 50
+
+autoencoder_training:
+  batch_size: 512
+  grad_accum_steps: 4
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-2
+  max_epochs: 200
+  max_steps:
+  max_steps_per_epoch: 2000
+  grad_clip_norm: 1.0
+  mixed_precision: bf16
+  pitch_shift_min_semitones: -5
+  pitch_shift_max_semitones: 5
+
+diffusion_training:
+  batch_size: 1
+  grad_accum_steps: 1
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-2
+  max_epochs: 200
+  max_steps:
+  max_steps_per_epoch:
+  grad_clip_norm: 1.0
+  mixed_precision: bf16
+  pitch_shift_min_semitones: 0
+  pitch_shift_max_semitones: 0
