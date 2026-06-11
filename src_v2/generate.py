@@ -7,13 +7,10 @@ from pathlib import Path
 import torch
 
 from src_v2.config import load_experiment_config
-from src_v2.data.segment import segment_grid_from_duration, segments_to_roll, roll_to_score
+from src_v2.data.segment import segment_grid_from_duration, roll_to_score
 from src_v2.data.midi import chunk_source_events, load_trimmed_source_events
 from src_v2.models.diffusion import ConditionalSegmentDiffusionModel
-from src_v2.models.segment_autoencoder import (
-    SegmentLatentAutoencoder,
-    decoder_outputs_to_segment_rolls,
-)
+from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +49,7 @@ def build_source_batch(source_midi_path: str, config, performer_id: int, device:
     # モデル入力用バッチの構築
     source_events = load_trimmed_source_events(source_midi_path, config.source_chunks)
     chunked = chunk_source_events(source_events, config.source_chunks)
-    
+
     # セグメント分割用グリッドの作成
     source_duration = max((event.end for event in source_events), default=config.target_roll.frame_seconds)
     segment_grid = segment_grid_from_duration(source_duration, config.target_roll)
@@ -70,7 +67,7 @@ def build_source_batch(source_midi_path: str, config, performer_id: int, device:
         "segment_mask": torch.ones((1, num_segments), dtype=torch.bool, device=device),
         "performer_ids": torch.tensor([performer_id], dtype=torch.long, device=device),
     }
-    return batch, segment_grid.num_frames
+    return batch, segment_grid
 
 
 def main() -> None:
@@ -117,7 +114,7 @@ def main() -> None:
     model.eval()
 
     # 6. 入力バッチの構築と推論（サンプリング＆デコード）の実行
-    batch, num_frames = build_source_batch(args.source_midi, config, performer_id, device)
+    batch, segment_grid = build_source_batch(args.source_midi, config, performer_id, device)
     latent_shape = (
         1,
         int(batch["segment_mask"].shape[1]),
@@ -129,20 +126,11 @@ def main() -> None:
         latents = model.sample(batch, latent_shape=latent_shape, sampling_steps=args.sampling_steps)
         # 潜在変数をオートエンコーダーでデコード
         decoded = autoencoder.decode(latents)
-        segment_times = batch["segment_times"][0].cpu()
-        
-        # デコードされた出力をセグメント単位のピアノロールに変換
-        recon_segment_rolls = decoder_outputs_to_segment_rolls(
+        recon_roll = autoencoder.reconstruct_roll(
             decoded,
-            config.autoencoder_model,
-            config.target_roll,
-        )[0].cpu()
-        # 各セグメントを結合し、全体のピアノロールに再構成
-        recon_roll = segments_to_roll(
-            recon_segment_rolls,
-            segment_times,
-            num_frames,
-            config.target_roll,
+            segment_grid.segment_times,
+            segment_grid.segment_valid_lengths,
+            segment_grid.num_frames,
         )
 
     # 7. 再構成されたピアノロールをMIDIスコアに変換して書き出し
@@ -158,7 +146,7 @@ def main() -> None:
         "performer_id": performer_id,
         "num_source_chunks": int(batch["source_chunk_mask"].sum().item()),
         "num_segments": int(batch["segment_mask"].sum().item()),
-        "num_frames": num_frames,
+        "num_frames": segment_grid.num_frames,
         "sampling_steps": args.sampling_steps or config.diffusion_model.sampling_steps,
         "output_midi": str(output_midi),
     }

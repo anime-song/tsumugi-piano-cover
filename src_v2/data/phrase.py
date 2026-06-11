@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from external.amt_model.models.interval_boundaries import PitchIntervalTargets
 from symusic import ControlChange, Note, Score, Tempo, TimeSignature, Track
 
 from src_v2.config import TargetRollConfig
@@ -14,6 +15,8 @@ from src_v2.data.midi import NoteEvent, load_trimmed_target_events
 class SegmentSong:
     segments: torch.Tensor
     segment_times: torch.Tensor
+    segment_valid_lengths: torch.Tensor
+    interval_targets: tuple[PitchIntervalTargets | None, ...]
     num_frames: int
     duration_seconds: float
 
@@ -105,26 +108,153 @@ def midi_to_target_roll(
     return roll
 
 
-def segment_grid_from_roll(roll: torch.Tensor, config: TargetRollConfig) -> SegmentSong:
+def _extract_note_intervals_from_events(
+    notes: list[NoteEvent],
+    config: TargetRollConfig,
+    num_frames: int,
+    max_time_seconds: float | None = None,
+    transpose_semitones: int = 0,
+) -> list[list[tuple[int, int]]]:
+    """NoteEventリストから直接、ピッチごとのフレーム区間を構築する。
+    ロールをスキャンする O(pitch_count × num_frames) のループを完全に排除。"""
+    pitch_count = config.pitch_count
+    intervals: list[list[tuple[int, int]]] = [[] for _ in range(pitch_count)]
+
+    for note in notes:
+        if max_time_seconds is not None and note.start > max_time_seconds:
+            continue
+        shifted_pitch = note.pitch + transpose_semitones
+        pitch_index = int(max(config.pitch_min, min(shifted_pitch, config.pitch_max)) - config.pitch_min)
+        if pitch_index < 0 or pitch_index >= pitch_count:
+            continue
+
+        start_frame = _frame_index(note.start, config.frame_seconds)
+        end_time = note.end if max_time_seconds is None else min(note.end, max_time_seconds)
+        # end_frame は sustain の最終フレーム（inclusive）
+        end_frame = max(start_frame, _frame_index(end_time, config.frame_seconds) - 1)
+        start_frame = min(start_frame, num_frames - 1)
+        end_frame = min(end_frame, num_frames - 1)
+
+        intervals[pitch_index].append((start_frame, end_frame))
+
+    # ピッチごとに開始フレーム順でソートし、重複する区間をマージ
+    for pitch_index in range(pitch_count):
+        raw = intervals[pitch_index]
+        if not raw:
+            continue
+        raw.sort()
+        merged: list[tuple[int, int]] = [raw[0]]
+        for start, end in raw[1:]:
+            prev_start, prev_end = merged[-1]
+            # onset が同じフレーム → 後続ノートの onset で先行ノートが切れる
+            if start == prev_start:
+                merged[-1] = (prev_start, max(prev_end, end))
+            elif start <= prev_end + 1:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        intervals[pitch_index] = merged
+
+    return intervals
+
+
+def _build_segment_interval_targets(
+    notes: list[NoteEvent],
+    num_frames: int,
+    start_frames: list[int],
+    valid_lengths: list[int],
+    config: TargetRollConfig,
+    max_time_seconds: float | None = None,
+    transpose_semitones: int = 0,
+) -> tuple[PitchIntervalTargets, ...]:
+    full_intervals = _extract_note_intervals_from_events(
+        notes, config, num_frames,
+        max_time_seconds=max_time_seconds,
+        transpose_semitones=transpose_semitones,
+    )
+    targets: list[PitchIntervalTargets] = []
+    pitch_start_indices = [0] * config.pitch_count
+
+    for start_frame, valid_length in zip(start_frames, valid_lengths, strict=True):
+        end_frame_exclusive = start_frame + valid_length
+        pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(config.pitch_count)]
+        has_onset: list[list[bool]] = [[] for _ in range(config.pitch_count)]
+        has_offset: list[list[bool]] = [[] for _ in range(config.pitch_count)]
+        onset_offsets: list[list[float]] = [[] for _ in range(config.pitch_count)]
+        offset_offsets: list[list[float]] = [[] for _ in range(config.pitch_count)]
+
+        for pitch_index, intervals in enumerate(full_intervals):
+            idx = pitch_start_indices[pitch_index]
+            while idx < len(intervals) and intervals[idx][1] < start_frame:
+                idx += 1
+            pitch_start_indices[pitch_index] = idx
+
+            for j in range(idx, len(intervals)):
+                interval_start, interval_end = intervals[j]
+                if interval_start >= end_frame_exclusive:
+                    break
+                local_start = max(interval_start, start_frame) - start_frame
+                local_end = min(interval_end, end_frame_exclusive - 1) - start_frame
+                pitch_intervals[pitch_index].append((local_start, local_end))
+                has_onset[pitch_index].append(interval_start >= start_frame)
+                has_offset[pitch_index].append(interval_end < end_frame_exclusive or interval_end >= num_frames - 1)
+                onset_offsets[pitch_index].append(0.0)
+                offset_offsets[pitch_index].append(0.0)
+
+        targets.append(
+            PitchIntervalTargets(
+                intervals=pitch_intervals,
+                has_onset=has_onset,
+                has_offset=has_offset,
+                onset_offsets=onset_offsets,
+                offset_offsets=offset_offsets,
+            )
+        )
+    return tuple(targets)
+
+
+def segment_grid_from_roll(
+    roll: torch.Tensor,
+    config: TargetRollConfig,
+    skip_intervals: bool = False,
+    notes: list[NoteEvent] | None = None,
+    max_time_seconds: float | None = None,
+    transpose_semitones: int = 0,
+) -> SegmentSong:
     num_frames = int(roll.shape[0])
 
     start_frames = compute_segment_start_frames(num_frames, config)
     frames_per_phrase = config.frames_per_phrase
 
     segments = torch.zeros((len(start_frames), frames_per_phrase, config.feature_dim), dtype=torch.float32)
+    valid_lengths: list[int] = []
 
     for segment_index, start_frame in enumerate(start_frames):
         end_frame = min(num_frames, start_frame + frames_per_phrase)
         window = roll[start_frame:end_frame]
         segments[segment_index, : window.shape[0]] = window
+        valid_lengths.append(int(window.shape[0]))
 
     segment_times = torch.tensor(
         [start_frame * config.frame_seconds for start_frame in start_frames], dtype=torch.float32
     )
+    segment_valid_lengths = torch.tensor(valid_lengths, dtype=torch.long)
+
+    if skip_intervals or notes is None:
+        interval_targets: tuple[PitchIntervalTargets | None, ...] = tuple([None] * len(start_frames))
+    else:
+        interval_targets = _build_segment_interval_targets(
+            notes, num_frames, start_frames, valid_lengths, config,
+            max_time_seconds=max_time_seconds,
+            transpose_semitones=transpose_semitones,
+        )
+
     duration_seconds = max(0.0, (num_frames - 1) * config.frame_seconds)
     return SegmentSong(
         segments=segments,
         segment_times=segment_times,
+        segment_valid_lengths=segment_valid_lengths,
+        interval_targets=interval_targets,
         num_frames=num_frames,
         duration_seconds=duration_seconds,
     )
@@ -135,6 +265,7 @@ def target_midi_to_segment_song(
     config: TargetRollConfig,
     max_time_seconds: float | None = None,
     transpose_semitones: int = 0,
+    skip_intervals: bool = False,
 ) -> SegmentSong:
     # MIDIからピアノロールへの変換とセグメント分割
     notes, pedals = load_trimmed_target_events(midi_path, min_duration_seconds=config.min_duration_seconds)
@@ -145,7 +276,13 @@ def target_midi_to_segment_song(
         max_time_seconds=max_time_seconds,
         transpose_semitones=transpose_semitones,
     )
-    return segment_grid_from_roll(roll, config)
+    return segment_grid_from_roll(
+        roll, config,
+        skip_intervals=skip_intervals,
+        notes=notes,
+        max_time_seconds=max_time_seconds,
+        transpose_semitones=transpose_semitones,
+    )
 
 
 def segment_grid_from_duration(duration_seconds: float, config: TargetRollConfig) -> SegmentSong:
@@ -189,7 +326,7 @@ def segments_to_roll(
         start_frame = _frame_index(float(segment_times[segment_index].item()), config.frame_seconds)
         end_frame = min(num_frames, start_frame + config.frames_per_phrase)
         window = segment_rolls[segment_index, : end_frame - start_frame]
-        
+
         frame_weights = _segment_center_weights(window.shape[0], window.device).unsqueeze(-1)
 
         merged[start_frame:end_frame, onset_slice] += window[:, onset_slice] * frame_weights
@@ -199,7 +336,7 @@ def segments_to_roll(
         )
         frame_weight_sum[start_frame:end_frame] += frame_weights
 
-        # velocityは発音中のフレームのみ加重平均
+        # velocity は発音中のフレームのみ加重平均
         note_weight = torch.maximum(window[:, onset_slice], window[:, sustain_slice])
         weighted_note_weight = note_weight * frame_weights
         velocity_sum[start_frame:end_frame] += window[:, velocity_slice] * weighted_note_weight
@@ -207,8 +344,8 @@ def segments_to_roll(
 
     merged[:, onset_slice] = merged[:, onset_slice] / frame_weight_sum.clamp_min(1.0e-6)
     merged[:, sustain_slice] = merged[:, sustain_slice] / frame_weight_sum.clamp_min(1.0e-6)
-    merged[:, pedal_index : pedal_index + 1] = (
-        merged[:, pedal_index : pedal_index + 1] / frame_weight_sum.clamp_min(1.0e-6)
+    merged[:, pedal_index : pedal_index + 1] = merged[:, pedal_index : pedal_index + 1] / frame_weight_sum.clamp_min(
+        1.0e-6
     )
     merged[:, velocity_slice] = velocity_sum / velocity_weight.clamp_min(1.0e-6)
     return merged.cpu()
