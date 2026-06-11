@@ -90,7 +90,7 @@ class SegmentLatentDenoiser(nn.Module):
         hidden = hidden + self.segment_time_projection(segment_times.unsqueeze(-1))
         hidden = hidden + self.time_embedding(timesteps).unsqueeze(1)
         hidden = hidden + self.performer_dropout(self.performer_embedding(performer_ids)).unsqueeze(1)
-        
+
         hidden = self.transformer(
             hidden,
             context=memory,
@@ -155,11 +155,11 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         # フォワードパス：ノイズ付与 (q(x_t | x_0))
         # latents, noise: [batch_size, num_segments, latent_dim]
         # timesteps: [batch_size]
-        
+
         # [batch_size] -> [batch_size, 1, 1]
         sqrt_alpha_bar = rearrange(self.sqrt_alpha_bars[timesteps], "b -> b 1 1")
         sqrt_one_minus_alpha_bar = rearrange(self.sqrt_one_minus_alpha_bars[timesteps], "b -> b 1 1")
-        
+
         # [batch_size, num_segments, latent_dim]
         return sqrt_alpha_bar * latents + sqrt_one_minus_alpha_bar * noise
 
@@ -190,13 +190,13 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         # === 1. 初期化と準備 ===
         device = batch["source_features"].device
         num_steps = sampling_steps or self.diffusion_config.sampling_steps
-        
+
         # 純粋なガウスノイズからスタート
         latents = torch.randn(latent_shape, device=device)
-        
+
         # 原曲のエンコード（全ステップで使い回すコンテキスト）
         memory, memory_mask = self.encode_source(batch)
-        
+
         # サンプリング用のタイムステップを計算 (T-1 から 0 へ)
         step_indices = torch.linspace(
             self.diffusion_config.num_train_timesteps - 1,
@@ -218,7 +218,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
                 memory=memory,
                 memory_mask=memory_mask,
             )
-            
+
             # 2-2. ノイズを除去した元の状態 (x0) を推定
             alpha_bar_t = self.alpha_bars[timestep]
             x0 = (latents - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)

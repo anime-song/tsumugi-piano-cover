@@ -53,7 +53,7 @@ class TargetRollConfig:
     min_duration_seconds: float = 0.03
     # 曲あたりの最大セグメント数
     max_phrases_per_song: int | None = None
-    # onset, sustain, pedalの閾値
+    # 評価時に使う onset / sustain / pedal の二値化閾値
     onset_threshold: float = 0.5
     sustain_threshold: float = 0.5
     pedal_threshold: float = 0.5
@@ -105,10 +105,12 @@ class SourceEncoderConfig:
 
 @dataclass
 class SegmentAutoencoderConfig:
+    # デコーダーのモード ("semi-crf" または "frame")
+    decoder_mode: str = "semi-crf"
     d_model: int = 256
     # 潜在表現（latent）の次元数
     latent_dim: int = 64
-    # 潜在クエリの数
+    # 潜在表現を集約するクエリ数
     num_latent_queries: int = 4
     encoder_layers: int = 4
     decoder_layers: int = 4
@@ -117,14 +119,35 @@ class SegmentAutoencoderConfig:
     dropout: float = 0.1
     # KL損失の重み
     kl_beta: float = 1.0e-4
-    # onsetのクラス不均衡調整用重み
-    onset_positive_class_weight: float = 0.3
-    onset_negative_class_weight: float = 0.7
-    # 各損失の重み係数
+    # 補助損失の重み
     onset_loss_weight: float = 1.0
     sustain_loss_weight: float = 1.0
     pedal_loss_weight: float = 1.0
     velocity_loss_weight: float = 1.0
+    # onset のクラス重み
+    onset_positive_class_weight: float = 0.5
+    onset_negative_class_weight: float = 0.5
+    # sustain のクラス重み
+    sustain_positive_class_weight: float = 0.5
+    sustain_negative_class_weight: float = 0.5
+    # semi-CRF 用の pitch/frame 特徴量次元
+    semi_crf_pitch_feature_dim: int = 64
+    # semi-CRF の query/key 次元
+    semi_crf_head_dim: int = 64
+    # 区間長に対するスコアリング方式
+    semi_crf_length_scaling: str = "linear"
+    semi_crf_length_penalty: float = 0.0
+    # note の事前バイアス
+    semi_crf_note_bias: float = 0.0
+    # pitch ごとのデコードを分割するバッチサイズ
+    semi_crf_track_batch_size: int = 128
+    # 区間見逃し / 誤検出に対するコスト
+    semi_crf_false_negative_cost: float = 0.0
+    semi_crf_false_positive_cost: float = 0.0
+    # 区間境界の onset / offset 存在を補助学習するか
+    use_interval_boundary_head: bool = True
+    # boundary loss の重み
+    interval_presence_loss_weight: float = 1.0
 
     @property
     def head_dim(self) -> int:
@@ -167,6 +190,10 @@ class RuntimeConfig:
     autoencoder_checkpoint: str | None = None
     # DataLoaderのワーカー数
     num_workers: int = 0
+    # Autoencoder 側だけ num_workers を上書きしたい場合に使う
+    autoencoder_num_workers: int | None = None
+    # Autoencoder dataset 内で保持する song 単位の LRU cache 数
+    autoencoder_max_cached_songs: int | None = 16
     log_every_steps: int = 20
     # 保存ステップ間隔
     save_every_steps: int = 500

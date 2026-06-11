@@ -11,13 +11,9 @@ from src_v2.data.segment import (
     midi_to_target_roll,
     roll_to_score,
     segment_grid_from_roll,
-    segments_to_roll,
 )
 from src_v2.data.midi import load_trimmed_target_events
-from src_v2.models.segment_autoencoder import (
-    SegmentLatentAutoencoder,
-    decoder_outputs_to_segment_rolls,
-)
+from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,16 +88,11 @@ def main() -> None:
     segments = segment_song.segments.unsqueeze(0).to(device)
     with torch.no_grad():
         outputs = model(segments, sample_posterior=args.sample_posterior, variational=use_variational)
-        recon_segment_rolls = decoder_outputs_to_segment_rolls(outputs, config.autoencoder_model, config.target_roll)[
-            0
-        ].cpu()
-
-    # セグメントを結合してピアノロールを再構成
-    recon_roll = segments_to_roll(
-        recon_segment_rolls,
+    recon_roll = model.reconstruct_roll(
+        outputs,
         segment_song.segment_times,
+        segment_song.segment_valid_lengths,
         segment_song.num_frames,
-        config.target_roll,
     )
 
     # MIDIファイルへ出力

@@ -158,7 +158,7 @@ def load_training_checkpoint(
         f"loaded checkpoint path={path} saved_epoch={saved_epoch} resume_epoch={start_epoch} "
         f"resume_batch={start_batch_index} step={global_step} best_val_loss={best_text}"
     )
-    
+
     # 予約キー以外の追加状態を取得
     reserved = {
         "model_state",
@@ -208,7 +208,7 @@ def build_splits(
     train_pairs = splits["train"]
     val_pairs = splits["val"]
     test_pairs = splits["test"]
-    
+
     if limit_train_pairs is not None:
         train_pairs = train_pairs[:limit_train_pairs]
     if limit_val_pairs is not None:

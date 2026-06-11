@@ -271,6 +271,7 @@ class Transformer(nn.Module):
 
         for blocks in self.layers:
             if use_gradient_checkpointing:
+
                 def custom_forward(hidden: torch.Tensor) -> torch.Tensor:
                     return self._forward_layer(
                         blocks=blocks,

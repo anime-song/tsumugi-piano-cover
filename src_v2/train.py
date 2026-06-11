@@ -81,7 +81,7 @@ def run_validation(
             batch = move_batch_to_device(batch, device)
             # ピアノカバーを潜在表現にエンコード
             latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
-            
+
             timesteps = torch.randint(
                 0,
                 config.diffusion_model.num_train_timesteps,
@@ -90,7 +90,7 @@ def run_validation(
                 dtype=torch.long,
             )
             noise = torch.randn_like(latents)
-            
+
             noisy_latents = model.q_sample(latents, timesteps, noise)
             predicted_noise = model(batch, noisy_latents, timesteps)
             loss = diffusion_mse_loss(predicted_noise, noise, batch["segment_mask"])
@@ -125,7 +125,7 @@ def main() -> None:
         # フリーズされたオートエンコーダーのロード
         autoencoder_checkpoint = resolve_autoencoder_checkpoint(config, args.autoencoder_checkpoint)
         autoencoder = load_frozen_autoencoder(config, autoencoder_checkpoint, device)
-        
+
         model = ConditionalSegmentDiffusionModel(config.source_model, config.diffusion_model, performer_vocab_size).to(
             device
         )
@@ -135,7 +135,7 @@ def main() -> None:
             lr=config.diffusion_training.learning_rate,
             weight_decay=config.diffusion_training.weight_decay,
         )
-        
+
         # GradScalerの初期化
         scaler = torch.amp.GradScaler(
             "cuda", enabled=device.type == "cuda" and config.diffusion_training.mixed_precision == "fp16"
@@ -226,7 +226,7 @@ def main() -> None:
                     stopped_by_epoch_step_limit = True
                     break
                 batch = move_batch_to_device(batch, device)
-                
+
                 # ピアノロールを潜在表現にエンコード
                 with torch.no_grad():
                     latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
