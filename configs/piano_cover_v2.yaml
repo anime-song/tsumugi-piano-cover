@@ -7,7 +7,7 @@ runtime:
   autoencoder_checkpoint:
   num_workers: 4
   autoencoder_num_workers: 4
-  autoencoder_max_cached_songs: null
+  autoencoder_max_cached_songs: 32
   log_every_steps: 20
   save_every_steps: 500
 
