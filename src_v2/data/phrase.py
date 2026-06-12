@@ -16,7 +16,7 @@ class SegmentSong:
     segments: torch.Tensor
     segment_times: torch.Tensor
     segment_valid_lengths: torch.Tensor
-    interval_targets: tuple[PitchIntervalTargets | None, ...]
+    full_intervals: tuple[list[tuple[int, int]], ...] | None
     num_frames: int
     duration_seconds: float
 
@@ -158,59 +158,6 @@ def _extract_note_intervals_from_events(
     return intervals
 
 
-def _build_segment_interval_targets(
-    notes: list[NoteEvent],
-    num_frames: int,
-    start_frames: list[int],
-    valid_lengths: list[int],
-    config: TargetRollConfig,
-    max_time_seconds: float | None = None,
-    transpose_semitones: int = 0,
-) -> tuple[PitchIntervalTargets, ...]:
-    full_intervals = _extract_note_intervals_from_events(
-        notes, config, num_frames,
-        max_time_seconds=max_time_seconds,
-        transpose_semitones=transpose_semitones,
-    )
-    targets: list[PitchIntervalTargets] = []
-    pitch_start_indices = [0] * config.pitch_count
-
-    for start_frame, valid_length in zip(start_frames, valid_lengths, strict=True):
-        end_frame_exclusive = start_frame + valid_length
-        pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(config.pitch_count)]
-        has_onset: list[list[bool]] = [[] for _ in range(config.pitch_count)]
-        has_offset: list[list[bool]] = [[] for _ in range(config.pitch_count)]
-        onset_offsets: list[list[float]] = [[] for _ in range(config.pitch_count)]
-        offset_offsets: list[list[float]] = [[] for _ in range(config.pitch_count)]
-
-        for pitch_index, intervals in enumerate(full_intervals):
-            idx = pitch_start_indices[pitch_index]
-            while idx < len(intervals) and intervals[idx][1] < start_frame:
-                idx += 1
-            pitch_start_indices[pitch_index] = idx
-
-            for j in range(idx, len(intervals)):
-                interval_start, interval_end = intervals[j]
-                if interval_start >= end_frame_exclusive:
-                    break
-                local_start = max(interval_start, start_frame) - start_frame
-                local_end = min(interval_end, end_frame_exclusive - 1) - start_frame
-                pitch_intervals[pitch_index].append((local_start, local_end))
-                has_onset[pitch_index].append(interval_start >= start_frame)
-                has_offset[pitch_index].append(interval_end < end_frame_exclusive or interval_end >= num_frames - 1)
-                onset_offsets[pitch_index].append(0.0)
-                offset_offsets[pitch_index].append(0.0)
-
-        targets.append(
-            PitchIntervalTargets(
-                intervals=pitch_intervals,
-                has_onset=has_onset,
-                has_offset=has_offset,
-                onset_offsets=onset_offsets,
-                offset_offsets=offset_offsets,
-            )
-        )
-    return tuple(targets)
 
 
 def segment_grid_from_roll(
@@ -241,10 +188,10 @@ def segment_grid_from_roll(
     segment_valid_lengths = torch.tensor(valid_lengths, dtype=torch.long)
 
     if skip_intervals or notes is None:
-        interval_targets: tuple[PitchIntervalTargets | None, ...] = tuple([None] * len(start_frames))
+        full_intervals = None
     else:
-        interval_targets = _build_segment_interval_targets(
-            notes, num_frames, start_frames, valid_lengths, config,
+        full_intervals = _extract_note_intervals_from_events(
+            notes, config, num_frames,
             max_time_seconds=max_time_seconds,
             transpose_semitones=transpose_semitones,
         )
@@ -254,7 +201,7 @@ def segment_grid_from_roll(
         segments=segments,
         segment_times=segment_times,
         segment_valid_lengths=segment_valid_lengths,
-        interval_targets=interval_targets,
+        full_intervals=full_intervals,
         num_frames=num_frames,
         duration_seconds=duration_seconds,
     )

@@ -165,58 +165,80 @@ class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
         shifted_segment[:, -1] = segment[:, -1]
         return shifted_segment
 
-    def _transpose_interval_targets(
+    def _extract_single_segment_interval_targets(
         self,
-        targets: PitchIntervalTargets,
+        full_intervals: tuple[list[tuple[int, int]], ...],
+        start_frame: int,
+        valid_length: int,
+        num_frames: int,
         shift: int,
     ) -> PitchIntervalTargets:
-        if shift == 0:
-            return targets
+        end_frame_exclusive = start_frame + valid_length
+        config = self.target_roll_config
+        pitch_count = config.pitch_count
 
-        pitch_count = self.target_roll_config.pitch_count
-        empty_intervals: list[list[tuple[int, int]]] = [[] for _ in range(pitch_count)]
-        empty_flags: list[list[bool]] = [[] for _ in range(pitch_count)]
-        empty_offsets: list[list[float]] = [[] for _ in range(pitch_count)]
+        pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(pitch_count)]
+        has_onset: list[list[bool]] = [[] for _ in range(pitch_count)]
+        has_offset: list[list[bool]] = [[] for _ in range(pitch_count)]
+        onset_offsets: list[list[float]] = [[] for _ in range(pitch_count)]
+        offset_offsets: list[list[float]] = [[] for _ in range(pitch_count)]
 
-        shifted_intervals = [list(track) for track in empty_intervals]
-        shifted_has_onset = [list(track) for track in empty_flags]
-        shifted_has_offset = [list(track) for track in empty_flags]
-        shifted_onset_offsets = [list(track) for track in empty_offsets]
-        shifted_offset_offsets = [list(track) for track in empty_offsets]
-
-        for pitch_index in range(pitch_count):
+        for pitch_index, intervals in enumerate(full_intervals):
             shifted_pitch_index = pitch_index + shift
             if not (0 <= shifted_pitch_index < pitch_count):
                 continue
-            shifted_intervals[shifted_pitch_index] = list(targets.intervals[pitch_index])
-            shifted_has_onset[shifted_pitch_index] = list(targets.has_onset[pitch_index])
-            shifted_has_offset[shifted_pitch_index] = list(targets.has_offset[pitch_index])
-            shifted_onset_offsets[shifted_pitch_index] = list(targets.onset_offsets[pitch_index])
-            shifted_offset_offsets[shifted_pitch_index] = list(targets.offset_offsets[pitch_index])
 
+            for interval_start, interval_end in intervals:
+                if interval_end < start_frame:
+                    continue
+                if interval_start >= end_frame_exclusive:
+                    break
+                local_start = max(interval_start, start_frame) - start_frame
+                local_end = min(interval_end, end_frame_exclusive - 1) - start_frame
+                pitch_intervals[shifted_pitch_index].append((local_start, local_end))
+                has_onset[shifted_pitch_index].append(interval_start >= start_frame)
+                has_offset[shifted_pitch_index].append(interval_end < end_frame_exclusive or interval_end >= num_frames - 1)
+                onset_offsets[shifted_pitch_index].append(0.0)
+                offset_offsets[shifted_pitch_index].append(0.0)
+
+        from external.amt_model.models.interval_boundaries import PitchIntervalTargets
         return PitchIntervalTargets(
-            intervals=shifted_intervals,
-            has_onset=shifted_has_onset,
-            has_offset=shifted_has_offset,
-            onset_offsets=shifted_onset_offsets,
-            offset_offsets=shifted_offset_offsets,
+            intervals=pitch_intervals,
+            has_onset=has_onset,
+            has_offset=has_offset,
+            onset_offsets=onset_offsets,
+            offset_offsets=offset_offsets,
         )
 
     def __getitem__(self, index: int) -> AutoencoderSegmentSample:
         entry, segment_index = self.samples[index]
         segment_song = self._get_segment_song(entry)
         segment = segment_song.segments[segment_index]
-        interval_targets = segment_song.interval_targets[segment_index]
         shift = self._sample_pitch_shift(segment)
         segment = self._transpose_segment_tensors(segment, shift)
-        if interval_targets is not None:
-            interval_targets = self._transpose_interval_targets(interval_targets, shift)
+
+        segment_time = float(segment_song.segment_times[segment_index].item())
+        valid_length = int(segment_song.segment_valid_lengths[segment_index].item())
+
+        if segment_song.full_intervals is not None:
+            # セグメント開始時間をフレームインデックスに変換して区間を切り出す
+            start_frame = max(0, int(round(segment_time / self.target_roll_config.frame_seconds)))
+            interval_targets = self._extract_single_segment_interval_targets(
+                full_intervals=segment_song.full_intervals,
+                start_frame=start_frame,
+                valid_length=valid_length,
+                num_frames=segment_song.num_frames,
+                shift=shift,
+            )
+        else:
+            interval_targets = None
+
         return AutoencoderSegmentSample(
             song_name=entry.song_name,
             piano_id=entry.piano_id,
             segment=segment,
-            segment_time=float(segment_song.segment_times[segment_index].item()),
-            segment_valid_length=int(segment_song.segment_valid_lengths[segment_index].item()),
+            segment_time=segment_time,
+            segment_valid_length=valid_length,
             interval_targets=interval_targets,
         )
 
@@ -240,20 +262,26 @@ class SegmentSongBatchSampler(Sampler[list[int]]):
         if self.shuffle:
             random.shuffle(song_keys)
 
-        batches: list[list[int]] = []
-        for song_key in song_keys:
-            indices = list(self.dataset.song_to_sample_indices[song_key])
-            if self.shuffle:
-                random.shuffle(indices)
-            for offset in range(0, len(indices), self.batch_size):
-                batch = indices[offset : offset + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                batches.append(batch)
+        # キャッシュヒット率向上のため、曲のリストを一定サイズ(chunk)ごとに処理
+        # キャッシュサイズ(max_cached_songs)の半分程度、指定がなければ8とする
+        chunk_size = max(1, self.dataset.max_cached_songs // 2) if self.dataset.max_cached_songs else 8
 
-        if self.shuffle:
-            random.shuffle(batches)
-        yield from batches
+        for i in range(0, len(song_keys), chunk_size):
+            chunk_keys = song_keys[i : i + chunk_size]
+            chunk_batches: list[list[int]] = []
+            for song_key in chunk_keys:
+                indices = list(self.dataset.song_to_sample_indices[song_key])
+                if self.shuffle:
+                    random.shuffle(indices)
+                for offset in range(0, len(indices), self.batch_size):
+                    batch = indices[offset : offset + self.batch_size]
+                    if len(batch) < self.batch_size and self.drop_last:
+                        continue
+                    chunk_batches.append(batch)
+
+            if self.shuffle:
+                random.shuffle(chunk_batches)
+            yield from chunk_batches
 
     def __len__(self) -> int:
         total = 0
@@ -310,7 +338,7 @@ class SegmentDiffusionDataset(Dataset[DiffusionSongSample]):
 
 def collate_autoencoder_samples(
     samples: list[AutoencoderSegmentSample],
-) -> dict[str, torch.Tensor | list[str] | list[PitchIntervalTargets]]:
+) -> dict[str, torch.Tensor | list[str] | list[PitchIntervalTargets | None]]:
     batch_size = len(samples)
     frames_per_segment = samples[0].segment.shape[0]
     feature_dim = samples[0].segment.shape[1]
@@ -395,3 +423,4 @@ def collate_diffusion_samples(samples: list[DiffusionSongSample]) -> dict[str, t
         "performer_ids": performer_ids,
         "metadata": metadata,
     }
+
