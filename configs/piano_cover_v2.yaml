@@ -7,7 +7,7 @@ runtime:
   autoencoder_checkpoint:
   num_workers: 4
   autoencoder_num_workers: 4
-  autoencoder_max_cached_songs: 16
+  autoencoder_max_cached_songs: null
   log_every_steps: 20
   save_every_steps: 500
 
@@ -84,7 +84,7 @@ autoencoder_model:
   semi_crf_length_scaling: linear
   semi_crf_length_penalty: 0.0
   semi_crf_note_bias: 0.0
-  semi_crf_track_batch_size: 512
+  semi_crf_track_batch_size: 8192
   semi_crf_false_negative_cost: 0.0
   semi_crf_false_positive_cost: 0.0
   use_interval_boundary_head: true
