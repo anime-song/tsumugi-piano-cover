@@ -160,6 +160,8 @@ class SegmentAutoencoderConfig:
 class DiffusionConfig:
     d_model: int = 256
     latent_dim: int = 64
+    # Diffusionの予測対象 ("epsilon" または "v")
+    prediction_type: str = "epsilon"
     num_layers: int = 6
     num_heads: int = 4
     ff_multiplier: int = 4
@@ -228,6 +230,10 @@ class TrainingConfig:
     # ピッチシフトの範囲（半音）
     pitch_shift_min_semitones: int = 0
     pitch_shift_max_semitones: int = 0
+    # 学習率スケジューラー
+    lr_scheduler_type: str = "cosine_with_warmup"
+    lr_warmup_steps: int = 1000
+    lr_min: float = 1.0e-6
 
 
 @dataclass
@@ -280,7 +286,32 @@ def _build_dataclass(cls: type[T], data: dict[str, Any]) -> T:
     return cls(**kwargs)
 
 
+def _validate_experiment_config(config: ExperimentConfig) -> None:
+    # 0. Diffusionの予測対象が対応済みの方式か確認
+    if config.diffusion_model.prediction_type not in {"epsilon", "v"}:
+        raise ValueError(
+            "diffusion_model.prediction_type must be one of {'epsilon', 'v'}: "
+            f"{config.diffusion_model.prediction_type!r}"
+        )
+
+    # 1. オートエンコーダーとDiffusionで潜在次元が一致しているか確認
+    if config.autoencoder_model.latent_dim != config.diffusion_model.latent_dim:
+        raise ValueError(
+            "autoencoder_model.latent_dim and diffusion_model.latent_dim must match: "
+            f"{config.autoencoder_model.latent_dim} != {config.diffusion_model.latent_dim}"
+        )
+
+    # 2. 原曲エンコーダーとDiffusionで隠れ次元が一致しているか確認
+    if config.source_model.d_model != config.diffusion_model.d_model:
+        raise ValueError(
+            "source_model.d_model and diffusion_model.d_model must match: "
+            f"{config.source_model.d_model} != {config.diffusion_model.d_model}"
+        )
+
+
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
     # YAMLファイルから設定をロード
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    return _build_dataclass(ExperimentConfig, raw)
+    config = _build_dataclass(ExperimentConfig, raw)
+    _validate_experiment_config(config)
+    return config

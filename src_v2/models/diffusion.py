@@ -71,7 +71,7 @@ class SegmentLatentDenoiser(nn.Module):
     ) -> torch.Tensor:
         """
         ノイズが付加された潜在表現に対し、各種条件（時間、ノイズステップ、演奏者、原曲）を加味して
-        ノイズ（または元データ）を予測する順伝播処理。
+        Diffusion学習で使うターゲット（epsilon または velocity）を予測する順伝播処理。
 
         Args:
             noisy_latents: ノイズが付与されたセグメントの潜在表現 [batch_size, num_segments, latent_dim]
@@ -83,7 +83,7 @@ class SegmentLatentDenoiser(nn.Module):
             memory_mask: memoryの有効な要素を示すマスク [batch_size, memory_length]
 
         Returns:
-            予測されたノイズ（または復元された潜在表現） [batch_size, num_segments, latent_dim]
+            予測されたDiffusionターゲット [batch_size, num_segments, latent_dim]
         """
         hidden = self.input_projection(noisy_latents)
         # 条件の埋め込みを加算
@@ -151,17 +151,64 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         )
         return memory, batch["source_chunk_mask"]
 
+    def _expand_noise_scales(self, timesteps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # [batch_size] の時刻インデックスを [batch_size, 1, 1] の係数へ展開
+        sqrt_alpha_bar = rearrange(self.sqrt_alpha_bars[timesteps], "b -> b 1 1")
+        sqrt_one_minus_alpha_bar = rearrange(self.sqrt_one_minus_alpha_bars[timesteps], "b -> b 1 1")
+        return sqrt_alpha_bar, sqrt_one_minus_alpha_bar
+
     def q_sample(self, latents: torch.Tensor, timesteps: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         # フォワードパス：ノイズ付与 (q(x_t | x_0))
         # latents, noise: [batch_size, num_segments, latent_dim]
         # timesteps: [batch_size]
 
         # [batch_size] -> [batch_size, 1, 1]
-        sqrt_alpha_bar = rearrange(self.sqrt_alpha_bars[timesteps], "b -> b 1 1")
-        sqrt_one_minus_alpha_bar = rearrange(self.sqrt_one_minus_alpha_bars[timesteps], "b -> b 1 1")
-
+        sqrt_alpha_bar, sqrt_one_minus_alpha_bar = self._expand_noise_scales(timesteps)
         # [batch_size, num_segments, latent_dim]
         return sqrt_alpha_bar * latents + sqrt_one_minus_alpha_bar * noise
+
+    def compute_training_target(
+        self,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        # 学習ターゲットを prediction_type に応じて組み立てる
+        sqrt_alpha_bar, sqrt_one_minus_alpha_bar = self._expand_noise_scales(timesteps)
+
+        # 1. epsilon-pred は加えたノイズそのものを当てる
+        if self.diffusion_config.prediction_type == "epsilon":
+            return noise
+
+        # 2. v-pred は v = alpha_t * epsilon - sigma_t * x0 を当てる
+        if self.diffusion_config.prediction_type == "v":
+            return sqrt_alpha_bar * noise - sqrt_one_minus_alpha_bar * latents
+
+        raise ValueError(f"unsupported prediction_type: {self.diffusion_config.prediction_type!r}")
+
+    def predict_x0_and_noise(
+        self,
+        noisy_latents: torch.Tensor,
+        model_output: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # モデル出力から x0 と epsilon を復元する
+        sqrt_alpha_bar, sqrt_one_minus_alpha_bar = self._expand_noise_scales(timesteps)
+
+        # 1. epsilon-pred は出力がそのまま epsilon
+        if self.diffusion_config.prediction_type == "epsilon":
+            pred_noise = model_output
+            pred_x0 = (noisy_latents - sqrt_one_minus_alpha_bar * pred_noise) / sqrt_alpha_bar
+            return pred_x0, pred_noise
+
+        # 2. v-pred は出力を v とみなし、x0 と epsilon に戻す
+        if self.diffusion_config.prediction_type == "v":
+            pred_v = model_output
+            pred_x0 = sqrt_alpha_bar * noisy_latents - sqrt_one_minus_alpha_bar * pred_v
+            pred_noise = sqrt_one_minus_alpha_bar * noisy_latents + sqrt_alpha_bar * pred_v
+            return pred_x0, pred_noise
+
+        raise ValueError(f"unsupported prediction_type: {self.diffusion_config.prediction_type!r}")
 
     def forward(
         self,
@@ -209,7 +256,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         for step_pos, timestep in enumerate(step_indices):
             # 2-1. ノイズの予測
             timestep_batch = torch.full((latent_shape[0],), int(timestep.item()), device=device, dtype=torch.long)
-            pred_noise = self.denoiser(
+            model_output = self.denoiser(
                 noisy_latents=latents,
                 segment_times=batch["segment_times"],
                 segment_mask=batch["segment_mask"],
@@ -218,19 +265,17 @@ class ConditionalSegmentDiffusionModel(nn.Module):
                 memory=memory,
                 memory_mask=memory_mask,
             )
+            pred_x0, pred_noise = self.predict_x0_and_noise(latents, model_output, timestep_batch)
 
             # 2-2. ノイズを除去した元の状態 (x0) を推定
-            alpha_bar_t = self.alpha_bars[timestep]
-            x0 = (latents - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
-
             # 最終ステップの場合は、推定した x0 をそのまま最終結果とする
             if step_pos == len(step_indices) - 1:
-                latents = x0
+                latents = pred_x0
                 break
 
             # 2-3. 次のステップのノイズレベルに合わせて状態 (x_t-1) を計算
             next_timestep = step_indices[step_pos + 1]
             alpha_bar_next = self.alpha_bars[next_timestep]
-            latents = torch.sqrt(alpha_bar_next) * x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
+            latents = torch.sqrt(alpha_bar_next) * pred_x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
 
         return latents
