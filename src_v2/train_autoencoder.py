@@ -22,6 +22,7 @@ from src_v2.train_common import (
     resolve_device,
     save_checkpoint,
     skip_to_batch,
+    build_lr_scheduler,
 )
 from src_v2.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
 
@@ -209,52 +210,9 @@ def main() -> None:
 
         # 初期重みのロード（aeの事前学習モデル、または指定チェックポイント）
         init_checkpoint = resolve_stage_init_checkpoint(config, args.init_from, args.stage)
-        if args.resume_from is None and init_checkpoint is not None:
+        if init_checkpoint is not None and args.resume_from is None:
             load_model_weights(model, init_checkpoint, device, encoder_only=args.init_encoder_only)
 
-        optimizer = AdamW(
-            model.parameters(),
-            lr=config.autoencoder_training.learning_rate,
-            weight_decay=config.autoencoder_training.weight_decay,
-        )
-
-        # 混合精度用のGradScalerの初期化
-        scaler = torch.amp.GradScaler(
-            "cuda", enabled=device.type == "cuda" and config.autoencoder_training.mixed_precision == "fp16"
-        )
-
-        resume_state = ResumeState()
-        if args.resume_from is not None:
-            resume_state, _ = load_training_checkpoint(
-                Path(args.resume_from).expanduser(),
-                model,
-                optimizer,
-                scaler,
-                device,
-            )
-
-        print(f"experiment={config.experiment_name}")
-        print(f"stage={args.stage}")
-        print(f"device={device}")
-        print(f"train_pairs={len(train_pairs)}")
-        print(f"val_pairs={len(val_pairs)}")
-        print(f"test_pairs={len(test_pairs)}")
-        print(f"autoencoder_parameters={sum(parameter.numel() for parameter in model.parameters())}")
-        if init_checkpoint is not None and args.resume_from is None:
-            print(f"initialized_from={init_checkpoint}")
-
-        update_wandb_summary(
-            wandb_run,
-            autoencoder_stage=args.stage,
-            train_pairs=len(train_pairs),
-            val_pairs=len(val_pairs),
-            test_pairs=len(test_pairs),
-            autoencoder_parameters=sum(parameter.numel() for parameter in model.parameters()),
-            device=str(device),
-        )
-
-        if args.dry_run:
-            return
         autoencoder_num_workers = (
             config.runtime.autoencoder_num_workers
             if config.runtime.autoencoder_num_workers is not None
@@ -306,6 +264,59 @@ def main() -> None:
             persistent_workers=autoencoder_num_workers > 0,
             collate_fn=collate_autoencoder_samples,
         )
+
+        optimizer = AdamW(
+            model.parameters(),
+            lr=config.autoencoder_training.learning_rate,
+            weight_decay=config.autoencoder_training.weight_decay,
+        )
+
+        # 混合精度用のGradScalerの初期化
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=device.type == "cuda" and config.autoencoder_training.mixed_precision == "fp16"
+        )
+
+        import math
+        total_steps = config.autoencoder_training.max_steps
+        if total_steps is None:
+            steps_per_epoch = math.ceil(len(train_loader) / config.autoencoder_training.grad_accum_steps)
+            total_steps = steps_per_epoch * config.autoencoder_training.max_epochs
+
+        scheduler = build_lr_scheduler(optimizer, config.autoencoder_training, total_steps)
+
+        resume_state = ResumeState()
+        if args.resume_from is not None:
+            resume_state, _ = load_training_checkpoint(
+                Path(args.resume_from).expanduser(),
+                model,
+                optimizer,
+                scaler,
+                device,
+                scheduler=scheduler,
+            )
+
+        print(f"experiment={config.experiment_name}")
+        print(f"stage={args.stage}")
+        print(f"device={device}")
+        print(f"train_pairs={len(train_pairs)}")
+        print(f"val_pairs={len(val_pairs)}")
+        print(f"test_pairs={len(test_pairs)}")
+        print(f"autoencoder_parameters={sum(parameter.numel() for parameter in model.parameters())}")
+        if init_checkpoint is not None and args.resume_from is None:
+            print(f"initialized_from={init_checkpoint}")
+
+        update_wandb_summary(
+            wandb_run,
+            autoencoder_stage=args.stage,
+            train_pairs=len(train_pairs),
+            val_pairs=len(val_pairs),
+            test_pairs=len(test_pairs),
+            autoencoder_parameters=sum(parameter.numel() for parameter in model.parameters()),
+            device=str(device),
+        )
+
+        if args.dry_run:
+            return
 
         # 再開バッチ位置の調整
         if resume_state.start_batch_index == len(train_loader):
@@ -423,6 +434,10 @@ def main() -> None:
                         scaler.update()
                     else:
                         optimizer.step()
+                    
+                    if scheduler is not None:
+                        scheduler.step()
+
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     epoch_step_count += 1
@@ -487,6 +502,7 @@ def main() -> None:
                             next_batch_index,
                             "last",
                             extra_state={"autoencoder_stage": args.stage},
+                            scheduler=scheduler,
                         )
 
                     if args.max_steps is not None and global_step >= args.max_steps:
@@ -509,6 +525,10 @@ def main() -> None:
                     scaler.update()
                 else:
                     optimizer.step()
+                
+                if scheduler is not None:
+                    scheduler.step()
+
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
@@ -538,6 +558,7 @@ def main() -> None:
                 0,
                 "last",
                 extra_state={"autoencoder_stage": args.stage},
+                scheduler=scheduler,
             )
             # ベストロスの更新による保存
             if is_best:
@@ -554,6 +575,7 @@ def main() -> None:
                     0,
                     "best",
                     extra_state={"autoencoder_stage": args.stage},
+                    scheduler=scheduler,
                 )
 
             # CUDAキャッシュをクリアしてメモリの断片化を防止

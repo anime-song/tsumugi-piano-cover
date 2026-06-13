@@ -7,9 +7,11 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from tqdm.auto import tqdm
+import math
 
-from src_v2.config import ExperimentConfig
+from src_v2.config import ExperimentConfig, TrainingConfig
 from src_v2.data.index import PairEntry, build_pair_index, split_pairs_by_song
 
 
@@ -44,6 +46,31 @@ def clear_cuda_cache(device: torch.device, epoch: int) -> None:
         return
     torch.cuda.empty_cache()
     tqdm.write(f"cleared cuda cache after epoch={epoch}")
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+    total_steps: int,
+) -> LRScheduler | None:
+    # 学習率スケジューラーの構築
+    if config.lr_scheduler_type == "none":
+        return None
+        
+    if config.lr_scheduler_type == "cosine_with_warmup":
+        warmup_steps = config.lr_warmup_steps
+        lr_min_ratio = config.lr_min / config.learning_rate if config.learning_rate > 0 else 0.0
+
+        def lr_lambda(current_step: int):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            return lr_min_ratio + 0.5 * (1.0 - lr_min_ratio) * (1.0 + math.cos(math.pi * progress))
+            
+        return LambdaLR(optimizer, lr_lambda)
+        
+    raise ValueError(f"unsupported lr_scheduler_type: {config.lr_scheduler_type}")
 
 
 @dataclass
@@ -89,6 +116,7 @@ def save_checkpoint(
     resume_batch_index: int,
     checkpoint_name: str,
     extra_state: dict[str, object] | None = None,
+    scheduler: LRScheduler | None = None,
 ) -> None:
     # チェックポイントの保存（重み、最適化状態、乱数シードなど）
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +132,7 @@ def save_checkpoint(
         "resume_batch_index": resume_batch_index,
         "cpu_rng_state": torch.random.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "lr_scheduler_state": scheduler.state_dict() if scheduler is not None else None,
     }
     if extra_state:
         payload.update(extra_state)
@@ -121,6 +150,7 @@ def load_training_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: torch.device,
+    scheduler: LRScheduler | None = None,
 ) -> tuple[ResumeState, dict[str, object]]:
     # チェックポイントの読み込み
     if not path.is_file():
@@ -133,6 +163,10 @@ def load_training_checkpoint(
     scaler_state = checkpoint.get("scaler_state")
     if scaler.is_enabled() and scaler_state is not None:
         scaler.load_state_dict(scaler_state)
+
+    lr_scheduler_state = checkpoint.get("lr_scheduler_state")
+    if scheduler is not None and lr_scheduler_state is not None:
+        scheduler.load_state_dict(lr_scheduler_state)
 
     # 乱数状態の復元
     cpu_rng_state = checkpoint.get("cpu_rng_state")
@@ -164,7 +198,6 @@ def load_training_checkpoint(
         "model_state",
         "optimizer_state",
         "scaler_state",
-        "experiment_config",
         "epoch",
         "global_step",
         "best_val_loss",
@@ -172,6 +205,7 @@ def load_training_checkpoint(
         "resume_batch_index",
         "cpu_rng_state",
         "cuda_rng_state_all",
+        "lr_scheduler_state",
     }
     extra_state = {key: value for key, value in checkpoint.items() if key not in reserved}
     return (

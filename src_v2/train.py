@@ -23,6 +23,7 @@ from src_v2.train_common import (
     resolve_device,
     save_checkpoint,
     skip_to_batch,
+    build_lr_scheduler,
 )
 from src_v2.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
 
@@ -91,9 +92,13 @@ def run_validation(
             )
             noise = torch.randn_like(latents)
 
+            # 1. ノイズ付与とモデル出力の計算
             noisy_latents = model.q_sample(latents, timesteps, noise)
-            predicted_noise = model(batch, noisy_latents, timesteps)
-            loss = diffusion_mse_loss(predicted_noise, noise, batch["segment_mask"])
+            model_output = model(batch, noisy_latents, timesteps)
+
+            # 2. prediction_type に応じた教師ターゲットとの MSE を計算
+            target = model.compute_training_target(latents, noise, timesteps)
+            loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
             losses.append(loss.detach().cpu())
             val_progress.set_postfix(val_total=f"{loss.item():.4f}")
     if not losses:
@@ -126,55 +131,6 @@ def main() -> None:
         autoencoder_checkpoint = resolve_autoencoder_checkpoint(config, args.autoencoder_checkpoint)
         autoencoder = load_frozen_autoencoder(config, autoencoder_checkpoint, device)
 
-        model = ConditionalSegmentDiffusionModel(config.source_model, config.diffusion_model, performer_vocab_size).to(
-            device
-        )
-        model.set_gradient_checkpointing(True)
-        optimizer = AdamW(
-            model.parameters(),
-            lr=config.diffusion_training.learning_rate,
-            weight_decay=config.diffusion_training.weight_decay,
-        )
-
-        # GradScalerの初期化
-        scaler = torch.amp.GradScaler(
-            "cuda", enabled=device.type == "cuda" and config.diffusion_training.mixed_precision == "fp16"
-        )
-        resume_state = ResumeState()
-        if args.resume_from is not None:
-            resume_state, _ = load_training_checkpoint(
-                Path(args.resume_from).expanduser(),
-                model,
-                optimizer,
-                scaler,
-                device,
-            )
-
-        print(f"experiment={config.experiment_name}")
-        print(f"device={device}")
-        print(f"train_pairs={len(train_pairs)}")
-        print(f"val_pairs={len(val_pairs)}")
-        print(f"test_pairs={len(test_pairs)}")
-        print(f"performer_vocab_size={performer_vocab_size}")
-        print(f"autoencoder_checkpoint={autoencoder_checkpoint}")
-        print(f"diffusion_parameters={sum(parameter.numel() for parameter in model.parameters())}")
-        print("gradient_checkpointing=True")
-
-        update_wandb_summary(
-            wandb_run,
-            train_pairs=len(train_pairs),
-            val_pairs=len(val_pairs),
-            test_pairs=len(test_pairs),
-            performer_vocab_size=performer_vocab_size,
-            autoencoder_checkpoint=str(autoencoder_checkpoint),
-            diffusion_parameters=sum(parameter.numel() for parameter in model.parameters()),
-            gradient_checkpointing=True,
-            device=str(device),
-        )
-
-        if args.dry_run:
-            return
-
         train_dataset = SegmentDiffusionDataset(train_pairs, config.source_chunks, config.target_roll)
         val_dataset = SegmentDiffusionDataset(val_pairs, config.source_chunks, config.target_roll)
         train_loader = DataLoader(
@@ -191,6 +147,88 @@ def main() -> None:
             num_workers=config.runtime.num_workers,
             collate_fn=collate_diffusion_samples,
         )
+
+        model = ConditionalSegmentDiffusionModel(config.source_model, config.diffusion_model, performer_vocab_size).to(
+            device
+        )
+        model.set_gradient_checkpointing(True)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=config.diffusion_training.learning_rate,
+            weight_decay=config.diffusion_training.weight_decay,
+        )
+
+        # GradScalerの初期化
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=device.type == "cuda" and config.diffusion_training.mixed_precision == "fp16"
+        )
+        
+        import math
+        steps_per_epoch = math.ceil(len(train_loader) / config.diffusion_training.grad_accum_steps)
+        total_steps = config.diffusion_training.max_steps
+        if total_steps is None:
+            total_steps = steps_per_epoch * config.diffusion_training.max_epochs
+
+        scheduler = build_lr_scheduler(optimizer, config.diffusion_training, total_steps)
+
+        resume_state = ResumeState()
+        if args.resume_from is not None:
+            resume_state, extra_state = load_training_checkpoint(
+                Path(args.resume_from).expanduser(),
+                model,
+                optimizer,
+                scaler,
+                device,
+                scheduler=scheduler,
+            )
+            checkpoint_config = extra_state.get("experiment_config")
+            if isinstance(checkpoint_config, dict):
+                checkpoint_diffusion_config = checkpoint_config.get("diffusion_model")
+                if isinstance(checkpoint_diffusion_config, dict):
+                    checkpoint_prediction_type = str(checkpoint_diffusion_config.get("prediction_type", "epsilon"))
+                    if checkpoint_prediction_type != config.diffusion_model.prediction_type:
+                        raise ValueError(
+                            "resume checkpoint prediction_type does not match current config: "
+                            f"{checkpoint_prediction_type!r} != {config.diffusion_model.prediction_type!r}"
+                        )
+
+        print(f"experiment={config.experiment_name}")
+        print(f"device={device}")
+        print(f"train_pairs={len(train_pairs)}")
+        print(f"val_pairs={len(val_pairs)}")
+        print(f"test_pairs={len(test_pairs)}")
+        print(f"performer_vocab_size={performer_vocab_size}")
+        print(f"autoencoder_checkpoint={autoencoder_checkpoint}")
+        print(f"diffusion_parameters={sum(parameter.numel() for parameter in model.parameters())}")
+        print(f"prediction_type={config.diffusion_model.prediction_type}")
+        print("gradient_checkpointing=True")
+        print(f"optimizer_steps_per_epoch={steps_per_epoch}")
+        if scheduler is None:
+            print("lr_scheduler=none")
+        else:
+            warmup_epochs = config.diffusion_training.lr_warmup_steps / max(steps_per_epoch, 1)
+            print(f"lr_scheduler={config.diffusion_training.lr_scheduler_type}")
+            print(f"lr_warmup_steps={config.diffusion_training.lr_warmup_steps}")
+            print(f"lr_warmup_epochs~={warmup_epochs:.2f}")
+            print(f"total_optimizer_steps={total_steps}")
+
+        update_wandb_summary(
+            wandb_run,
+            train_pairs=len(train_pairs),
+            val_pairs=len(val_pairs),
+            test_pairs=len(test_pairs),
+            performer_vocab_size=performer_vocab_size,
+            autoencoder_checkpoint=str(autoencoder_checkpoint),
+            diffusion_parameters=sum(parameter.numel() for parameter in model.parameters()),
+            prediction_type=config.diffusion_model.prediction_type,
+            gradient_checkpointing=True,
+            device=str(device),
+            optimizer_steps_per_epoch=steps_per_epoch,
+            total_optimizer_steps=total_steps,
+        )
+
+        if args.dry_run:
+            return
 
         # 再開時のバッチ位置調整
         if resume_state.start_batch_index == len(train_loader):
@@ -241,11 +279,13 @@ def main() -> None:
                 noise = torch.randn_like(latents)
 
                 with get_autocast_context(device, config.diffusion_training.mixed_precision):
-                    # 潜在変数にノイズを付与
+                    # 1. 潜在変数にノイズを付与
                     noisy_latents = model.q_sample(latents, timesteps, noise)
-                    # 予測ノイズを計算
-                    predicted_noise = model(batch, noisy_latents, timesteps)
-                    loss = diffusion_mse_loss(predicted_noise, noise, batch["segment_mask"])
+
+                    # 2. prediction_type に応じたターゲットを予測
+                    model_output = model(batch, noisy_latents, timesteps)
+                    target = model.compute_training_target(latents, noise, timesteps)
+                    loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
                     step_loss = loss / config.diffusion_training.grad_accum_steps
 
                 if scaler.is_enabled():
@@ -267,6 +307,10 @@ def main() -> None:
                         scaler.update()
                     else:
                         optimizer.step()
+                    
+                    if scheduler is not None:
+                        scheduler.step()
+                        
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     epoch_step_count += 1
@@ -306,6 +350,7 @@ def main() -> None:
                                 "autoencoder_checkpoint": str(autoencoder_checkpoint),
                                 "performer_vocab_size": performer_vocab_size,
                             },
+                            scheduler=scheduler,
                         )
 
                     if args.max_steps is not None and global_step >= args.max_steps:
@@ -327,6 +372,10 @@ def main() -> None:
                     scaler.update()
                 else:
                     optimizer.step()
+                
+                if scheduler is not None:
+                    scheduler.step()
+
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
@@ -353,6 +402,7 @@ def main() -> None:
                     "autoencoder_checkpoint": str(autoencoder_checkpoint),
                     "performer_vocab_size": performer_vocab_size,
                 },
+                scheduler=scheduler,
             )
             if is_best:
                 save_checkpoint(
@@ -371,6 +421,7 @@ def main() -> None:
                         "autoencoder_checkpoint": str(autoencoder_checkpoint),
                         "performer_vocab_size": performer_vocab_size,
                     },
+                    scheduler=scheduler,
                 )
 
             # CUDAキャッシュのクリア

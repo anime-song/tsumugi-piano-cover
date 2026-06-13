@@ -81,6 +81,14 @@ def main() -> None:
         raise FileNotFoundError(f"diffusion checkpoint not found: {diffusion_checkpoint}")
     diffusion_payload = torch.load(diffusion_checkpoint, map_location=device)
 
+    # 1-1. 生成時はcheckpoint保存時の prediction_type を優先する
+    checkpoint_config = diffusion_payload.get("experiment_config")
+    if isinstance(checkpoint_config, dict):
+        checkpoint_diffusion_config = checkpoint_config.get("diffusion_model")
+        if isinstance(checkpoint_diffusion_config, dict):
+            checkpoint_prediction_type = checkpoint_diffusion_config.get("prediction_type", "epsilon")
+            config.diffusion_model.prediction_type = str(checkpoint_prediction_type)
+
     # 2. オートエンコーダー（VAE）のチェックポイントの特定
     autoencoder_checkpoint = args.autoencoder_checkpoint
     if autoencoder_checkpoint is None:
@@ -144,6 +152,7 @@ def main() -> None:
         "diffusion_checkpoint": str(diffusion_checkpoint),
         "autoencoder_checkpoint": str(autoencoder_checkpoint),
         "performer_id": performer_id,
+        "prediction_type": config.diffusion_model.prediction_type,
         "num_source_chunks": int(batch["source_chunk_mask"].sum().item()),
         "num_segments": int(batch["segment_mask"].sum().item()),
         "num_frames": segment_grid.num_frames,
