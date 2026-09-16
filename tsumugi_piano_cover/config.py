@@ -73,11 +73,16 @@ class SourceEncoderConfig:
     # alignment 由来の cross-attention bias の強さ
     alignment_bias_strength: float = 1.0
     # alignment bias の時間幅（秒）。大きいほど弱く広く source を見る
-    alignment_bias_sigma_seconds: float = 2.0
+    alignment_bias_sigma_seconds: float = 6.0
     # 0なら元の同時刻グリッド、1ならalignment時刻だけを中心にする
     alignment_bias_aligned_time_weight: float = 0.5
     # 学習時にalignment biasをsegment単位で落とす確率
     alignment_bias_dropout: float = 0.0
+    # 学習時にalignment biasを曲単位で丸ごと落とす確率（bias無しでも動く状態を保つ）
+    alignment_bias_song_dropout: float = 0.1
+    # 学習時にguide時刻を推論と同じ「同時刻」に置き換える確率
+    # （推論ではalignmentが無く同時刻を使うため、そのズレた条件も学習させる）
+    alignment_bias_identity_probability: float = 0.3
 
 
 @dataclass
@@ -141,14 +146,22 @@ class DiffusionConfig:
     num_heads: int = 4
     ff_multiplier: int = 4
     dropout: float = 0.1
-    # Performer条件のドロップアウト率
+    # Performer条件を null ID へ置き換える確率（classifier-free guidance 用の無条件埋め込み）
     performer_dropout: float = 0.1
+    # セグメント絶対時刻の正弦波埋め込みがカバーする周期（秒）
+    segment_time_min_period_seconds: float = 0.5
+    segment_time_max_period_seconds: float = 1024.0
     # 訓練のタイムステップ数
     num_train_timesteps: int = 1000
     beta_start: float = 1.0e-4
     beta_end: float = 0.02
+    # 終端のSNRを0にリスケールするか（学習時のx_Tと推論時の純ノイズを一致させる）
+    zero_terminal_snr: bool = True
     # 推論のサンプリングステップ数
     sampling_steps: int = 50
+    # denoiser の gradient checkpointing。timesteps_per_sample の回数だけ再計算が走るので
+    # VRAM に余裕があるなら切った方が速い（実測 1.4x）
+    gradient_checkpointing: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -227,6 +240,13 @@ class TrainingConfig:
     lr_scheduler_type: str = "cosine_with_warmup"
     lr_warmup_steps: int = 1000
     lr_min: float = 1.0e-6
+    # 重みのEMA（Diffusionでは事実上必須。検証・保存はEMA重みで行う）
+    ema_enabled: bool = True
+    ema_decay: float = 0.999
+    # 1サンプルあたりに引くタイムステップ数。原曲エンコードを共有して勾配分散を下げる
+    timesteps_per_sample: int = 1
+    # 検証で使う固定タイムステップの本数（毎エポック同じ値を使い、val lossを比較可能にする）
+    val_timesteps: int = 5
 
 
 @dataclass
@@ -331,6 +351,33 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
         raise ValueError("source_model.alignment_bias_aligned_time_weight must be in [0, 1]")
     if not 0.0 <= config.source_model.alignment_bias_dropout <= 1.0:
         raise ValueError("source_model.alignment_bias_dropout must be in [0, 1]")
+    if not 0.0 <= config.source_model.alignment_bias_song_dropout <= 1.0:
+        raise ValueError("source_model.alignment_bias_song_dropout must be in [0, 1]")
+    if not 0.0 <= config.source_model.alignment_bias_identity_probability <= 1.0:
+        raise ValueError("source_model.alignment_bias_identity_probability must be in [0, 1]")
+    if not 0.0 <= config.diffusion_model.performer_dropout <= 1.0:
+        raise ValueError("diffusion_model.performer_dropout must be in [0, 1]")
+    if (
+        not 0.0
+        < config.diffusion_model.segment_time_min_period_seconds
+        < config.diffusion_model.segment_time_max_period_seconds
+    ):
+        raise ValueError(
+            "diffusion_model.segment_time_min_period_seconds must be positive and smaller than "
+            "segment_time_max_period_seconds"
+        )
+
+    # 6. 学習ループ側の設定範囲を確認
+    for name, training in (
+        ("autoencoder_training", config.autoencoder_training),
+        ("diffusion_training", config.diffusion_training),
+    ):
+        if not 0.0 < training.ema_decay < 1.0:
+            raise ValueError(f"{name}.ema_decay must be in (0, 1): {training.ema_decay}")
+        if training.timesteps_per_sample < 1:
+            raise ValueError(f"{name}.timesteps_per_sample must be >= 1: {training.timesteps_per_sample}")
+        if training.val_timesteps < 1:
+            raise ValueError(f"{name}.val_timesteps must be >= 1: {training.val_timesteps}")
 
     # 5. alignment 前計算の設定範囲を確認
     if config.alignment.method != "audio_sync":
