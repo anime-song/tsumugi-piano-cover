@@ -385,13 +385,15 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         latent_shape: tuple[int, int, int],
         sampling_steps: int | None = None,
         guidance_scale: float = 1.0,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         # === 1. 初期化と準備 ===
         device = batch["source_audio"].device
         num_steps = sampling_steps or self.diffusion_config.sampling_steps
 
-        # 純粋なガウスノイズからスタート
-        latents = torch.randn(latent_shape, device=device)
+        # 純粋なガウスノイズからスタート。generator を渡すと初期ノイズが固定され、
+        # 学習中の生成チェックをエポック間で比較できる
+        latents = torch.randn(latent_shape, device=device, generator=generator)
 
         # 原曲のエンコード（全ステップで使い回すコンテキスト）
         conditioning = self.prepare_conditioning(batch)

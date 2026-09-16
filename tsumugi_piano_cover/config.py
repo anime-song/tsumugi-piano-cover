@@ -247,6 +247,11 @@ class TrainingConfig:
     timesteps_per_sample: int = 1
     # 検証で使う固定タイムステップの本数（毎エポック同じ値を使い、val lossを比較可能にする）
     val_timesteps: int = 5
+    # 実際に逆拡散を回して生成品質を測る間隔（エポック）。0 で無効
+    # MSE は生成品質と相関しないため、破綻を早期に検知するのに使う
+    generation_eval_every_epochs: int = 1
+    generation_eval_songs: int = 4
+    generation_eval_sampling_steps: int = 50
 
 
 @dataclass
@@ -378,6 +383,13 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
             raise ValueError(f"{name}.timesteps_per_sample must be >= 1: {training.timesteps_per_sample}")
         if training.val_timesteps < 1:
             raise ValueError(f"{name}.val_timesteps must be >= 1: {training.val_timesteps}")
+        if training.generation_eval_every_epochs < 0:
+            raise ValueError(f"{name}.generation_eval_every_epochs must be >= 0")
+        if training.generation_eval_every_epochs > 0:
+            if training.generation_eval_songs < 1:
+                raise ValueError(f"{name}.generation_eval_songs must be >= 1")
+            if training.generation_eval_sampling_steps < 1:
+                raise ValueError(f"{name}.generation_eval_sampling_steps must be >= 1")
 
     # 5. alignment 前計算の設定範囲を確認
     if config.alignment.method != "audio_sync":
