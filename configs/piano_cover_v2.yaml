@@ -130,8 +130,9 @@ autoencoder_training:
   lr_min: 1.0e-6
   pitch_shift_min_semitones: -5
   pitch_shift_max_semitones: 5
-  # train_autoencoder.py はEMA/複数タイムステップを使わない
+  # train_autoencoder.py はEMA/複数タイムステップ/生成チェックを使わない
   ema_enabled: false
+  generation_eval_every_epochs: 0
 
 diffusion_training:
   batch_size: 1
@@ -154,3 +155,7 @@ diffusion_training:
   # コストは約2.3倍で済み、optimizer step あたりのタイムステップ数は 4 -> 16 になる
   timesteps_per_sample: 4
   val_timesteps: 5
+  # 毎エポック実際に逆拡散を回して生成を確認する。4曲で約4秒、1エポック12.6分に対して0.5%
+  generation_eval_every_epochs: 1
+  generation_eval_songs: 4
+  generation_eval_sampling_steps: 50
