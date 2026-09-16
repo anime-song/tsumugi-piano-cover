@@ -99,8 +99,10 @@ class TsumugiAudioEncoder(nn.Module):
         audio_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         frame_mask, frame_times = self.frame_metadata(audio_lengths, max_samples=audio.shape[-1])
-        # パディングが無いときに mask を渡すと SDPA が FlashAttention を選べなくなるため、
-        # 必要なときだけ渡す（batch_size=1 の学習では常にパディング無し）
+        # パディングが無いときに mask を渡すと SDPA がマスクを実体化する経路に入るため、
+        # 必要なときだけ渡す（batch_size=1 の学習では常にパディング無し）。実測 10ms/曲 短縮。
+        # なお Windows 版 PyTorch は FlashAttention を同梱しておらず（2.7 / 2.13 とも）、
+        # 実際に選ばれるのは cuDNN attention か mem-efficient attention。
         tsumugi_padding_mask = None if bool(frame_mask.all()) else ~frame_mask
         hidden = self.model(audio, padding_mask=tsumugi_padding_mask)
         if hidden.shape[:2] != frame_mask.shape:
