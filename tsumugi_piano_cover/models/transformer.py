@@ -10,17 +10,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 
-def choose_low_precision_dtype() -> torch.dtype:
-    if not torch.cuda.is_available():
-        return torch.float32
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    major_cc, _ = torch.cuda.get_device_capability()
-    if major_cc >= 6:
-        return torch.float16
-    return torch.float32
-
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 5.960464477539063e-08) -> None:
         super().__init__()
@@ -109,7 +98,6 @@ class MultiHeadAttention(nn.Module):
         self.to_gates = nn.Linear(input_dim, num_heads)
         self.to_out = nn.Sequential(nn.Linear(self.hidden_size, input_dim), nn.Dropout(dropout))
         self.rope = RotaryEmbedding(head_dim) if use_rope else None
-        self.lowp_dtype = choose_low_precision_dtype()
 
     @staticmethod
     def _expand_mask(mask: torch.Tensor, query_length: int, key_length: int) -> torch.Tensor:
@@ -122,6 +110,17 @@ class MultiHeadAttention(nn.Module):
         if mask.dim() == 4:
             return mask
         raise ValueError(f"unsupported attention mask shape: {tuple(mask.shape)}")
+
+    @staticmethod
+    def _expand_bias(bias: torch.Tensor) -> torch.Tensor:
+        # additive attention bias を SDPA の [B, H, Q, K] 互換形へ広げる
+        if bias.dim() == 2:
+            return bias.unsqueeze(0).unsqueeze(0)
+        if bias.dim() == 3:
+            return bias.unsqueeze(1)
+        if bias.dim() == 4:
+            return bias
+        raise ValueError(f"unsupported attention bias shape: {tuple(bias.shape)}")
 
     def forward(
         self,
@@ -146,32 +145,37 @@ class MultiHeadAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, k)
 
-        q = q.to(self.lowp_dtype)
-        k = k.to(self.lowp_dtype)
-        v = v.to(self.lowp_dtype)
-
         attn_mask = None
         if attention_bias is not None:
-            if attention_mask is not None or is_causal:
-                raise ValueError("attention_bias only supports non-causal attention without an explicit attention mask")
-            bias = attention_bias.to(device=q.device, dtype=q.dtype)
+            bias = self._expand_bias(attention_bias.to(device=q.device, dtype=q.dtype))
             alpha = 1.0 if attention_bias_alpha is None else attention_bias_alpha
             if not isinstance(alpha, torch.Tensor):
                 alpha = torch.tensor(float(alpha), device=q.device, dtype=q.dtype)
-            attn_mask = (alpha * bias).unsqueeze(0).unsqueeze(0)
-        elif attention_mask is not None:
-            attn_mask = self._expand_mask(attention_mask.to(device=q.device), q.shape[2], k.shape[2])
+            else:
+                alpha = alpha.to(device=q.device, dtype=q.dtype)
+            attn_mask = alpha * bias
+
+        if attention_mask is not None:
+            expanded_mask = self._expand_mask(attention_mask.to(device=q.device), q.shape[2], k.shape[2])
+            if attn_mask is None:
+                attn_mask = expanded_mask
+            else:
+                mask_value = torch.finfo(q.dtype).min
+                attn_mask = attn_mask.masked_fill(~expanded_mask, mask_value)
 
         if is_causal and attn_mask is not None:
             causal_mask = torch.ones((q.shape[2], k.shape[2]), device=q.device, dtype=torch.bool).tril()
-            attn_mask = attn_mask & causal_mask.unsqueeze(0).unsqueeze(0)
+            if attn_mask.dtype == torch.bool:
+                attn_mask = attn_mask & causal_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                attn_mask = attn_mask.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(q.dtype).min)
             is_causal = False
 
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
             fetched = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
 
         gates = self.to_gates(self.norm_q(x)).sigmoid()
-        out = fetched.float() * einops.rearrange(gates, "b t h -> b h t 1")
+        out = fetched * einops.rearrange(gates, "b t h -> b h t 1")
         out = einops.rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
@@ -231,6 +235,8 @@ class Transformer(nn.Module):
         context_attention_mask: Optional[torch.Tensor],
         attention_bias: Optional[torch.Tensor],
         attention_bias_alpha: Optional[torch.Tensor | float],
+        context_attention_bias: Optional[torch.Tensor],
+        context_attention_bias_alpha: Optional[torch.Tensor | float],
     ) -> torch.Tensor:
         residual = x
         x = blocks[0](
@@ -247,7 +253,13 @@ class Transformer(nn.Module):
             if context is None:
                 raise ValueError("context is required when use_cross_attention=True")
             residual = x
-            x = blocks[next_index](x, context=context, attention_mask=context_attention_mask)
+            x = blocks[next_index](
+                x,
+                context=context,
+                attention_mask=context_attention_mask,
+                attention_bias=context_attention_bias,
+                attention_bias_alpha=context_attention_bias_alpha,
+            )
             x = x + residual
             next_index += 1
 
@@ -264,6 +276,8 @@ class Transformer(nn.Module):
         context_attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         attention_bias_alpha: Optional[torch.Tensor | float] = None,
+        context_attention_bias: Optional[torch.Tensor] = None,
+        context_attention_bias_alpha: Optional[torch.Tensor | float] = None,
         return_hiddens: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states: list[torch.Tensor] = []
@@ -282,6 +296,8 @@ class Transformer(nn.Module):
                         context_attention_mask=context_attention_mask,
                         attention_bias=attention_bias,
                         attention_bias_alpha=attention_bias_alpha,
+                        context_attention_bias=context_attention_bias,
+                        context_attention_bias_alpha=context_attention_bias_alpha,
                     )
 
                 x = checkpoint(custom_forward, x, use_reentrant=False)
@@ -295,6 +311,8 @@ class Transformer(nn.Module):
                     context_attention_mask=context_attention_mask,
                     attention_bias=attention_bias,
                     attention_bias_alpha=attention_bias_alpha,
+                    context_attention_bias=context_attention_bias,
+                    context_attention_bias_alpha=context_attention_bias_alpha,
                 )
             if return_hiddens:
                 hidden_states.append(x)

@@ -4,6 +4,7 @@
 artifacts/
 Dataset/
 wandb/
+runs/
 
 # Python
 __pycache__/

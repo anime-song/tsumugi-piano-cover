@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src_v2.data.phrase import (
+from tsumugi_piano_cover.data.phrase import (
     SegmentSong,
     compute_segment_start_frames,
     compute_target_num_frames,

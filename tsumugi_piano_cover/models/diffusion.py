@@ -6,9 +6,9 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from src_v2.config import DiffusionConfig, SourceEncoderConfig
-from src_v2.models.source_encoder import SongEncoder, SourceNoteChunkEncoder
-from src_v2.models.transformer import Transformer
+from tsumugi_piano_cover.config import DiffusionConfig, SourceEncoderConfig, TsumugiConfig
+from tsumugi_piano_cover.models.tsumugi_encoder import TsumugiAudioEncoder
+from tsumugi_piano_cover.models.transformer import Transformer
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -34,7 +34,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 class SegmentLatentDenoiser(nn.Module):
     def __init__(
-        self, diffusion_config: DiffusionConfig, source_config: SourceEncoderConfig, performer_vocab_size: int
+        self, diffusion_config: DiffusionConfig, performer_vocab_size: int
     ) -> None:
         super().__init__()
         self.diffusion_config = diffusion_config
@@ -68,6 +68,7 @@ class SegmentLatentDenoiser(nn.Module):
         performer_ids: torch.Tensor,
         memory: torch.Tensor,
         memory_mask: torch.Tensor,
+        context_attention_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         ノイズが付加された潜在表現に対し、各種条件（時間、ノイズステップ、演奏者、原曲）を加味して
@@ -81,6 +82,8 @@ class SegmentLatentDenoiser(nn.Module):
             performer_ids: 演奏スタイルの条件付けに用いる演奏者ID [batch_size]
             memory: クロスアテンションで参照する原曲（ソース）の特徴量 [batch_size, memory_length, d_model]
             memory_mask: memoryの有効な要素を示すマスク [batch_size, memory_length]
+            context_attention_bias: target segment から source memory への soft attention bias
+                [batch_size, num_segments, memory_length]
 
         Returns:
             予測されたDiffusionターゲット [batch_size, num_segments, latent_dim]
@@ -96,6 +99,7 @@ class SegmentLatentDenoiser(nn.Module):
             context=memory,
             attention_mask=segment_mask,
             context_attention_mask=memory_mask,
+            context_attention_bias=context_attention_bias,
         )
         return self.output_projection(hidden)
 
@@ -106,6 +110,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         source_config: SourceEncoderConfig,
         diffusion_config: DiffusionConfig,
         performer_vocab_size: int,
+        tsumugi_config: TsumugiConfig,
     ) -> None:
         super().__init__()
         if source_config.d_model != diffusion_config.d_model:
@@ -114,9 +119,8 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             )
         self.source_config = source_config
         self.diffusion_config = diffusion_config
-        self.chunk_encoder = SourceNoteChunkEncoder(source_config)
-        self.song_encoder = SongEncoder(source_config)
-        self.denoiser = SegmentLatentDenoiser(diffusion_config, source_config, performer_vocab_size)
+        self.audio_encoder = TsumugiAudioEncoder(tsumugi_config, output_dim=source_config.d_model)
+        self.denoiser = SegmentLatentDenoiser(diffusion_config, performer_vocab_size)
 
         # ノイズスケジュールの事前計算
         betas = torch.linspace(
@@ -135,21 +139,42 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             if isinstance(module, Transformer):
                 module.set_gradient_checkpointing(enabled)
 
-    def encode_source(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_source(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # 原曲エンコードとメモリ生成
-        chunk_embeddings = self.chunk_encoder(
-            source_features=batch["source_features"],
-            source_programs=batch["source_programs"],
-            source_drums=batch["source_drums"],
-            source_track_roles=batch["source_track_roles"],
-            source_note_mask=batch["source_note_mask"],
+        source_embeddings, source_mask, source_times = self.audio_encoder(
+            audio=batch["source_audio"],
+            audio_lengths=batch["source_audio_lengths"],
         )
-        memory, _ = self.song_encoder(
-            chunk_embeddings=chunk_embeddings,
-            source_chunk_mask=batch["source_chunk_mask"],
-            source_chunk_times=batch["source_chunk_times"],
-        )
-        return memory, batch["source_chunk_mask"]
+        return source_embeddings, source_mask, source_times
+
+    def _build_alignment_attention_bias(
+        self,
+        batch: dict[str, torch.Tensor],
+        source_times: torch.Tensor,
+    ) -> torch.Tensor | None:
+        # alignment は教師ターゲットをワープせず、cross-attention の事前分布としてだけ使う
+        strength = float(self.source_config.alignment_bias_strength)
+        if strength <= 0.0 or "alignment_source_times" not in batch:
+            return None
+
+        segment_times = batch["segment_times"].to(device=source_times.device, dtype=source_times.dtype)
+        aligned_source_times = batch["alignment_source_times"].to(device=source_times.device, dtype=source_times.dtype)
+        aligned_weight = float(self.source_config.alignment_bias_aligned_time_weight)
+        guide_times = (1.0 - aligned_weight) * segment_times + aligned_weight * aligned_source_times
+
+        sigma_seconds = float(self.source_config.alignment_bias_sigma_seconds)
+        time_delta = source_times.unsqueeze(1) - guide_times.unsqueeze(-1)
+        bias = -0.5 * (time_delta / sigma_seconds).square()
+
+        if "alignment_mask" in batch:
+            alignment_mask = batch["alignment_mask"].to(device=source_times.device, dtype=torch.bool)
+            if self.training and self.source_config.alignment_bias_dropout > 0.0:
+                keep_prob = 1.0 - float(self.source_config.alignment_bias_dropout)
+                keep_mask = torch.rand(alignment_mask.shape, device=alignment_mask.device) < keep_prob
+                alignment_mask = alignment_mask & keep_mask
+            bias = torch.where(alignment_mask.unsqueeze(-1), bias, torch.zeros_like(bias))
+
+        return bias.clamp_min(-20.0) * strength
 
     def _expand_noise_scales(self, timesteps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # [batch_size] の時刻インデックスを [batch_size, 1, 1] の係数へ展開
@@ -216,7 +241,8 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        memory, memory_mask = self.encode_source(batch)
+        memory, memory_mask, source_times = self.encode_source(batch)
+        context_attention_bias = self._build_alignment_attention_bias(batch, source_times)
         return self.denoiser(
             noisy_latents=noisy_latents,
             segment_times=batch["segment_times"],
@@ -225,6 +251,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             performer_ids=batch["performer_ids"],
             memory=memory,
             memory_mask=memory_mask,
+            context_attention_bias=context_attention_bias,
         )
 
     @torch.no_grad()
@@ -235,14 +262,15 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         sampling_steps: int | None = None,
     ) -> torch.Tensor:
         # === 1. 初期化と準備 ===
-        device = batch["source_features"].device
+        device = batch["source_audio"].device
         num_steps = sampling_steps or self.diffusion_config.sampling_steps
 
         # 純粋なガウスノイズからスタート
         latents = torch.randn(latent_shape, device=device)
 
         # 原曲のエンコード（全ステップで使い回すコンテキスト）
-        memory, memory_mask = self.encode_source(batch)
+        memory, memory_mask, source_times = self.encode_source(batch)
+        context_attention_bias = self._build_alignment_attention_bias(batch, source_times)
 
         # サンプリング用のタイムステップを計算 (T-1 から 0 へ)
         step_indices = torch.linspace(
@@ -264,6 +292,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
                 performer_ids=batch["performer_ids"],
                 memory=memory,
                 memory_mask=memory_mask,
+                context_attention_bias=context_attention_bias,
             )
             pred_x0, pred_noise = self.predict_x0_and_noise(latents, model_output, timestep_batch)
 

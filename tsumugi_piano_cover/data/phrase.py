@@ -4,11 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from external.amt_model.models.interval_boundaries import PitchIntervalTargets
 from symusic import ControlChange, Note, Score, Tempo, TimeSignature, Track
 
-from src_v2.config import TargetRollConfig
-from src_v2.data.midi import NoteEvent, load_trimmed_target_events
+from tsumugi_piano_cover.config import TargetRollConfig
+from tsumugi_piano_cover.data.midi import NoteEvent, load_trimmed_target_events
 
 
 @dataclass(frozen=True)
@@ -158,8 +157,6 @@ def _extract_note_intervals_from_events(
     return intervals
 
 
-
-
 def segment_grid_from_roll(
     roll: torch.Tensor,
     config: TargetRollConfig,
@@ -191,7 +188,9 @@ def segment_grid_from_roll(
         full_intervals = None
     else:
         full_intervals = _extract_note_intervals_from_events(
-            notes, config, num_frames,
+            notes,
+            config,
+            num_frames,
             max_time_seconds=max_time_seconds,
             transpose_semitones=transpose_semitones,
         )
@@ -224,7 +223,8 @@ def target_midi_to_segment_song(
         transpose_semitones=transpose_semitones,
     )
     return segment_grid_from_roll(
-        roll, config,
+        roll,
+        config,
         skip_intervals=skip_intervals,
         notes=notes,
         max_time_seconds=max_time_seconds,

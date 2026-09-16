@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 import random
+from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, Sampler
-from external.amt_model.models.interval_boundaries import PitchIntervalTargets
 
-from src_v2.config import SourceChunkConfig, TargetRollConfig
-from src_v2.data.index import PairEntry
-from src_v2.data.midi import chunk_source_events, load_trimmed_source_events, load_trimmed_target_events
-from src_v2.data.segment import (
+from recipes.data.index import PairEntry
+from tsumugi_piano_cover.config import TargetRollConfig
+from tsumugi_piano_cover.data.audio import load_audio
+from tsumugi_piano_cover.data.midi import load_trimmed_target_events
+from tsumugi_piano_cover.data.segment import (
     SegmentSong,
     compute_segment_start_frames,
     compute_target_num_frames,
@@ -26,7 +27,6 @@ class AutoencoderSegmentSample:
     segment: torch.Tensor
     segment_time: float
     segment_valid_length: int
-    interval_targets: PitchIntervalTargets | None
 
 
 @dataclass(frozen=True)
@@ -35,22 +35,61 @@ class DiffusionSongSample:
     original_id: str
     piano_id: str
     performer_id: int
-    source_features: torch.Tensor
-    source_programs: torch.Tensor
-    source_drums: torch.Tensor
-    source_track_roles: torch.Tensor
-    source_note_mask: torch.Tensor
-    source_chunk_times: torch.Tensor
+    source_audio: torch.Tensor
+    source_audio_length: int
+    alignment_source_times: torch.Tensor
+    alignment_mask: torch.Tensor
     target_segments: torch.Tensor
     target_segment_times: torch.Tensor
     target_num_frames: int
 
 
-def _source_song_max_time(chunked: dict[str, torch.Tensor], config: SourceChunkConfig) -> float | None:
-    if chunked["source_chunk_times"].numel() == 0:
-        return None
-    last_chunk_start = float(chunked["source_chunk_times"][-1].item())
-    return last_chunk_start + config.window_seconds
+def _load_alignment_source_times(
+    alignment_path: Path | None,
+    segment_times: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # alignment は教師リズムを動かさず、target時刻から参照しやすいsource時刻だけを返す
+    aligned_source_times = segment_times.clone()
+    alignment_mask = torch.zeros_like(segment_times, dtype=torch.bool)
+    if alignment_path is None or not alignment_path.is_file():
+        return aligned_source_times, alignment_mask
+
+    payload = torch.load(alignment_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"unsupported alignment payload: {alignment_path}")
+
+    target_knots = payload.get("target_time_knots_seconds")
+    source_knots = payload.get("source_time_knots_seconds")
+    if not isinstance(target_knots, torch.Tensor) or not isinstance(source_knots, torch.Tensor):
+        raise KeyError(f"alignment payload lacks time knots: {alignment_path}")
+    if target_knots.ndim != 1 or source_knots.ndim != 1 or target_knots.numel() != source_knots.numel():
+        raise ValueError(f"invalid alignment knot shapes: {alignment_path}")
+    if int(target_knots.numel()) < 2:
+        return aligned_source_times, alignment_mask
+
+    target_knots = target_knots.float()
+    source_knots = source_knots.float()
+    clamped_times = segment_times.float().clamp(float(target_knots[0].item()), float(target_knots[-1].item()))
+    right_indices = torch.searchsorted(target_knots, clamped_times, right=False).clamp(1, target_knots.numel() - 1)
+    left_indices = right_indices - 1
+    left_target = target_knots[left_indices]
+    right_target = target_knots[right_indices]
+    ratio = (clamped_times - left_target) / (right_target - left_target).clamp_min(1.0e-6)
+    aligned_source_times = source_knots[left_indices] + ratio * (
+        source_knots[right_indices] - source_knots[left_indices]
+    )
+    alignment_mask = (segment_times >= target_knots[0]) & (segment_times <= target_knots[-1])
+
+    target_has_match = payload.get("target_has_match")
+    alignment_config = payload.get("alignment_config", {})
+    frame_seconds = float(alignment_config.get("frame_seconds", 0.0)) if isinstance(alignment_config, dict) else 0.0
+    if isinstance(target_has_match, torch.Tensor) and target_has_match.numel() > 0 and frame_seconds > 0.0:
+        frame_indices = torch.round(segment_times.float() / frame_seconds).long()
+        frame_in_range = (frame_indices >= 0) & (frame_indices < target_has_match.numel())
+        safe_indices = frame_indices.clamp(0, int(target_has_match.numel()) - 1)
+        alignment_mask = alignment_mask & frame_in_range & target_has_match.bool()[safe_indices]
+
+    return aligned_source_times, alignment_mask
 
 
 class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
@@ -58,14 +97,12 @@ class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
         self,
         entries: list[PairEntry],
         target_roll_config: TargetRollConfig,
-        decoder_mode: str = "semi-crf",
         augment_pitch_shift: bool = False,
         pitch_shift_min_semitones: int = 0,
         pitch_shift_max_semitones: int = 0,
         max_cached_songs: int | None = 16,
     ) -> None:
         self.target_roll_config = target_roll_config
-        self.decoder_mode = decoder_mode
         self.augment_pitch_shift = augment_pitch_shift
         self.pitch_shift_min_semitones = pitch_shift_min_semitones
         self.pitch_shift_max_semitones = pitch_shift_max_semitones
@@ -101,7 +138,7 @@ class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
         segment_song = target_midi_to_segment_song(
             entry.target_midi_path,
             self.target_roll_config,
-            skip_intervals=(self.decoder_mode == "frame"),
+            skip_intervals=True,
         )
         self._segment_song_cache[cache_key] = segment_song
         if self.max_cached_songs is not None and len(self._segment_song_cache) > self.max_cached_songs:
@@ -165,51 +202,6 @@ class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
         shifted_segment[:, -1] = segment[:, -1]
         return shifted_segment
 
-    def _extract_single_segment_interval_targets(
-        self,
-        full_intervals: tuple[list[tuple[int, int]], ...],
-        start_frame: int,
-        valid_length: int,
-        num_frames: int,
-        shift: int,
-    ) -> PitchIntervalTargets:
-        end_frame_exclusive = start_frame + valid_length
-        config = self.target_roll_config
-        pitch_count = config.pitch_count
-
-        pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(pitch_count)]
-        has_onset: list[list[bool]] = [[] for _ in range(pitch_count)]
-        has_offset: list[list[bool]] = [[] for _ in range(pitch_count)]
-        onset_offsets: list[list[float]] = [[] for _ in range(pitch_count)]
-        offset_offsets: list[list[float]] = [[] for _ in range(pitch_count)]
-
-        for pitch_index, intervals in enumerate(full_intervals):
-            shifted_pitch_index = pitch_index + shift
-            if not (0 <= shifted_pitch_index < pitch_count):
-                continue
-
-            for interval_start, interval_end in intervals:
-                if interval_end < start_frame:
-                    continue
-                if interval_start >= end_frame_exclusive:
-                    break
-                local_start = max(interval_start, start_frame) - start_frame
-                local_end = min(interval_end, end_frame_exclusive - 1) - start_frame
-                pitch_intervals[shifted_pitch_index].append((local_start, local_end))
-                has_onset[shifted_pitch_index].append(interval_start >= start_frame)
-                has_offset[shifted_pitch_index].append(interval_end < end_frame_exclusive or interval_end >= num_frames - 1)
-                onset_offsets[shifted_pitch_index].append(0.0)
-                offset_offsets[shifted_pitch_index].append(0.0)
-
-        from external.amt_model.models.interval_boundaries import PitchIntervalTargets
-        return PitchIntervalTargets(
-            intervals=pitch_intervals,
-            has_onset=has_onset,
-            has_offset=has_offset,
-            onset_offsets=onset_offsets,
-            offset_offsets=offset_offsets,
-        )
-
     def __getitem__(self, index: int) -> AutoencoderSegmentSample:
         entry, segment_index = self.samples[index]
         segment_song = self._get_segment_song(entry)
@@ -220,26 +212,12 @@ class SegmentAutoencoderDataset(Dataset[AutoencoderSegmentSample]):
         segment_time = float(segment_song.segment_times[segment_index].item())
         valid_length = int(segment_song.segment_valid_lengths[segment_index].item())
 
-        if segment_song.full_intervals is not None:
-            # セグメント開始時間をフレームインデックスに変換して区間を切り出す
-            start_frame = max(0, int(round(segment_time / self.target_roll_config.frame_seconds)))
-            interval_targets = self._extract_single_segment_interval_targets(
-                full_intervals=segment_song.full_intervals,
-                start_frame=start_frame,
-                valid_length=valid_length,
-                num_frames=segment_song.num_frames,
-                shift=shift,
-            )
-        else:
-            interval_targets = None
-
         return AutoencoderSegmentSample(
             song_name=entry.song_name,
             piano_id=entry.piano_id,
             segment=segment,
             segment_time=segment_time,
             segment_valid_length=valid_length,
-            interval_targets=interval_targets,
         )
 
 
@@ -297,39 +275,58 @@ class SegmentDiffusionDataset(Dataset[DiffusionSongSample]):
     def __init__(
         self,
         entries: list[PairEntry],
-        source_chunk_config: SourceChunkConfig,
         target_roll_config: TargetRollConfig,
+        alignment_cache_dir: str | None = None,
+        audio_sample_rate: int = 22050,
+        audio_channels: int = 2,
     ) -> None:
         self.entries = entries
-        self.source_chunk_config = source_chunk_config
         self.target_roll_config = target_roll_config
+        self.alignment_cache_dir = Path(alignment_cache_dir) if alignment_cache_dir else None
+        self.audio_sample_rate = audio_sample_rate
+        self.audio_channels = audio_channels
 
     def __len__(self) -> int:
         return len(self.entries)
 
     def __getitem__(self, index: int) -> DiffusionSongSample:
         entry = self.entries[index]
-        source_events = load_trimmed_source_events(entry.source_midi_path, self.source_chunk_config)
-        chunked = chunk_source_events(source_events, self.source_chunk_config)
+        if entry.source_audio_path is None:
+            raise FileNotFoundError(
+                f"source audio was not found for original_id={entry.original_id}"
+            )
+        source_audio = load_audio(
+            entry.source_audio_path,
+            sample_rate=self.audio_sample_rate,
+            num_channels=self.audio_channels,
+        )
+        source_audio_length = int(source_audio.shape[-1])
 
         # 原曲長に合わせたピアノカバーのセグメント化
-        max_time_seconds = _source_song_max_time(chunked, self.source_chunk_config)
+        max_time_seconds = source_audio_length / self.audio_sample_rate
         segment_song = target_midi_to_segment_song(
             entry.target_midi_path,
             self.target_roll_config,
             max_time_seconds=max_time_seconds,
+        )
+        alignment_path = (
+            self.alignment_cache_dir / entry.original_id / f"{entry.piano_id}.pt"
+            if self.alignment_cache_dir is not None
+            else None
+        )
+        alignment_source_times, alignment_mask = _load_alignment_source_times(
+            alignment_path,
+            segment_song.segment_times,
         )
         return DiffusionSongSample(
             song_name=entry.song_name,
             original_id=entry.original_id,
             piano_id=entry.piano_id,
             performer_id=entry.performer_id,
-            source_features=chunked["source_features"],
-            source_programs=chunked["source_programs"],
-            source_drums=chunked["source_drums"],
-            source_track_roles=chunked["source_track_roles"],
-            source_note_mask=chunked["source_note_mask"],
-            source_chunk_times=chunked["source_chunk_times"],
+            source_audio=source_audio,
+            source_audio_length=source_audio_length,
+            alignment_source_times=alignment_source_times,
+            alignment_mask=alignment_mask,
             target_segments=segment_song.segments,
             target_segment_times=segment_song.segment_times,
             target_num_frames=segment_song.num_frames,
@@ -338,7 +335,7 @@ class SegmentDiffusionDataset(Dataset[DiffusionSongSample]):
 
 def collate_autoencoder_samples(
     samples: list[AutoencoderSegmentSample],
-) -> dict[str, torch.Tensor | list[str] | list[PitchIntervalTargets | None]]:
+) -> dict[str, torch.Tensor | list[str]]:
     batch_size = len(samples)
     frames_per_segment = samples[0].segment.shape[0]
     feature_dim = samples[0].segment.shape[1]
@@ -348,41 +345,33 @@ def collate_autoencoder_samples(
     segment_times = torch.zeros((batch_size, 1), dtype=torch.float32)
     segment_valid_lengths = torch.zeros((batch_size,), dtype=torch.long)
     metadata: list[str] = []
-    interval_targets: list[PitchIntervalTargets | None] = []
 
     for batch_index, sample in enumerate(samples):
         target_segments[batch_index, 0] = sample.segment
         segment_times[batch_index, 0] = sample.segment_time
         segment_valid_lengths[batch_index] = sample.segment_valid_length
         metadata.append(sample.piano_id)
-        interval_targets.append(sample.interval_targets)
 
     return {
         "target_segments": target_segments,
         "segment_mask": segment_mask,
         "segment_times": segment_times,
         "segment_valid_lengths": segment_valid_lengths,
-        "interval_targets": interval_targets,
         "metadata": metadata,
     }
 
 
 def collate_diffusion_samples(samples: list[DiffusionSongSample]) -> dict[str, torch.Tensor | list[tuple[str, str]]]:
     batch_size = len(samples)
-    max_chunks = max(sample.source_features.shape[0] for sample in samples)
-    max_notes = samples[0].source_features.shape[1]
-    note_dim = samples[0].source_features.shape[2]
+    max_source_samples = max(sample.source_audio.shape[-1] for sample in samples)
     max_segments = max(sample.target_segments.shape[0] for sample in samples)
     frames_per_segment = samples[0].target_segments.shape[1]
     feature_dim = samples[0].target_segments.shape[2]
 
-    source_features = torch.zeros((batch_size, max_chunks, max_notes, note_dim), dtype=torch.float32)
-    source_programs = torch.zeros((batch_size, max_chunks, max_notes), dtype=torch.long)
-    source_drums = torch.zeros((batch_size, max_chunks, max_notes), dtype=torch.long)
-    source_track_roles = torch.zeros((batch_size, max_chunks, max_notes), dtype=torch.long)
-    source_note_mask = torch.zeros((batch_size, max_chunks, max_notes), dtype=torch.bool)
-    source_chunk_mask = torch.zeros((batch_size, max_chunks), dtype=torch.bool)
-    source_chunk_times = torch.zeros((batch_size, max_chunks), dtype=torch.float32)
+    source_audio = torch.zeros((batch_size, 2, max_source_samples), dtype=torch.float32)
+    source_audio_lengths = torch.zeros((batch_size,), dtype=torch.long)
+    alignment_source_times = torch.zeros((batch_size, max_segments), dtype=torch.float32)
+    alignment_mask = torch.zeros((batch_size, max_segments), dtype=torch.bool)
     target_segments = torch.zeros((batch_size, max_segments, frames_per_segment, feature_dim), dtype=torch.float32)
     segment_mask = torch.zeros((batch_size, max_segments), dtype=torch.bool)
     segment_times = torch.zeros((batch_size, max_segments), dtype=torch.float32)
@@ -391,17 +380,14 @@ def collate_diffusion_samples(samples: list[DiffusionSongSample]) -> dict[str, t
     metadata: list[tuple[str, str]] = []
 
     for batch_index, sample in enumerate(samples):
-        num_chunks = sample.source_features.shape[0]
-        source_features[batch_index, :num_chunks] = sample.source_features
-        source_programs[batch_index, :num_chunks] = sample.source_programs
-        source_drums[batch_index, :num_chunks] = sample.source_drums
-        source_track_roles[batch_index, :num_chunks] = sample.source_track_roles
-        source_note_mask[batch_index, :num_chunks] = sample.source_note_mask
-        source_chunk_mask[batch_index, :num_chunks] = True
-        source_chunk_times[batch_index, :num_chunks] = sample.source_chunk_times
+        num_source_samples = sample.source_audio.shape[-1]
+        source_audio[batch_index, :, :num_source_samples] = sample.source_audio
+        source_audio_lengths[batch_index] = sample.source_audio_length
 
         num_segments = sample.target_segments.shape[0]
         target_segments[batch_index, :num_segments] = sample.target_segments
+        alignment_source_times[batch_index, :num_segments] = sample.alignment_source_times
+        alignment_mask[batch_index, :num_segments] = sample.alignment_mask
         segment_mask[batch_index, :num_segments] = True
         segment_times[batch_index, :num_segments] = sample.target_segment_times
         target_num_frames[batch_index] = sample.target_num_frames
@@ -409,13 +395,10 @@ def collate_diffusion_samples(samples: list[DiffusionSongSample]) -> dict[str, t
         metadata.append((sample.song_name, sample.piano_id))
 
     return {
-        "source_features": source_features,
-        "source_programs": source_programs,
-        "source_drums": source_drums,
-        "source_track_roles": source_track_roles,
-        "source_note_mask": source_note_mask,
-        "source_chunk_mask": source_chunk_mask,
-        "source_chunk_times": source_chunk_times,
+        "source_audio": source_audio,
+        "source_audio_lengths": source_audio_lengths,
+        "alignment_source_times": alignment_source_times,
+        "alignment_mask": alignment_mask,
         "target_segments": target_segments,
         "segment_mask": segment_mask,
         "segment_times": segment_times,
@@ -423,4 +406,3 @@ def collate_diffusion_samples(samples: list[DiffusionSongSample]) -> dict[str, t
         "performer_ids": performer_ids,
         "metadata": metadata,
     }
-
