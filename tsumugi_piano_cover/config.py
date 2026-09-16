@@ -10,31 +10,21 @@ import yaml
 @dataclass
 class DatasetConfig:
     # データセット情報のJSONパス
-    dataset_json: str = "dataset.json"
-    # 原曲（ソース）のMIDIディレクトリ
-    original_midi_dir: str = "Dataset/original_midis/merged"
+    dataset_json: str = "data/metadata/dataset.json"
+    # 原曲（ソース）の音源ディレクトリ
+    original_audio_dir: str = "Dataset/original"
     # ピアノカバーのMIDIディレクトリ
     piano_midi_dir: str = "Dataset/pianos_midi"
+    # ピアノカバーの音源ディレクトリ
+    piano_audio_dir: str = "Dataset/pianos"
     # ピアノと演奏者の対応マッピングJSONのパス
-    piano_to_performer_json: str = "piano_to_performer.json"
+    piano_to_performer_json: str = "data/metadata/piano_to_performer.json"
+    # source/target の時刻対応を保存したキャッシュディレクトリ
+    alignment_cache_dir: str | None = None
     # 訓練/検証/テストの分割割合
     train_fraction: float = 0.9
     val_fraction: float = 0.05
     test_fraction: float = 0.05
-
-
-@dataclass
-class SourceChunkConfig:
-    # 原曲の切り出し窓サイズ（秒）
-    window_seconds: float = 2.0
-    # 窓のスライド幅（秒）
-    hop_seconds: float = 0.5
-    # チャンクあたりの最大音符数
-    max_notes_per_chunk: int = 256
-    # 最小音符長（秒）
-    min_duration_seconds: float = 0.03
-    # 曲あたりの最大チャンク数（制限しない場合はNone）
-    max_chunks_per_song: int | None = None
 
 
 @dataclass
@@ -78,35 +68,38 @@ class TargetRollConfig:
 
 @dataclass
 class SourceEncoderConfig:
-    # 隠れ層の次元数（d_model）
+    # Tsumugi adapterとdiffusion memoryの次元数
     d_model: int = 256
-    note_feature_dim: int = 4
-    # プログラム（音色）の種類数
-    num_programs: int = 129
-    # トラックの役割の種類数
-    num_source_track_roles: int = 4
-    # チャンク表現を集約する query token 数
-    num_chunk_queries: int = 1
-    # チャンクエンコーダーのレイヤー数
-    chunk_encoder_layers: int = 2
-    # 曲エンコーダーのレイヤー数
-    song_encoder_layers: int = 4
-    num_heads: int = 4
-    # FFNの拡大倍率
-    ff_multiplier: int = 4
-    dropout: float = 0.1
+    # alignment 由来の cross-attention bias の強さ
+    alignment_bias_strength: float = 1.0
+    # alignment bias の時間幅（秒）。大きいほど弱く広く source を見る
+    alignment_bias_sigma_seconds: float = 2.0
+    # 0なら元の同時刻グリッド、1ならalignment時刻だけを中心にする
+    alignment_bias_aligned_time_weight: float = 0.5
+    # 学習時にalignment biasをsegment単位で落とす確率
+    alignment_bias_dropout: float = 0.0
 
-    @property
-    def head_dim(self) -> int:
-        if self.d_model % self.num_heads != 0:
-            raise ValueError(f"d_model={self.d_model} must be divisible by num_heads={self.num_heads}")
-        return self.d_model // self.num_heads
+
+@dataclass
+class TsumugiConfig:
+    model_id: str = "anime-song/tsumugi-mrl"
+    revision: str | None = None
+    hidden_dim: int = 512
+    sample_rate: int = 22050
+    audio_channels: int = 2
+    lora_enabled: bool = True
+    lora_rank: int = 32
+    lora_alpha: float = 32.0
+    lora_dropout: float = 0.0
+    lora_target_modules: list[str] = field(
+        default_factory=lambda: ["to_q", "to_k", "to_v", "to_out.0", "net.1", "net.4"]
+    )
+    lora_layers: list[int] | None = None
+    gradient_checkpointing: bool = True
 
 
 @dataclass
 class SegmentAutoencoderConfig:
-    # デコーダーのモード ("semi-crf" または "frame")
-    decoder_mode: str = "semi-crf"
     d_model: int = 256
     # 潜在表現（latent）の次元数
     latent_dim: int = 64
@@ -130,24 +123,6 @@ class SegmentAutoencoderConfig:
     # sustain のクラス重み
     sustain_positive_class_weight: float = 0.5
     sustain_negative_class_weight: float = 0.5
-    # semi-CRF 用の pitch/frame 特徴量次元
-    semi_crf_pitch_feature_dim: int = 64
-    # semi-CRF の query/key 次元
-    semi_crf_head_dim: int = 64
-    # 区間長に対するスコアリング方式
-    semi_crf_length_scaling: str = "linear"
-    semi_crf_length_penalty: float = 0.0
-    # note の事前バイアス
-    semi_crf_note_bias: float = 0.0
-    # pitch ごとのデコードを分割するバッチサイズ
-    semi_crf_track_batch_size: int = 128
-    # 区間見逃し / 誤検出に対するコスト
-    semi_crf_false_negative_cost: float = 0.0
-    semi_crf_false_positive_cost: float = 0.0
-    # 区間境界の onset / offset 存在を補助学習するか
-    use_interval_boundary_head: bool = True
-    # boundary loss の重み
-    interval_presence_loss_weight: float = 1.0
 
     @property
     def head_dim(self) -> int:
@@ -202,6 +177,24 @@ class RuntimeConfig:
 
 
 @dataclass
+class AlignmentConfig:
+    # alignment cache の保存先。未指定なら dataset.alignment_cache_dir または既定値を使う
+    cache_dir: str | None = None
+    # 前計算方法。音声同士の同期を使う
+    method: str = "audio_sync"
+    # alignment 用の時間フレーム幅（秒）
+    frame_seconds: float = 0.1
+    # audio-sync 前処理で読み込むサンプルレート
+    audio_sample_rate: int = 22050
+    # synctoolbox の特徴量フレームレート
+    sync_feature_rate: int = 50
+    # synctoolbox の step weight
+    sync_step_weights: tuple[float, float, float] = (1.5, 1.5, 2.0)
+    # synctoolbox の recursion threshold
+    sync_threshold_rec: int = 10**6
+
+
+@dataclass
 class WandbConfig:
     # W&Bロギングの有効化
     enabled: bool = False
@@ -241,11 +234,12 @@ class ExperimentConfig:
     experiment_name: str = "piano_cover_v2_segment_diffusion"
     seed: int = 7
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    source_chunks: SourceChunkConfig = field(default_factory=SourceChunkConfig)
     target_roll: TargetRollConfig = field(default_factory=TargetRollConfig)
     source_model: SourceEncoderConfig = field(default_factory=SourceEncoderConfig)
+    tsumugi_model: TsumugiConfig = field(default_factory=TsumugiConfig)
     autoencoder_model: SegmentAutoencoderConfig = field(default_factory=SegmentAutoencoderConfig)
     diffusion_model: DiffusionConfig = field(default_factory=DiffusionConfig)
     autoencoder_training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -307,6 +301,54 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
             "source_model.d_model and diffusion_model.d_model must match: "
             f"{config.source_model.d_model} != {config.diffusion_model.d_model}"
         )
+
+    if config.tsumugi_model.hidden_dim <= 0:
+        raise ValueError(f"tsumugi_model.hidden_dim must be positive: {config.tsumugi_model.hidden_dim}")
+    if config.tsumugi_model.sample_rate <= 0:
+        raise ValueError(f"tsumugi_model.sample_rate must be positive: {config.tsumugi_model.sample_rate}")
+    if config.tsumugi_model.audio_channels != 2:
+        raise ValueError("tsumugi_model.audio_channels must be 2 for Tsumugi-MRL")
+    if config.tsumugi_model.sample_rate != config.alignment.audio_sample_rate:
+        raise ValueError(
+            "tsumugi_model.sample_rate and alignment.audio_sample_rate must match: "
+            f"{config.tsumugi_model.sample_rate} != {config.alignment.audio_sample_rate}"
+        )
+    if config.tsumugi_model.lora_rank <= 0:
+        raise ValueError(f"tsumugi_model.lora_rank must be positive: {config.tsumugi_model.lora_rank}")
+    if config.tsumugi_model.lora_alpha <= 0.0:
+        raise ValueError(f"tsumugi_model.lora_alpha must be positive: {config.tsumugi_model.lora_alpha}")
+    if not 0.0 <= config.tsumugi_model.lora_dropout < 1.0:
+        raise ValueError(f"tsumugi_model.lora_dropout must be in [0, 1): {config.tsumugi_model.lora_dropout}")
+    if not config.tsumugi_model.lora_target_modules:
+        raise ValueError("tsumugi_model.lora_target_modules must not be empty")
+
+    # 4. alignment attention bias の設定範囲を確認
+    if config.source_model.alignment_bias_strength < 0.0:
+        raise ValueError("source_model.alignment_bias_strength must be non-negative")
+    if config.source_model.alignment_bias_sigma_seconds <= 0.0:
+        raise ValueError("source_model.alignment_bias_sigma_seconds must be positive")
+    if not 0.0 <= config.source_model.alignment_bias_aligned_time_weight <= 1.0:
+        raise ValueError("source_model.alignment_bias_aligned_time_weight must be in [0, 1]")
+    if not 0.0 <= config.source_model.alignment_bias_dropout <= 1.0:
+        raise ValueError("source_model.alignment_bias_dropout must be in [0, 1]")
+
+    # 5. alignment 前計算の設定範囲を確認
+    if config.alignment.method != "audio_sync":
+        raise ValueError(f"alignment.method must be 'audio_sync': {config.alignment.method!r}")
+    if config.alignment.frame_seconds <= 0.0:
+        raise ValueError(f"alignment.frame_seconds must be positive: {config.alignment.frame_seconds}")
+    if config.alignment.audio_sample_rate <= 0:
+        raise ValueError(f"alignment.audio_sample_rate must be positive: {config.alignment.audio_sample_rate}")
+    if config.alignment.sync_feature_rate <= 0:
+        raise ValueError(f"alignment.sync_feature_rate must be positive: {config.alignment.sync_feature_rate}")
+    if config.alignment.sync_threshold_rec <= 0:
+        raise ValueError(f"alignment.sync_threshold_rec must be positive: {config.alignment.sync_threshold_rec}")
+    if len(config.alignment.sync_step_weights) != 3:
+        raise ValueError(
+            f"alignment.sync_step_weights must contain exactly 3 values: {config.alignment.sync_step_weights}"
+        )
+    if any(weight <= 0.0 for weight in config.alignment.sync_step_weights):
+        raise ValueError(f"alignment.sync_step_weights must be positive: {config.alignment.sync_step_weights}")
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:

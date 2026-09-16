@@ -11,46 +11,66 @@ class PairEntry:
     # 原曲（ソース）とピアノカバー（ターゲット）のペア情報
     song_name: str
     original_id: str
-    source_midi_path: str
     piano_id: str
     target_midi_path: str
     performer_id: int
+    source_audio_path: str | None = None
+    target_audio_path: str | None = None
+
+
+_AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".flac", ".ogg")
+
+
+def _resolve_optional_audio_path(root: str | Path, *parts: str) -> str | None:
+    # 拡張子違いを吸収しつつ、存在する音源ファイルを 1 つ探す
+    base = Path(root).joinpath(*parts)
+    for suffix in _AUDIO_SUFFIXES:
+        candidate = base.with_suffix(suffix)
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def build_pair_index(
     dataset_json_path: str | Path,
-    original_midi_dir: str | Path,
     piano_midi_dir: str | Path,
     piano_to_performer_json: str | Path,
+    original_audio_dir: str | Path | None = None,
+    piano_audio_dir: str | Path | None = None,
 ) -> list[PairEntry]:
     # データセットメタデータと演奏者情報からペアリストを構築する
     dataset = json.loads(Path(dataset_json_path).read_text(encoding="utf-8"))
     performer_map = json.loads(Path(piano_to_performer_json).read_text(encoding="utf-8"))
 
-    original_root = Path(original_midi_dir)
     piano_root = Path(piano_midi_dir)
     entries: list[PairEntry] = []
 
     for song_name, meta in dataset.items():
         original_id = meta["original"]
-        source_path = original_root / f"{original_id}.mid"
-        if not source_path.exists():
-            continue
+        source_audio_path = (
+            _resolve_optional_audio_path(original_audio_dir, original_id) if original_audio_dir is not None else None
+        )
 
         for piano_id in meta["pianos"]:
             target_path = piano_root / original_id / f"{piano_id}.mid"
             performer_id = performer_map.get(piano_id)
             if not target_path.exists() or performer_id is None:
                 continue
+            target_audio_path = (
+                _resolve_optional_audio_path(piano_audio_dir, original_id, piano_id)
+                if piano_audio_dir is not None
+                else None
+            )
 
             entries.append(
                 PairEntry(
                     song_name=song_name,
                     original_id=original_id,
-                    source_midi_path=str(source_path),
                     piano_id=piano_id,
                     target_midi_path=str(target_path),
                     performer_id=int(performer_id),
+                    source_audio_path=source_audio_path,
+                    target_audio_path=target_audio_path,
                 )
             )
 

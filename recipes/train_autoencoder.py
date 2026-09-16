@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -8,12 +9,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src_v2.config import ExperimentConfig, load_experiment_config
-from src_v2.data.dataset import SegmentAutoencoderDataset, SegmentSongBatchSampler, collate_autoencoder_samples
-from src_v2.models.losses import autoencoder_reconstruction_loss
-from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
-from src_v2.train_common import (
+from recipes.data.dataset import SegmentAutoencoderDataset, SegmentSongBatchSampler, collate_autoencoder_samples
+from recipes.losses import autoencoder_reconstruction_loss
+from recipes.train_common import (
     ResumeState,
+    build_lr_scheduler,
     build_splits,
     clear_cuda_cache,
     get_autocast_context,
@@ -22,9 +22,10 @@ from src_v2.train_common import (
     resolve_device,
     save_checkpoint,
     skip_to_batch,
-    build_lr_scheduler,
 )
-from src_v2.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
+from recipes.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
+from tsumugi_piano_cover.config import ExperimentConfig, load_experiment_config
+from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--resume-from")
     parser.add_argument("--init-from")
-    parser.add_argument("--init-encoder-only", action="store_true", help="事前学習済みのエンコーダーの重みのみをロードする")
+    parser.add_argument(
+        "--init-encoder-only", action="store_true", help="事前学習済みのエンコーダーの重みのみをロードする"
+    )
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0, help="エンコーダーをフリーズするエポック数")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-name")
@@ -113,9 +116,6 @@ def run_validation(
                 model_config=config.autoencoder_model,
                 roll_config=config.target_roll,
                 variational=use_variational,
-                interval_targets=batch["interval_targets"],
-                segment_valid_lengths=batch["segment_valid_lengths"],
-                boundary_predictor=getattr(model.decoder, "interval_boundary_predictor", None),
             )
             loss_value = loss_dict["total"].detach().cpu()
             losses.append(loss_value)
@@ -125,63 +125,76 @@ def run_validation(
                 "velocity": f"{loss_dict['velocity'].item():.4f}",
                 "kl": f"{loss_dict['kl'].item():.4f}",
             }
-            if config.autoencoder_model.decoder_mode == "frame":
-                mask = batch["segment_mask"]
-                if mask.any():
-                    valid_targets = batch["target_segments"][mask]
-                    valid_logits = outputs["frame_logits"][mask]
-                    pitch_count = config.target_roll.pitch_count
-                    
-                    onset_target = valid_targets[:, :, :pitch_count] >= config.target_roll.onset_threshold
-                    onset_pred = valid_logits[:, :, :pitch_count] >= 0.0
-                    tp_onset += int((onset_pred & onset_target).sum().item())
-                    fp_onset += int((onset_pred & ~onset_target).sum().item())
-                    fn_onset += int((~onset_pred & onset_target).sum().item())
+            mask = batch["segment_mask"]
+            if mask.any():
+                valid_targets = batch["target_segments"][mask]
+                valid_logits = outputs["frame_logits"][mask]
+                pitch_count = config.target_roll.pitch_count
 
-                    sustain_target = valid_targets[:, :, pitch_count : pitch_count * 2] >= config.target_roll.sustain_threshold
-                    sustain_pred = valid_logits[:, :, pitch_count : pitch_count * 2] >= 0.0
-                    tp_sustain += int((sustain_pred & sustain_target).sum().item())
-                    fp_sustain += int((sustain_pred & ~sustain_target).sum().item())
-                    fn_sustain += int((~sustain_pred & sustain_target).sum().item())
+                onset_target = valid_targets[:, :, :pitch_count] >= config.target_roll.onset_threshold
+                onset_pred = valid_logits[:, :, :pitch_count] >= 0.0
+                tp_onset += int((onset_pred & onset_target).sum().item())
+                fp_onset += int((onset_pred & ~onset_target).sum().item())
+                fn_onset += int((~onset_pred & onset_target).sum().item())
 
-                postfix["onset"] = f"{loss_dict['onset'].item():.4f}"
-                postfix["sustain"] = f"{loss_dict['sustain'].item():.4f}"
-                if tp_onset + fp_onset + fn_onset > 0:
-                    precision_onset = tp_onset / max(1, tp_onset + fp_onset)
-                    recall_onset = tp_onset / max(1, tp_onset + fn_onset)
-                    f1_onset = 0.0 if precision_onset + recall_onset == 0.0 else 2.0 * precision_onset * recall_onset / (precision_onset + recall_onset)
-                    postfix["on_f1"] = f"{f1_onset:.4f}"
-                    postfix["on_p"] = f"{precision_onset:.4f}"
-                    postfix["on_r"] = f"{recall_onset:.4f}"
-                if tp_sustain + fp_sustain + fn_sustain > 0:
-                    precision_sustain = tp_sustain / max(1, tp_sustain + fp_sustain)
-                    recall_sustain = tp_sustain / max(1, tp_sustain + fn_sustain)
-                    f1_sustain = 0.0 if precision_sustain + recall_sustain == 0.0 else 2.0 * precision_sustain * recall_sustain / (precision_sustain + recall_sustain)
-                    postfix["su_f1"] = f"{f1_sustain:.4f}"
-                    postfix["su_p"] = f"{precision_sustain:.4f}"
-                    postfix["su_r"] = f"{recall_sustain:.4f}"
-            else:
-                postfix["interval"] = f"{loss_dict['interval'].item():.4f}"
-                postfix["boundary"] = f"{loss_dict['boundary'].item():.4f}"
+                sustain_target = (
+                    valid_targets[:, :, pitch_count : pitch_count * 2] >= config.target_roll.sustain_threshold
+                )
+                sustain_pred = valid_logits[:, :, pitch_count : pitch_count * 2] >= 0.0
+                tp_sustain += int((sustain_pred & sustain_target).sum().item())
+                fp_sustain += int((sustain_pred & ~sustain_target).sum().item())
+                fn_sustain += int((~sustain_pred & sustain_target).sum().item())
+
+            postfix["onset"] = f"{loss_dict['onset'].item():.4f}"
+            postfix["sustain"] = f"{loss_dict['sustain'].item():.4f}"
+            if tp_onset + fp_onset + fn_onset > 0:
+                precision_onset = tp_onset / max(1, tp_onset + fp_onset)
+                recall_onset = tp_onset / max(1, tp_onset + fn_onset)
+                f1_onset = (
+                    0.0
+                    if precision_onset + recall_onset == 0.0
+                    else 2.0 * precision_onset * recall_onset / (precision_onset + recall_onset)
+                )
+                postfix["on_f1"] = f"{f1_onset:.4f}"
+                postfix["on_p"] = f"{precision_onset:.4f}"
+                postfix["on_r"] = f"{recall_onset:.4f}"
+            if tp_sustain + fp_sustain + fn_sustain > 0:
+                precision_sustain = tp_sustain / max(1, tp_sustain + fp_sustain)
+                recall_sustain = tp_sustain / max(1, tp_sustain + fn_sustain)
+                f1_sustain = (
+                    0.0
+                    if precision_sustain + recall_sustain == 0.0
+                    else 2.0 * precision_sustain * recall_sustain / (precision_sustain + recall_sustain)
+                )
+                postfix["su_f1"] = f"{f1_sustain:.4f}"
+                postfix["su_p"] = f"{precision_sustain:.4f}"
+                postfix["su_r"] = f"{recall_sustain:.4f}"
             val_progress.set_postfix(**postfix)
 
     if not losses:
         return {"total": float("nan")}
-    
+
     metrics = {"total": torch.stack(losses).mean().item()}
-    if config.autoencoder_model.decoder_mode == "frame":
-        if tp_onset + fp_onset + fn_onset > 0:
-            precision_onset = tp_onset / max(1, tp_onset + fp_onset)
-            recall_onset = tp_onset / max(1, tp_onset + fn_onset)
-            metrics["onset_precision"] = precision_onset
-            metrics["onset_recall"] = recall_onset
-            metrics["onset_f1"] = 0.0 if precision_onset + recall_onset == 0.0 else 2.0 * precision_onset * recall_onset / (precision_onset + recall_onset)
-        if tp_sustain + fp_sustain + fn_sustain > 0:
-            precision_sustain = tp_sustain / max(1, tp_sustain + fp_sustain)
-            recall_sustain = tp_sustain / max(1, tp_sustain + fn_sustain)
-            metrics["sustain_precision"] = precision_sustain
-            metrics["sustain_recall"] = recall_sustain
-            metrics["sustain_f1"] = 0.0 if precision_sustain + recall_sustain == 0.0 else 2.0 * precision_sustain * recall_sustain / (precision_sustain + recall_sustain)
+    if tp_onset + fp_onset + fn_onset > 0:
+        precision_onset = tp_onset / max(1, tp_onset + fp_onset)
+        recall_onset = tp_onset / max(1, tp_onset + fn_onset)
+        metrics["onset_precision"] = precision_onset
+        metrics["onset_recall"] = recall_onset
+        metrics["onset_f1"] = (
+            0.0
+            if precision_onset + recall_onset == 0.0
+            else 2.0 * precision_onset * recall_onset / (precision_onset + recall_onset)
+        )
+    if tp_sustain + fp_sustain + fn_sustain > 0:
+        precision_sustain = tp_sustain / max(1, tp_sustain + fp_sustain)
+        recall_sustain = tp_sustain / max(1, tp_sustain + fn_sustain)
+        metrics["sustain_precision"] = precision_sustain
+        metrics["sustain_recall"] = recall_sustain
+        metrics["sustain_f1"] = (
+            0.0
+            if precision_sustain + recall_sustain == 0.0
+            else 2.0 * precision_sustain * recall_sustain / (precision_sustain + recall_sustain)
+        )
     return metrics
 
 
@@ -223,7 +236,6 @@ def main() -> None:
         train_dataset = SegmentAutoencoderDataset(
             train_pairs,
             config.target_roll,
-            decoder_mode=config.autoencoder_model.decoder_mode,
             augment_pitch_shift=True,
             pitch_shift_min_semitones=config.autoencoder_training.pitch_shift_min_semitones,
             pitch_shift_max_semitones=config.autoencoder_training.pitch_shift_max_semitones,
@@ -232,7 +244,6 @@ def main() -> None:
         val_dataset = SegmentAutoencoderDataset(
             val_pairs,
             config.target_roll,
-            decoder_mode=config.autoencoder_model.decoder_mode,
             max_cached_songs=config.runtime.autoencoder_max_cached_songs,
         )
 
@@ -276,11 +287,16 @@ def main() -> None:
             "cuda", enabled=device.type == "cuda" and config.autoencoder_training.mixed_precision == "fp16"
         )
 
-        import math
+        # 1. scheduler が参照する optimizer step 数を、実際の停止条件に合わせて決める
+        steps_per_epoch = math.ceil(len(train_loader) / config.autoencoder_training.grad_accum_steps)
+        if config.autoencoder_training.max_steps_per_epoch is not None:
+            steps_per_epoch = min(steps_per_epoch, config.autoencoder_training.max_steps_per_epoch)
+
         total_steps = config.autoencoder_training.max_steps
         if total_steps is None:
-            steps_per_epoch = math.ceil(len(train_loader) / config.autoencoder_training.grad_accum_steps)
             total_steps = steps_per_epoch * config.autoencoder_training.max_epochs
+        if args.max_steps is not None:
+            total_steps = min(total_steps, args.max_steps)
 
         scheduler = build_lr_scheduler(optimizer, config.autoencoder_training, total_steps)
 
@@ -304,6 +320,15 @@ def main() -> None:
         print(f"autoencoder_parameters={sum(parameter.numel() for parameter in model.parameters())}")
         if init_checkpoint is not None and args.resume_from is None:
             print(f"initialized_from={init_checkpoint}")
+        print(f"optimizer_steps_per_epoch={steps_per_epoch}")
+        if scheduler is None:
+            print("lr_scheduler=none")
+        else:
+            warmup_epochs = config.autoencoder_training.lr_warmup_steps / max(steps_per_epoch, 1)
+            print(f"lr_scheduler={config.autoencoder_training.lr_scheduler_type}")
+            print(f"lr_warmup_steps={config.autoencoder_training.lr_warmup_steps}")
+            print(f"lr_warmup_epochs~={warmup_epochs:.2f}")
+            print(f"total_optimizer_steps={total_steps}")
 
         update_wandb_summary(
             wandb_run,
@@ -313,6 +338,8 @@ def main() -> None:
             test_pairs=len(test_pairs),
             autoencoder_parameters=sum(parameter.numel() for parameter in model.parameters()),
             device=str(device),
+            optimizer_steps_per_epoch=steps_per_epoch,
+            total_optimizer_steps=total_steps,
         )
 
         if args.dry_run:
@@ -345,8 +372,6 @@ def main() -> None:
 
             model.train()
             running_total = 0.0
-            running_interval = 0.0
-            running_boundary = 0.0
             running_onset = 0.0
             running_sustain = 0.0
             running_pedal = 0.0
@@ -387,9 +412,6 @@ def main() -> None:
                         model_config=config.autoencoder_model,
                         roll_config=config.target_roll,
                         variational=use_variational,
-                        interval_targets=batch["interval_targets"],
-                        segment_valid_lengths=batch["segment_valid_lengths"],
-                        boundary_predictor=getattr(model.decoder, "interval_boundary_predictor", None),
                     )
                     step_loss = loss_dict["total"] / config.autoencoder_training.grad_accum_steps
 
@@ -400,8 +422,6 @@ def main() -> None:
                     step_loss.backward()
 
                 running_total += loss_dict["total"].detach().item()
-                running_interval += loss_dict["interval"].detach().item()
-                running_boundary += loss_dict["boundary"].detach().item()
                 running_onset += loss_dict["onset"].detach().item()
                 running_sustain += loss_dict["sustain"].detach().item()
                 running_pedal += loss_dict["pedal"].detach().item()
@@ -414,13 +434,9 @@ def main() -> None:
                     "pedal": f"{running_pedal / batch_count:.4f}",
                     "velocity": f"{running_velocity / batch_count:.4f}",
                     "step": global_step,
+                    "onset": f"{running_onset / batch_count:.4f}",
+                    "sustain": f"{running_sustain / batch_count:.4f}",
                 }
-                if config.autoencoder_model.decoder_mode == "frame":
-                    postfix["onset"] = f"{running_onset / batch_count:.4f}"
-                    postfix["sustain"] = f"{running_sustain / batch_count:.4f}"
-                else:
-                    postfix["interval"] = f"{running_interval / batch_count:.4f}"
-                    postfix["boundary"] = f"{running_boundary / batch_count:.4f}"
                 train_progress.set_postfix(**postfix)
 
                 # 勾配累積のステップ数が満たされたらオプティマイザを更新
@@ -434,7 +450,7 @@ def main() -> None:
                         scaler.update()
                     else:
                         optimizer.step()
-                    
+
                     if scheduler is not None:
                         scheduler.step()
 
@@ -447,18 +463,8 @@ def main() -> None:
                         log_str = (
                             f"epoch={epoch} step={global_step} "
                             f"train_total={running_total / batch_count:.4f} "
-                        )
-                        if config.autoencoder_model.decoder_mode == "frame":
-                            log_str += (
-                                f"train_onset={running_onset / batch_count:.4f} "
-                                f"train_sustain={running_sustain / batch_count:.4f} "
-                            )
-                        else:
-                            log_str += (
-                                f"train_interval={running_interval / batch_count:.4f} "
-                                f"train_boundary={running_boundary / batch_count:.4f} "
-                            )
-                        log_str += (
+                            f"train_onset={running_onset / batch_count:.4f} "
+                            f"train_sustain={running_sustain / batch_count:.4f} "
                             f"train_pedal={running_pedal / batch_count:.4f} "
                             f"train_velocity={running_velocity / batch_count:.4f} "
                             f"train_kl={running_kl / batch_count:.4f}"
@@ -472,13 +478,9 @@ def main() -> None:
                             "train/kl": running_kl / batch_count,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "epoch": epoch,
+                            "train/onset": running_onset / batch_count,
+                            "train/sustain": running_sustain / batch_count,
                         }
-                        if config.autoencoder_model.decoder_mode == "frame":
-                            metrics["train/onset"] = running_onset / batch_count
-                            metrics["train/sustain"] = running_sustain / batch_count
-                        else:
-                            metrics["train/interval"] = running_interval / batch_count
-                            metrics["train/boundary"] = running_boundary / batch_count
 
                         log_wandb_metrics(wandb_run, metrics, step=global_step)
 
@@ -525,7 +527,7 @@ def main() -> None:
                     scaler.update()
                 else:
                     optimizer.step()
-                
+
                 if scheduler is not None:
                     scheduler.step()
 
@@ -537,7 +539,7 @@ def main() -> None:
             val_loss = val_metrics["total"]
             is_best = val_loss <= best_val_loss
             best_val_loss = min(best_val_loss, val_loss)
-            
+
             wandb_val_metrics = {"epoch": epoch}
             for k, v in val_metrics.items():
                 wandb_val_metrics[f"val/{k}"] = v

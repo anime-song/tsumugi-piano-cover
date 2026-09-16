@@ -1,14 +1,15 @@
-import streamlit as st
 import json
 import os
-from typing import Dict, List, Optional
-from dataclasses import dataclass
 import urllib.parse
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+import streamlit as st
 
 # ==========================================
 # 定数・設定
 # ==========================================
-DATA_FILE_PATH = "dataset.json"
+DATA_FILE_PATH = "data/metadata/dataset.json"
 PAGE_TITLE = "YouTube Song Mapper"
 
 
@@ -109,13 +110,13 @@ def extract_youtube_ids(text: str) -> List[str]:
         return []
 
     # カンマや空白(改行含む)で分割してトークン化
-    tokens = re.split(r'[\s,]+', text)
+    tokens = re.split(r"[\s,]+", text)
     results = []
 
     for token in tokens:
         if not token:
             continue
-            
+
         # 1. URL形式から抽出 (v=ID, youtu.be/ID, embed/ID)
         # 前後の余計な文字を除去した上でIDパターンを探す
         match = re.search(r"(?:v=|\/|be\/|embed\/|^)([0-9A-Za-z_-]{11})(?:[?&]|$|#)", token)
@@ -123,13 +124,13 @@ def extract_youtube_ids(text: str) -> List[str]:
             # group(1)がID
             # ただし、regexの '^' マッチで誤検知する可能性があるため
             # tokenそのものがID形式(11文字)に近いか、あるいはURLの一部かを判断
-            
+
             candidate = match.group(1)
             # 念のため候補が純粋なID文字種のみか確認
             if re.fullmatch(r"[0-9A-Za-z_-]{11}", candidate):
                 results.append(candidate)
                 continue
-        
+
         # 2. そのままIDっぽい文字列 (11桁)
         # URLの一部としてヒットしなかった場合でも、生のIDとしてチェック
         if re.fullmatch(r"[0-9A-Za-z_-]{11}", token):
@@ -414,7 +415,7 @@ def main():
             if input_pianos_list:
                 st.write(f"Piano Covers ({len(input_pianos_list)})")
                 st.write(f"Piano Covers ({len(input_pianos_list)})")
-                
+
                 # グリッド表示 (2列)
                 p_cols = st.columns(2)
                 for i, pid in enumerate(input_pianos_list):

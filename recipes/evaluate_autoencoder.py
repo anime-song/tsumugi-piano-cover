@@ -6,14 +6,14 @@ from pathlib import Path
 
 import torch
 
-from src_v2.config import load_experiment_config
-from src_v2.data.segment import (
+from tsumugi_piano_cover.config import load_experiment_config
+from tsumugi_piano_cover.data.midi import load_trimmed_target_events
+from tsumugi_piano_cover.data.segment import (
     midi_to_target_roll,
     roll_to_score,
     segment_grid_from_roll,
 )
-from src_v2.data.midi import load_trimmed_target_events
-from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
+from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:

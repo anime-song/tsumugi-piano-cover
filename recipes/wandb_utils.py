@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from src_v2.config import ExperimentConfig
+from tsumugi_piano_cover.config import ExperimentConfig
 
 
 def init_wandb_run(config: ExperimentConfig, job_type: str):

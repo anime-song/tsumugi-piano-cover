@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -8,13 +9,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src_v2.config import ExperimentConfig, load_experiment_config
-from src_v2.data.dataset import SegmentDiffusionDataset, collate_diffusion_samples
-from src_v2.models.diffusion import ConditionalSegmentDiffusionModel
-from src_v2.models.losses import diffusion_mse_loss
-from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
-from src_v2.train_common import (
+from recipes.data.dataset import SegmentDiffusionDataset, collate_diffusion_samples
+from recipes.losses import diffusion_mse_loss
+from recipes.train_common import (
     ResumeState,
+    build_lr_scheduler,
     build_splits,
     clear_cuda_cache,
     get_autocast_context,
@@ -23,9 +22,12 @@ from src_v2.train_common import (
     resolve_device,
     save_checkpoint,
     skip_to_batch,
-    build_lr_scheduler,
 )
-from src_v2.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
+from recipes.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
+from tsumugi_piano_cover.config import ExperimentConfig, load_experiment_config
+from tsumugi_piano_cover.latent_scaling import resolve_latent_scale, scale_latents_for_diffusion
+from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
+from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--resume-from")
     parser.add_argument("--autoencoder-checkpoint")
+    parser.add_argument("--latent-scale", type=float)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-name")
     return parser.parse_args()
@@ -53,7 +56,7 @@ def resolve_autoencoder_checkpoint(config: ExperimentConfig, override: str | Non
 
 def load_frozen_autoencoder(
     config: ExperimentConfig, checkpoint_path: Path, device: torch.device
-) -> SegmentLatentAutoencoder:
+) -> tuple[SegmentLatentAutoencoder, dict[str, object]]:
     # オートエンコーダーの重みをフリーズ
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"autoencoder checkpoint not found: {checkpoint_path}")
@@ -63,7 +66,7 @@ def load_frozen_autoencoder(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    return model
+    return model, checkpoint
 
 
 def run_validation(
@@ -73,6 +76,7 @@ def run_validation(
     device: torch.device,
     config: ExperimentConfig,
     epoch: int,
+    latent_scale: float,
 ) -> float:
     model.eval()
     losses = []
@@ -82,6 +86,7 @@ def run_validation(
             batch = move_batch_to_device(batch, device)
             # ピアノカバーを潜在表現にエンコード
             latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
+            latents = scale_latents_for_diffusion(latents, latent_scale)
 
             timesteps = torch.randint(
                 0,
@@ -129,10 +134,28 @@ def main() -> None:
 
         # フリーズされたオートエンコーダーのロード
         autoencoder_checkpoint = resolve_autoencoder_checkpoint(config, args.autoencoder_checkpoint)
-        autoencoder = load_frozen_autoencoder(config, autoencoder_checkpoint, device)
+        autoencoder, autoencoder_payload = load_frozen_autoencoder(config, autoencoder_checkpoint, device)
+        latent_scale = resolve_latent_scale(
+            override=args.latent_scale,
+            checkpoint=autoencoder_payload,
+            require=True,
+            source_name="autoencoder checkpoint",
+        )
 
-        train_dataset = SegmentDiffusionDataset(train_pairs, config.source_chunks, config.target_roll)
-        val_dataset = SegmentDiffusionDataset(val_pairs, config.source_chunks, config.target_roll)
+        train_dataset = SegmentDiffusionDataset(
+            train_pairs,
+            config.target_roll,
+            alignment_cache_dir=config.dataset.alignment_cache_dir,
+            audio_sample_rate=config.tsumugi_model.sample_rate,
+            audio_channels=config.tsumugi_model.audio_channels,
+        )
+        val_dataset = SegmentDiffusionDataset(
+            val_pairs,
+            config.target_roll,
+            alignment_cache_dir=config.dataset.alignment_cache_dir,
+            audio_sample_rate=config.tsumugi_model.sample_rate,
+            audio_channels=config.tsumugi_model.audio_channels,
+        )
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.diffusion_training.batch_size,
@@ -148,9 +171,12 @@ def main() -> None:
             collate_fn=collate_diffusion_samples,
         )
 
-        model = ConditionalSegmentDiffusionModel(config.source_model, config.diffusion_model, performer_vocab_size).to(
-            device
-        )
+        model = ConditionalSegmentDiffusionModel(
+            config.source_model,
+            config.diffusion_model,
+            performer_vocab_size,
+            config.tsumugi_model,
+        ).to(device)
         model.set_gradient_checkpointing(True)
         optimizer = AdamW(
             model.parameters(),
@@ -162,8 +188,7 @@ def main() -> None:
         scaler = torch.amp.GradScaler(
             "cuda", enabled=device.type == "cuda" and config.diffusion_training.mixed_precision == "fp16"
         )
-        
-        import math
+
         steps_per_epoch = math.ceil(len(train_loader) / config.diffusion_training.grad_accum_steps)
         total_steps = config.diffusion_training.max_steps
         if total_steps is None:
@@ -191,6 +216,15 @@ def main() -> None:
                             "resume checkpoint prediction_type does not match current config: "
                             f"{checkpoint_prediction_type!r} != {config.diffusion_model.prediction_type!r}"
                         )
+            checkpoint_latent_scale = extra_state.get("latent_scale")
+            if checkpoint_latent_scale is None:
+                raise ValueError("resume checkpoint does not contain latent_scale")
+            checkpoint_latent_scale = float(checkpoint_latent_scale)
+            if not math.isclose(latent_scale, checkpoint_latent_scale, rel_tol=1.0e-6, abs_tol=1.0e-8):
+                raise ValueError(
+                    "resume checkpoint latent_scale does not match current setting: "
+                    f"{checkpoint_latent_scale} != {latent_scale}"
+                )
 
         print(f"experiment={config.experiment_name}")
         print(f"device={device}")
@@ -199,6 +233,7 @@ def main() -> None:
         print(f"test_pairs={len(test_pairs)}")
         print(f"performer_vocab_size={performer_vocab_size}")
         print(f"autoencoder_checkpoint={autoencoder_checkpoint}")
+        print(f"latent_scale={latent_scale}")
         print(f"diffusion_parameters={sum(parameter.numel() for parameter in model.parameters())}")
         print(f"prediction_type={config.diffusion_model.prediction_type}")
         print("gradient_checkpointing=True")
@@ -219,6 +254,7 @@ def main() -> None:
             test_pairs=len(test_pairs),
             performer_vocab_size=performer_vocab_size,
             autoencoder_checkpoint=str(autoencoder_checkpoint),
+            latent_scale=latent_scale,
             diffusion_parameters=sum(parameter.numel() for parameter in model.parameters()),
             prediction_type=config.diffusion_model.prediction_type,
             gradient_checkpointing=True,
@@ -268,6 +304,7 @@ def main() -> None:
                 # ピアノロールを潜在表現にエンコード
                 with torch.no_grad():
                     latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
+                    latents = scale_latents_for_diffusion(latents, latent_scale)
 
                 timesteps = torch.randint(
                     0,
@@ -307,10 +344,10 @@ def main() -> None:
                         scaler.update()
                     else:
                         optimizer.step()
-                    
+
                     if scheduler is not None:
                         scheduler.step()
-                        
+
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     epoch_step_count += 1
@@ -348,6 +385,7 @@ def main() -> None:
                             "last",
                             extra_state={
                                 "autoencoder_checkpoint": str(autoencoder_checkpoint),
+                                "latent_scale": latent_scale,
                                 "performer_vocab_size": performer_vocab_size,
                             },
                             scheduler=scheduler,
@@ -372,7 +410,7 @@ def main() -> None:
                     scaler.update()
                 else:
                     optimizer.step()
-                
+
                 if scheduler is not None:
                     scheduler.step()
 
@@ -380,7 +418,7 @@ def main() -> None:
                 global_step += 1
 
             # 検証とチェックポイント更新
-            val_loss = run_validation(model, autoencoder, val_loader, device, config, epoch)
+            val_loss = run_validation(model, autoencoder, val_loader, device, config, epoch, latent_scale)
             is_best = val_loss <= best_val_loss
             best_val_loss = min(best_val_loss, val_loss)
             log_wandb_metrics(wandb_run, {"val/total": val_loss, "epoch": epoch}, step=global_step)
@@ -400,6 +438,7 @@ def main() -> None:
                 "last",
                 extra_state={
                     "autoencoder_checkpoint": str(autoencoder_checkpoint),
+                    "latent_scale": latent_scale,
                     "performer_vocab_size": performer_vocab_size,
                 },
                 scheduler=scheduler,
@@ -419,6 +458,7 @@ def main() -> None:
                     "best",
                     extra_state={
                         "autoencoder_checkpoint": str(autoencoder_checkpoint),
+                        "latent_scale": latent_scale,
                         "performer_vocab_size": performer_vocab_size,
                     },
                     scheduler=scheduler,

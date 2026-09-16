@@ -1,8 +1,8 @@
-experiment_name: piano_cover_v2_segment_diffusion
+experiment_name: piano_cover_v2_tsumugi_diffusion
 seed: 7
 
 runtime:
-  work_dir: artifacts/piano_cover_v2_diffusion
+  work_dir: runs/piano_cover_v2_tsumugi_diffusion
   autoencoder_work_dir: artifacts/piano_cover_v2_autoencoder
   autoencoder_checkpoint:
   num_workers: 4
@@ -21,20 +21,24 @@ wandb:
   mode: online
 
 dataset:
-  dataset_json: dataset.json
-  original_midi_dir: Dataset/original_midis/merged
+  dataset_json: data/metadata/dataset.json
+  original_audio_dir: Dataset/original
   piano_midi_dir: Dataset/pianos_midi
-  piano_to_performer_json: piano_to_performer.json
+  piano_audio_dir: Dataset/pianos
+  piano_to_performer_json: data/metadata/piano_to_performer.json
+  alignment_cache_dir: artifacts/piano_cover_v2_alignments
   train_fraction: 0.9
   val_fraction: 0.05
   test_fraction: 0.05
 
-source_chunks:
-  window_seconds: 2.0
-  hop_seconds: 0.5
-  max_notes_per_chunk: 256
-  min_duration_seconds: 0.03
-  max_chunks_per_song: 512
+alignment:
+  cache_dir:
+  method: audio_sync
+  frame_seconds: 0.1
+  audio_sample_rate: 22050
+  sync_feature_rate: 40
+  sync_step_weights: [1.5, 1.5, 2.0]
+  sync_threshold_rec: 1000000
 
 target_roll:
   frame_seconds: 0.05
@@ -49,16 +53,15 @@ target_roll:
   pedal_threshold: 0.5
 
 autoencoder_model:
-  decoder_mode: semi-crf
   d_model: 256
-  latent_dim: 96
+  latent_dim: 128
   num_latent_queries: 4
   encoder_layers: 4
   decoder_layers: 4
   num_heads: 4
   ff_multiplier: 4
   dropout: 0.1
-  kl_beta: 1.0e-6
+  kl_beta: 0.001
   onset_positive_class_weight: 0.01
   onset_negative_class_weight: 0.99
   sustain_positive_class_weight: 0.05
@@ -67,32 +70,30 @@ autoencoder_model:
   sustain_loss_weight: 1.0
   pedal_loss_weight: 1.0
   velocity_loss_weight: 1.0
-  semi_crf_pitch_feature_dim: 32
-  semi_crf_head_dim: 32
-  semi_crf_length_scaling: linear
-  semi_crf_length_penalty: 0.0
-  semi_crf_note_bias: 0.0
-  semi_crf_track_batch_size: 8192
-  semi_crf_false_negative_cost: 0.0
-  semi_crf_false_positive_cost: 0.0
-  use_interval_boundary_head: true
-  interval_presence_loss_weight: 1.0
 
 source_model:
   d_model: 256
-  note_feature_dim: 4
-  num_programs: 129
-  num_source_track_roles: 4
-  num_chunk_queries: 4
-  chunk_encoder_layers: 2
-  song_encoder_layers: 4
-  num_heads: 8
-  ff_multiplier: 4
-  dropout: 0.1
+  alignment_bias_strength: 1.0
+  alignment_bias_sigma_seconds: 2.0
+  alignment_bias_aligned_time_weight: 1.0
+  alignment_bias_dropout: 0.1
+
+tsumugi_model:
+  model_id: anime-song/tsumugi-mrl
+  revision: 37e74399dcc60809b9f16bd0d837c8b99ed4719b
+  hidden_dim: 512
+  sample_rate: 22050
+  audio_channels: 2
+  lora_enabled: true
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  lora_target_modules: [to_q, to_k, to_v]
+  gradient_checkpointing: true
 
 diffusion_model:
   d_model: 256
-  latent_dim: 96
+  latent_dim: 128
   prediction_type: v
   num_layers: 6
   num_heads: 8
@@ -114,6 +115,9 @@ autoencoder_training:
   max_steps_per_epoch: 2000
   grad_clip_norm: 1.0
   mixed_precision: bf16
+  lr_scheduler_type: cosine_with_warmup
+  lr_warmup_steps: 1000
+  lr_min: 1.0e-6
   pitch_shift_min_semitones: -5
   pitch_shift_max_semitones: 5
 
@@ -126,7 +130,7 @@ diffusion_training:
   max_steps:
   max_steps_per_epoch:
   grad_clip_norm: 1.0
-  mixed_precision: bf16
+  mixed_precision: none
   lr_scheduler_type: cosine_with_warmup
   lr_warmup_steps: 2000
   lr_min: 1.0e-6

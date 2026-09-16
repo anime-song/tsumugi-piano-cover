@@ -1,3 +1,0 @@
-[submodule "external/amt_model"]
-	path = external/amt_model
-	url = https://github.com/anime-song/instrument-agnostic-amt

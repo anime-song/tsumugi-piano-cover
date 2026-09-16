@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from itertools import islice
@@ -9,10 +10,9 @@ import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from tqdm.auto import tqdm
-import math
 
-from src_v2.config import ExperimentConfig, TrainingConfig
-from src_v2.data.index import PairEntry, build_pair_index, split_pairs_by_song
+from recipes.data.index import PairEntry, build_pair_index, split_pairs_by_song
+from tsumugi_piano_cover.config import ExperimentConfig, TrainingConfig
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -56,7 +56,7 @@ def build_lr_scheduler(
     # 学習率スケジューラーの構築
     if config.lr_scheduler_type == "none":
         return None
-        
+
     if config.lr_scheduler_type == "cosine_with_warmup":
         warmup_steps = config.lr_warmup_steps
         lr_min_ratio = config.lr_min / config.learning_rate if config.learning_rate > 0 else 0.0
@@ -67,9 +67,9 @@ def build_lr_scheduler(
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
             progress = min(1.0, max(0.0, progress))
             return lr_min_ratio + 0.5 * (1.0 - lr_min_ratio) * (1.0 + math.cos(math.pi * progress))
-            
+
         return LambdaLR(optimizer, lr_lambda)
-        
+
     raise ValueError(f"unsupported lr_scheduler_type: {config.lr_scheduler_type}")
 
 
@@ -228,9 +228,10 @@ def build_splits(
     # データセットを構築し、曲単位で train/val/test に分割
     pairs = build_pair_index(
         dataset_json_path=config.dataset.dataset_json,
-        original_midi_dir=config.dataset.original_midi_dir,
         piano_midi_dir=config.dataset.piano_midi_dir,
         piano_to_performer_json=config.dataset.piano_to_performer_json,
+        original_audio_dir=config.dataset.original_audio_dir,
+        piano_audio_dir=config.dataset.piano_audio_dir,
     )
     splits = split_pairs_by_song(
         entries=pairs,

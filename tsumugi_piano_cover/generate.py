@@ -6,11 +6,16 @@ from pathlib import Path
 
 import torch
 
-from src_v2.config import load_experiment_config
-from src_v2.data.segment import segment_grid_from_duration, roll_to_score
-from src_v2.data.midi import chunk_source_events, load_trimmed_source_events
-from src_v2.models.diffusion import ConditionalSegmentDiffusionModel
-from src_v2.models.segment_autoencoder import SegmentLatentAutoencoder
+from tsumugi_piano_cover.config import load_experiment_config
+from tsumugi_piano_cover.data.audio import load_audio
+from tsumugi_piano_cover.data.segment import roll_to_score, segment_grid_from_duration
+from tsumugi_piano_cover.latent_scaling import (
+    get_checkpoint_latent_scale,
+    resolve_latent_scale,
+    unscale_latents_from_diffusion,
+)
+from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
+from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,13 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/piano_cover_v2.yaml")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--autoencoder-checkpoint", default=None)
-    parser.add_argument("--source-midi", required=True)
+    parser.add_argument("--source-audio", required=True)
     parser.add_argument("--output-midi", required=True)
     parser.add_argument("--output-json")
     parser.add_argument("--performer-id", type=int)
     parser.add_argument("--piano-id")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument("--latent-scale", type=float)
     return parser.parse_args()
 
 
@@ -45,26 +51,30 @@ def resolve_performer_id(args: argparse.Namespace, config) -> int:
     return int(performer_map[args.piano_id])
 
 
-def build_source_batch(source_midi_path: str, config, performer_id: int, device: torch.device):
+def build_source_batch(source_audio_path: str, config, performer_id: int, device: torch.device):
     # モデル入力用バッチの構築
-    source_events = load_trimmed_source_events(source_midi_path, config.source_chunks)
-    chunked = chunk_source_events(source_events, config.source_chunks)
+    source_audio = load_audio(
+        source_audio_path,
+        sample_rate=config.tsumugi_model.sample_rate,
+        num_channels=config.tsumugi_model.audio_channels,
+    )
+    source_audio_length = int(source_audio.shape[-1])
 
     # セグメント分割用グリッドの作成
-    source_duration = max((event.end for event in source_events), default=config.target_roll.frame_seconds)
+    source_duration = source_audio_length / config.tsumugi_model.sample_rate
     segment_grid = segment_grid_from_duration(source_duration, config.target_roll)
-    num_chunks = int(chunked["source_features"].shape[0])
     num_segments = int(segment_grid.segments.shape[0])
+    segment_times = segment_grid.segment_times.unsqueeze(0).to(device)
+    # 推論時は target 側 alignment が無いので、source MIDI の同時刻を参照する局所biasを使う
+    alignment_source_times = segment_times.clone()
+    alignment_mask = torch.ones((1, num_segments), dtype=torch.bool, device=device)
     batch = {
-        "source_features": chunked["source_features"].unsqueeze(0).to(device),
-        "source_programs": chunked["source_programs"].unsqueeze(0).to(device),
-        "source_drums": chunked["source_drums"].unsqueeze(0).to(device),
-        "source_track_roles": chunked["source_track_roles"].unsqueeze(0).to(device),
-        "source_note_mask": chunked["source_note_mask"].unsqueeze(0).to(device),
-        "source_chunk_times": chunked["source_chunk_times"].unsqueeze(0).to(device),
-        "source_chunk_mask": torch.ones((1, num_chunks), dtype=torch.bool, device=device),
-        "segment_times": segment_grid.segment_times.unsqueeze(0).to(device),
+        "source_audio": source_audio.unsqueeze(0).to(device),
+        "source_audio_lengths": torch.tensor([source_audio_length], dtype=torch.long, device=device),
+        "segment_times": segment_times,
         "segment_mask": torch.ones((1, num_segments), dtype=torch.bool, device=device),
+        "alignment_source_times": alignment_source_times,
+        "alignment_mask": alignment_mask,
         "performer_ids": torch.tensor([performer_id], dtype=torch.long, device=device),
     }
     return batch, segment_grid
@@ -113,16 +123,26 @@ def main() -> None:
     autoencoder_payload = torch.load(autoencoder_checkpoint, map_location=device)
     autoencoder.load_state_dict(autoencoder_payload["model_state"])
     autoencoder.eval()
+    latent_scale = resolve_latent_scale(
+        override=args.latent_scale,
+        checkpoint=diffusion_payload,
+        fallback=get_checkpoint_latent_scale(autoencoder_payload),
+        require=True,
+        source_name="diffusion checkpoint",
+    )
 
     # 5. Diffusionモデルのロード
-    model = ConditionalSegmentDiffusionModel(config.source_model, config.diffusion_model, performer_vocab_size).to(
-        device
-    )
+    model = ConditionalSegmentDiffusionModel(
+        config.source_model,
+        config.diffusion_model,
+        performer_vocab_size,
+        config.tsumugi_model,
+    ).to(device)
     model.load_state_dict(diffusion_payload["model_state"])
     model.eval()
 
     # 6. 入力バッチの構築と推論（サンプリング＆デコード）の実行
-    batch, segment_grid = build_source_batch(args.source_midi, config, performer_id, device)
+    batch, segment_grid = build_source_batch(args.source_audio, config, performer_id, device)
     latent_shape = (
         1,
         int(batch["segment_mask"].shape[1]),
@@ -132,6 +152,7 @@ def main() -> None:
     with torch.no_grad():
         # Diffusionモデルから潜在変数をサンプリング
         latents = model.sample(batch, latent_shape=latent_shape, sampling_steps=args.sampling_steps)
+        latents = unscale_latents_from_diffusion(latents, latent_scale)
         # 潜在変数をオートエンコーダーでデコード
         decoded = autoencoder.decode(latents)
         recon_roll = autoencoder.reconstruct_roll(
@@ -148,12 +169,13 @@ def main() -> None:
 
     # 8. 実行結果のレポート作成と保存
     report = {
-        "source_midi": args.source_midi,
+        "source_audio": args.source_audio,
         "diffusion_checkpoint": str(diffusion_checkpoint),
         "autoencoder_checkpoint": str(autoencoder_checkpoint),
         "performer_id": performer_id,
         "prediction_type": config.diffusion_model.prediction_type,
-        "num_source_chunks": int(batch["source_chunk_mask"].sum().item()),
+        "latent_scale": latent_scale,
+        "source_audio_samples": int(batch["source_audio_lengths"].item()),
         "num_segments": int(batch["segment_mask"].sum().item()),
         "num_frames": segment_grid.num_frames,
         "sampling_steps": args.sampling_steps or config.diffusion_model.sampling_steps,
