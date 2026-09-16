@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import fields
 from pathlib import Path
 
 import torch
@@ -9,11 +10,7 @@ import torch
 from tsumugi_piano_cover.config import load_experiment_config
 from tsumugi_piano_cover.data.audio import load_audio
 from tsumugi_piano_cover.data.segment import roll_to_score, segment_grid_from_duration
-from tsumugi_piano_cover.latent_scaling import (
-    get_checkpoint_latent_scale,
-    resolve_latent_scale,
-    unscale_latents_from_diffusion,
-)
+from tsumugi_piano_cover.latent_scaling import LatentNormalizer
 from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
 from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
@@ -28,9 +25,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json")
     parser.add_argument("--performer-id", type=int)
     parser.add_argument("--piano-id")
+    parser.add_argument(
+        "--null-performer",
+        action="store_true",
+        help="演奏者を指定せず、学習時に使った無条件（null）埋め込みで生成する",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=1.0,
+        help="演奏者条件の classifier-free guidance 強度。1.0 で guidance なし",
+    )
     parser.add_argument("--latent-scale", type=float)
+    parser.add_argument("--no-ema", action="store_true", help="EMA重みではなく生の学習重みで生成する")
     return parser.parse_args()
 
 
@@ -40,11 +49,26 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
-def resolve_performer_id(args: argparse.Namespace, config) -> int:
+def restore_config_section(section: object, payload: object) -> None:
+    """チェックポイント保存時の設定でモデル構造に関わる項目を上書きする。
+
+    ノイズスケジュールや alignment bias の幅は学習時と一致していないと推論が壊れるため、
+    YAML よりチェックポイント側を優先する。
+    """
+    if not isinstance(payload, dict):
+        return
+    for item in fields(section):  # type: ignore[arg-type]
+        if item.name in payload:
+            setattr(section, item.name, payload[item.name])
+
+
+def resolve_performer_id(args: argparse.Namespace, config, null_performer_id: int) -> int:
+    if args.null_performer:
+        return null_performer_id
     if args.performer_id is not None:
         return int(args.performer_id)
     if args.piano_id is None:
-        raise ValueError("either --performer-id or --piano-id is required")
+        raise ValueError("either --performer-id, --piano-id or --null-performer is required")
     performer_map = json.loads(Path(config.dataset.piano_to_performer_json).read_text(encoding="utf-8"))
     if args.piano_id not in performer_map:
         raise KeyError(f"piano_id not found in performer map: {args.piano_id}")
@@ -65,7 +89,8 @@ def build_source_batch(source_audio_path: str, config, performer_id: int, device
     segment_grid = segment_grid_from_duration(source_duration, config.target_roll)
     num_segments = int(segment_grid.segments.shape[0])
     segment_times = segment_grid.segment_times.unsqueeze(0).to(device)
-    # 推論時は target 側 alignment が無いので、source MIDI の同時刻を参照する局所biasを使う
+    # 推論時は target 側 alignment が無いので同時刻を guide にする。
+    # 学習側でも一定確率でこの条件を与えているため、ここでのズレは吸収されるはず
     alignment_source_times = segment_times.clone()
     alignment_mask = torch.ones((1, num_segments), dtype=torch.bool, device=device)
     batch = {
@@ -91,13 +116,11 @@ def main() -> None:
         raise FileNotFoundError(f"diffusion checkpoint not found: {diffusion_checkpoint}")
     diffusion_payload = torch.load(diffusion_checkpoint, map_location=device)
 
-    # 1-1. 生成時はcheckpoint保存時の prediction_type を優先する
+    # 1-1. 生成時はcheckpoint保存時のモデル設定を優先する
     checkpoint_config = diffusion_payload.get("experiment_config")
     if isinstance(checkpoint_config, dict):
-        checkpoint_diffusion_config = checkpoint_config.get("diffusion_model")
-        if isinstance(checkpoint_diffusion_config, dict):
-            checkpoint_prediction_type = checkpoint_diffusion_config.get("prediction_type", "epsilon")
-            config.diffusion_model.prediction_type = str(checkpoint_prediction_type)
+        restore_config_section(config.diffusion_model, checkpoint_config.get("diffusion_model"))
+        restore_config_section(config.source_model, checkpoint_config.get("source_model"))
 
     # 2. オートエンコーダー（VAE）のチェックポイントの特定
     autoencoder_checkpoint = args.autoencoder_checkpoint
@@ -110,35 +133,50 @@ def main() -> None:
     if not autoencoder_checkpoint.is_file():
         raise FileNotFoundError(f"autoencoder checkpoint not found: {autoencoder_checkpoint}")
 
-    # 3. 演奏者情報の解決
-    performer_id = resolve_performer_id(args, config)
-    performer_map = json.loads(Path(config.dataset.piano_to_performer_json).read_text(encoding="utf-8"))
+    # 3. 演奏者情報の解決。埋め込みの最終行は無条件（null）用に確保されている
     performer_vocab_size = diffusion_payload.get("performer_vocab_size")
     if performer_vocab_size is None:
-        # 重み形状から演奏者数を推測
-        performer_vocab_size = diffusion_payload["model_state"]["denoiser.performer_embedding.weight"].shape[0]
+        # 重み形状から演奏者数を推測（null ぶんの1行を差し引く）
+        embedding_rows = int(diffusion_payload["model_state"]["denoiser.performer_embedding.weight"].shape[0])
+        performer_vocab_size = embedding_rows - 1
+    performer_vocab_size = int(performer_vocab_size)
+    null_performer_id = performer_vocab_size
+    performer_id = resolve_performer_id(args, config, null_performer_id)
+    if not 0 <= performer_id <= null_performer_id:
+        raise ValueError(f"performer_id out of range: {performer_id} (vocab size {performer_vocab_size})")
 
     # 4. オートエンコーダーモデルのロード
     autoencoder = SegmentLatentAutoencoder(config.autoencoder_model, config.target_roll).to(device)
     autoencoder_payload = torch.load(autoencoder_checkpoint, map_location=device)
     autoencoder.load_state_dict(autoencoder_payload["model_state"])
     autoencoder.eval()
-    latent_scale = resolve_latent_scale(
-        override=args.latent_scale,
-        checkpoint=diffusion_payload,
-        fallback=get_checkpoint_latent_scale(autoencoder_payload),
-        require=True,
-        source_name="diffusion checkpoint",
-    )
+    # 潜在の正規化は学習時と厳密に一致させる必要があるので diffusion checkpoint を優先する
+    if args.latent_scale is not None:
+        normalizer = LatentNormalizer(scale=float(args.latent_scale))
+    elif diffusion_payload.get("latent_scale") is not None:
+        normalizer = LatentNormalizer.from_state_dict(diffusion_payload)
+    else:
+        normalizer = LatentNormalizer.from_autoencoder_checkpoint(autoencoder_payload)
+    normalizer = normalizer.to(device)
 
-    # 5. Diffusionモデルのロード
+    # 5. Diffusionモデルのロード。既定では推論品質が安定するEMA重みを使う
     model = ConditionalSegmentDiffusionModel(
         config.source_model,
         config.diffusion_model,
         performer_vocab_size,
         config.tsumugi_model,
     ).to(device)
-    model.load_state_dict(diffusion_payload["model_state"])
+    model_state = dict(diffusion_payload["model_state"])
+    ema_state = diffusion_payload.get("ema_state")
+    used_ema = False
+    if ema_state is not None and not args.no_ema:
+        shadow = ema_state.get("shadow") if isinstance(ema_state, dict) else None
+        if isinstance(shadow, dict) and shadow:
+            for name, tensor in shadow.items():
+                if name in model_state:
+                    model_state[name] = torch.as_tensor(tensor).to(model_state[name].dtype)
+            used_ema = True
+    model.load_state_dict(model_state)
     model.eval()
 
     # 6. 入力バッチの構築と推論（サンプリング＆デコード）の実行
@@ -151,8 +189,13 @@ def main() -> None:
 
     with torch.no_grad():
         # Diffusionモデルから潜在変数をサンプリング
-        latents = model.sample(batch, latent_shape=latent_shape, sampling_steps=args.sampling_steps)
-        latents = unscale_latents_from_diffusion(latents, latent_scale)
+        latents = model.sample(
+            batch,
+            latent_shape=latent_shape,
+            sampling_steps=args.sampling_steps,
+            guidance_scale=args.guidance_scale,
+        )
+        latents = normalizer.denormalize(latents)
         # 潜在変数をオートエンコーダーでデコード
         decoded = autoencoder.decode(latents)
         recon_roll = autoencoder.reconstruct_roll(
@@ -173,8 +216,12 @@ def main() -> None:
         "diffusion_checkpoint": str(diffusion_checkpoint),
         "autoencoder_checkpoint": str(autoencoder_checkpoint),
         "performer_id": performer_id,
+        "null_performer_id": null_performer_id,
+        "used_ema_weights": used_ema,
         "prediction_type": config.diffusion_model.prediction_type,
-        "latent_scale": latent_scale,
+        "zero_terminal_snr": config.diffusion_model.zero_terminal_snr,
+        "latent_normalization": normalizer.describe(),
+        "guidance_scale": args.guidance_scale,
         "source_audio_samples": int(batch["source_audio_lengths"].item()),
         "num_segments": int(batch["segment_mask"].sum().item()),
         "num_frames": segment_grid.num_frames,
