@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from recipes.data.dataset import SegmentDiffusionDataset, collate_diffusion_samples
+from recipes.generation_eval import evaluate_generation
 from recipes.losses import diffusion_mse_loss
 from recipes.train_common import (
     ExponentialMovingAverage,
@@ -26,7 +27,13 @@ from recipes.train_common import (
     set_global_seed,
     skip_to_batch,
 )
-from recipes.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
+from recipes.wandb_utils import (
+    finish_wandb_run,
+    init_wandb_run,
+    log_wandb_images,
+    log_wandb_metrics,
+    update_wandb_summary,
+)
 from tsumugi_piano_cover.config import ExperimentConfig, load_experiment_config
 from tsumugi_piano_cover.latent_scaling import LatentNormalizer
 from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
@@ -201,6 +208,22 @@ def main() -> None:
             collate_fn=collate_diffusion_samples,
         )
 
+        # 生成チェック用に val の先頭数曲を固定で取り出しておく（毎エポック同じ曲を見る）
+        generation_every = config.diffusion_training.generation_eval_every_epochs
+        generation_batches: list[dict] = []
+        if generation_every > 0:
+            probe_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=collate_diffusion_samples,
+            )
+            for probe_index, probe_batch in enumerate(probe_loader):
+                if probe_index >= config.diffusion_training.generation_eval_songs:
+                    break
+                generation_batches.append(probe_batch)
+
         model = ConditionalSegmentDiffusionModel(
             config.source_model,
             config.diffusion_model,
@@ -283,11 +306,20 @@ def main() -> None:
         print(f"mixed_precision={config.diffusion_training.mixed_precision}")
         print(f"timesteps_per_sample={timesteps_per_sample}")
         print(f"validation_timesteps={validation_timesteps}")
+        if generation_every > 0:
+            print(
+                f"generation_eval: {len(generation_batches)}曲 / {generation_every}エポックごと / "
+                f"{config.diffusion_training.generation_eval_sampling_steps}ステップ"
+            )
+        else:
+            print("generation_eval=disabled")
         if ema is None:
             print("ema=disabled")
         else:
             print(f"ema_decay={config.diffusion_training.ema_decay}")
-        print(f"gradient_checkpointing: denoiser={config.diffusion_model.gradient_checkpointing} tsumugi={config.tsumugi_model.gradient_checkpointing}")
+        print(
+            f"gradient_checkpointing: denoiser={config.diffusion_model.gradient_checkpointing} tsumugi={config.tsumugi_model.gradient_checkpointing}"
+        )
         print(f"optimizer_steps_per_epoch={steps_per_epoch}")
         if scheduler is None:
             print("lr_scheduler=none")
@@ -490,13 +522,41 @@ def main() -> None:
                     normalizer,
                     validation_timesteps,
                 )
+                # 実際に逆拡散を最後まで回して生成品質を見る。MSE では破綻を検知できないため
+                generation_metrics: dict[str, float] = {}
+                generation_images: list = []
+                if generation_batches and epoch % generation_every == 0:
+                    generation_metrics, generation_images = evaluate_generation(
+                        model,
+                        autoencoder,
+                        generation_batches,
+                        device,
+                        config,
+                        normalizer,
+                        epoch,
+                        sample_dir=work_dir / "samples",
+                    )
             is_best = val_loss <= best_val_loss
             best_val_loss = min(best_val_loss, val_loss)
             val_metrics: dict[str, float | int] = {"val/total": val_loss, "epoch": epoch}
             for timestep_value, timestep_loss in val_per_timestep.items():
                 val_metrics[f"val/t{timestep_value:04d}"] = timestep_loss
+            val_metrics.update(generation_metrics)
             log_wandb_metrics(wandb_run, val_metrics, step=global_step)
+            log_wandb_images(wandb_run, generation_images, key="generation/piano_roll", step=global_step)
             update_wandb_summary(wandb_run, best_val_loss=best_val_loss)
+            if generation_metrics:
+                tqdm.write(
+                    "epoch={} gen onset_f1={:.3f} (recon上限 {:.3f}) 密度比={:.2f} "
+                    "ピッチクラス一致={:.3f} latent_std={:.2f}".format(
+                        epoch,
+                        generation_metrics.get("gen/onset_f1", float("nan")),
+                        generation_metrics.get("recon/onset_f1", float("nan")),
+                        generation_metrics.get("gen/note_density_ratio", float("nan")),
+                        generation_metrics.get("gen/pitch_class_overlap", float("nan")),
+                        generation_metrics.get("gen/latent_std", float("nan")),
+                    )
+                )
             per_timestep_text = " ".join(f"t{k}={v:.4f}" for k, v in sorted(val_per_timestep.items()))
             tqdm.write(f"epoch={epoch} val_total={val_loss:.4f} {per_timestep_text}")
 
