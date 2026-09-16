@@ -279,12 +279,24 @@ class SegmentDiffusionDataset(Dataset[DiffusionSongSample]):
         alignment_cache_dir: str | None = None,
         audio_sample_rate: int = 22050,
         audio_channels: int = 2,
+        known_performer_ids: set[int] | None = None,
+        unknown_performer_id: int | None = None,
     ) -> None:
         self.entries = entries
         self.target_roll_config = target_roll_config
         self.alignment_cache_dir = Path(alignment_cache_dir) if alignment_cache_dir else None
         self.audio_sample_rate = audio_sample_rate
         self.audio_channels = audio_channels
+        # 学習に出てこない演奏者の埋め込みは未学習のままなので、null ID へ寄せる
+        self.known_performer_ids = known_performer_ids
+        self.unknown_performer_id = unknown_performer_id
+
+    def resolve_performer_id(self, performer_id: int) -> int:
+        if self.known_performer_ids is None or self.unknown_performer_id is None:
+            return performer_id
+        if performer_id in self.known_performer_ids:
+            return performer_id
+        return self.unknown_performer_id
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -322,7 +334,7 @@ class SegmentDiffusionDataset(Dataset[DiffusionSongSample]):
             song_name=entry.song_name,
             original_id=entry.original_id,
             piano_id=entry.piano_id,
-            performer_id=entry.performer_id,
+            performer_id=self.resolve_performer_id(entry.performer_id),
             source_audio=source_audio,
             source_audio_length=source_audio_length,
             alignment_source_times=alignment_source_times,
