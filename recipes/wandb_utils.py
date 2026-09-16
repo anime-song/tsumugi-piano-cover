@@ -40,6 +40,15 @@ def log_wandb_metrics(run, metrics: dict[str, Any], step: int | None = None) -> 
     run.log(metrics, step=step)
 
 
+def log_wandb_images(run, images: list[tuple[str, Any]], key: str, step: int | None = None) -> None:
+    # ピアノロール画像を wandb へ送る（numpy の HxWx3 配列を想定）
+    if run is None or not images:
+        return
+    import wandb
+
+    run.log({key: [wandb.Image(array, caption=caption) for caption, array in images]}, step=step)
+
+
 def update_wandb_summary(run, **items: Any) -> None:
     if run is None:
         return
