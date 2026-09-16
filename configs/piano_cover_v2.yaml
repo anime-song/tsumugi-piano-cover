@@ -2,7 +2,7 @@ experiment_name: piano_cover_v2_tsumugi_diffusion
 seed: 7
 
 runtime:
-  work_dir: runs/piano_cover_v2_tsumugi_diffusion
+  work_dir: runs/piano_cover_v2_sigma05
   autoencoder_work_dir: artifacts/piano_cover_v2_autoencoder
   autoencoder_checkpoint:
   num_workers: 4
@@ -75,13 +75,21 @@ autoencoder_model:
 source_model:
   d_model: 256
   alignment_bias_strength: 1.0
-  # 実測で |source_time - target_time| は中央値1.2秒/p75 6.5秒。sigma=2.0では
-  # 推論時（alignmentなし=同時刻guide）にbiasが正解位置を外すため広めに取る
-  alignment_bias_sigma_seconds: 6.0
+  # 潜在は発音時刻の位相に極めて敏感で、50ms ずらすだけで別カバー2本ぶんの
+  # 距離の31%を消費する（diagnose_diffusion onset-sensitivity で実測）。
+  # onset の一致も50ms精度を要求し、alignment 自体はその精度を渡せている
+  # （カバー2本の一致度はずれ0に鋭いピーク、42%が完全一致）。
+  # 一方 sigma=6.0 では bias が ±6秒を平均させており、注意エントロピー 6.31 が
+  # bias 単体の理論値 6.43 と一致していた = 音符配置に必要な情報が届かない。
+  # alignment 残差が最大±5フレーム(250ms)なので、2シグマで覆える 0.5 秒にする。
+  alignment_bias_sigma_seconds: 0.5
   alignment_bias_aligned_time_weight: 1.0
   alignment_bias_dropout: 0.1
   alignment_bias_song_dropout: 0.1
-  alignment_bias_identity_probability: 0.3
+  # alignment が無い曲では bias は 0 になる（song_dropout がその条件を学習済み）。
+  # identity guide は「自曲の時刻に bias を張る」第三の人工条件で、sigma が
+  # 狭いと正解位置を確実に外すため無効化する。
+  alignment_bias_identity_probability: 0.0
 
 tsumugi_model:
   model_id: anime-song/tsumugi-mrl
