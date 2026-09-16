@@ -47,7 +47,8 @@ target_roll:
   pitch_min: 21
   pitch_max: 108
   min_duration_seconds: 0.03
-  max_phrases_per_song: 512
+  # 768 * 0.65秒 = 499秒。データセット最長曲(463秒)まで打ち切られない
+  max_phrases_per_song: 768
   onset_threshold: 0.5
   sustain_threshold: 0.5
   pedal_threshold: 0.5
@@ -74,9 +75,13 @@ autoencoder_model:
 source_model:
   d_model: 256
   alignment_bias_strength: 1.0
-  alignment_bias_sigma_seconds: 2.0
+  # 実測で |source_time - target_time| は中央値1.2秒/p75 6.5秒。sigma=2.0では
+  # 推論時（alignmentなし=同時刻guide）にbiasが正解位置を外すため広めに取る
+  alignment_bias_sigma_seconds: 6.0
   alignment_bias_aligned_time_weight: 1.0
   alignment_bias_dropout: 0.1
+  alignment_bias_song_dropout: 0.1
+  alignment_bias_identity_probability: 0.3
 
 tsumugi_model:
   model_id: anime-song/tsumugi-mrl
@@ -89,7 +94,8 @@ tsumugi_model:
   lora_alpha: 16.0
   lora_dropout: 0.0
   lora_target_modules: [to_q, to_k, to_v]
-  gradient_checkpointing: true
+  # VRAM 12GB では最長曲でも 3.9GB しか使わないため、再計算を省いて速度を取る
+  gradient_checkpointing: false
 
 diffusion_model:
   d_model: 256
@@ -100,10 +106,14 @@ diffusion_model:
   ff_multiplier: 4
   dropout: 0.1
   performer_dropout: 0.1
+  segment_time_min_period_seconds: 0.5
+  segment_time_max_period_seconds: 1024.0
   num_train_timesteps: 1000
   beta_start: 1.0e-3
   beta_end: 0.02
+  zero_terminal_snr: true
   sampling_steps: 50
+  gradient_checkpointing: false
 
 autoencoder_training:
   batch_size: 512
@@ -120,6 +130,8 @@ autoencoder_training:
   lr_min: 1.0e-6
   pitch_shift_min_semitones: -5
   pitch_shift_max_semitones: 5
+  # train_autoencoder.py はEMA/複数タイムステップを使わない
+  ema_enabled: false
 
 diffusion_training:
   batch_size: 1
@@ -130,9 +142,15 @@ diffusion_training:
   max_steps:
   max_steps_per_epoch:
   grad_clip_norm: 1.0
-  mixed_precision: none
+  mixed_precision: bf16
   lr_scheduler_type: cosine_with_warmup
   lr_warmup_steps: 2000
   lr_min: 1.0e-6
   pitch_shift_min_semitones: 0
   pitch_shift_max_semitones: 0
+  ema_enabled: true
+  ema_decay: 0.999
+  # 1曲あたり4つのタイムステップを引く。原曲エンコードを共有するので
+  # コストは約2.3倍で済み、optimizer step あたりのタイムステップ数は 4 -> 16 になる
+  timesteps_per_sample: 4
+  val_timesteps: 5
