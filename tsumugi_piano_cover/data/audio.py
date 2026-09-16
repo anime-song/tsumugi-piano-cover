@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 
 
 def load_audio(path: str | Path, sample_rate: int, num_channels: int = 2) -> torch.Tensor:
     """Load one audio file as [channels, samples] at the requested sample rate."""
-    waveform, input_sample_rate = torchaudio.load(str(path))
+    # デコードは libsndfile (soundfile) に任せる。torchaudio.load は 2.11 以降
+    # torchcodec と FFmpeg の共有ライブラリを要求するようになったため使わない。
+    # リサンプルは torchaudio.functional.resample のまま（こちらは依存が増えない）。
+    data, input_sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    # soundfile は [samples, channels] を返すので転置する
+    waveform = torch.from_numpy(np.ascontiguousarray(data.T))
     if waveform.ndim != 2 or waveform.shape[0] == 0 or waveform.shape[1] == 0:
         raise ValueError(f"audio must have shape [channels, samples]: {path}")
 
@@ -27,5 +34,5 @@ def load_audio(path: str | Path, sample_rate: int, num_channels: int = 2) -> tor
 
 def get_audio_duration_seconds(path: str | Path) -> float:
     """Return an audio file's duration without decoding the full waveform."""
-    info = torchaudio.info(str(path))
-    return float(info.num_frames) / float(info.sample_rate)
+    info = sf.info(str(path))
+    return float(info.frames) / float(info.samplerate)
