@@ -99,7 +99,9 @@ class TsumugiAudioEncoder(nn.Module):
         audio_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         frame_mask, frame_times = self.frame_metadata(audio_lengths, max_samples=audio.shape[-1])
-        tsumugi_padding_mask = ~frame_mask
+        # パディングが無いときに mask を渡すと SDPA が FlashAttention を選べなくなるため、
+        # 必要なときだけ渡す（batch_size=1 の学習では常にパディング無し）
+        tsumugi_padding_mask = None if bool(frame_mask.all()) else ~frame_mask
         hidden = self.model(audio, padding_mask=tsumugi_padding_mask)
         if hidden.shape[:2] != frame_mask.shape:
             raise RuntimeError(
