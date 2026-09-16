@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
+import random
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from itertools import islice
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
@@ -19,6 +22,92 @@ def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
+
+
+def set_global_seed(seed: int) -> None:
+    # Python / NumPy / PyTorch の乱数を揃えて実験を再現可能にする
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+class ExponentialMovingAverage:
+    """学習可能パラメータの指数移動平均。
+
+    Diffusion では生の重みよりEMA重みの方がサンプル品質が安定するため、検証と
+    チェックポイント保存はEMA側で行う。凍結パラメータ（Tsumugi本体など）は
+    更新されないのでシャドウを持たず、メモリは学習対象ぶんだけ増える。
+    """
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.decay = float(decay)
+        self.num_updates = 0
+        self.shadow: dict[str, torch.Tensor] = {
+            name: parameter.detach().clone().float()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self._backup: dict[str, torch.Tensor] | None = None
+
+    def _current_decay(self) -> float:
+        # 立ち上がりでは decay を抑え、初期の重みを引きずらないようにする
+        return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        decay = self._current_decay()
+        for name, parameter in model.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is None:
+                continue
+            shadow.mul_(decay).add_(parameter.detach().float(), alpha=1.0 - decay)
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        for name, parameter in model.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is not None:
+                parameter.copy_(shadow.to(dtype=parameter.dtype))
+
+    @contextmanager
+    def as_active(self, model: nn.Module) -> Generator[None]:
+        # 検証・保存の間だけモデルの重みをEMAへ差し替える
+        self._backup = {
+            name: parameter.detach().clone() for name, parameter in model.named_parameters() if name in self.shadow
+        }
+        self.copy_to(model)
+        try:
+            yield
+        finally:
+            backup = self._backup
+            self._backup = None
+            if backup is not None:
+                with torch.no_grad():
+                    for name, parameter in model.named_parameters():
+                        saved = backup.get(name)
+                        if saved is not None:
+                            parameter.copy_(saved)
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+            "shadow": {name: tensor.detach().cpu() for name, tensor in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        shadow = state.get("shadow")
+        if not isinstance(shadow, dict):
+            raise TypeError("ema state does not contain a shadow dict")
+        missing = set(self.shadow) - set(shadow)
+        if missing:
+            raise ValueError(f"ema state is missing {len(missing)} parameters, e.g. {sorted(missing)[:3]}")
+        for name in self.shadow:
+            self.shadow[name].copy_(torch.as_tensor(shadow[name]).to(self.shadow[name].device).float())
+        self.num_updates = int(state.get("num_updates", 0))
 
 
 def get_autocast_context(device: torch.device, mixed_precision: str):
@@ -117,8 +206,9 @@ def save_checkpoint(
     checkpoint_name: str,
     extra_state: dict[str, object] | None = None,
     scheduler: LRScheduler | None = None,
+    ema: ExponentialMovingAverage | None = None,
 ) -> None:
-    # チェックポイントの保存（重み、最適化状態、乱数シードなど）
+    # チェックポイントの保存（重み、最適化状態、EMA、乱数シードなど）
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model_state": model.state_dict(),
@@ -133,6 +223,7 @@ def save_checkpoint(
         "cpu_rng_state": torch.random.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "lr_scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "ema_state": ema.state_dict() if ema is not None else None,
     }
     if extra_state:
         payload.update(extra_state)
@@ -151,6 +242,7 @@ def load_training_checkpoint(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     scheduler: LRScheduler | None = None,
+    ema: ExponentialMovingAverage | None = None,
 ) -> tuple[ResumeState, dict[str, object]]:
     # チェックポイントの読み込み
     if not path.is_file():
@@ -167,6 +259,13 @@ def load_training_checkpoint(
     lr_scheduler_state = checkpoint.get("lr_scheduler_state")
     if scheduler is not None and lr_scheduler_state is not None:
         scheduler.load_state_dict(lr_scheduler_state)
+
+    ema_state = checkpoint.get("ema_state")
+    if ema is not None:
+        if ema_state is None:
+            tqdm.write("checkpoint has no ema state; seeding the ema from the loaded weights.")
+        else:
+            ema.load_state_dict(ema_state)
 
     # 乱数状態の復元
     cpu_rng_state = checkpoint.get("cpu_rng_state")
@@ -206,6 +305,7 @@ def load_training_checkpoint(
         "cpu_rng_state",
         "cuda_rng_state_all",
         "lr_scheduler_state",
+        "ema_state",
     }
     extra_state = {key: value for key, value in checkpoint.items() if key not in reserved}
     return (
