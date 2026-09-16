@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ from tqdm.auto import tqdm
 from recipes.data.dataset import SegmentDiffusionDataset, collate_diffusion_samples
 from recipes.losses import diffusion_mse_loss
 from recipes.train_common import (
+    ExponentialMovingAverage,
     ResumeState,
     build_lr_scheduler,
     build_splits,
@@ -21,11 +23,12 @@ from recipes.train_common import (
     move_batch_to_device,
     resolve_device,
     save_checkpoint,
+    set_global_seed,
     skip_to_batch,
 )
 from recipes.wandb_utils import finish_wandb_run, init_wandb_run, log_wandb_metrics, update_wandb_summary
 from tsumugi_piano_cover.config import ExperimentConfig, load_experiment_config
-from tsumugi_piano_cover.latent_scaling import resolve_latent_scale, scale_latents_for_diffusion
+from tsumugi_piano_cover.latent_scaling import LatentNormalizer
 from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
 from tsumugi_piano_cover.models.segment_autoencoder import SegmentLatentAutoencoder
 
@@ -41,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from")
     parser.add_argument("--autoencoder-checkpoint")
     parser.add_argument("--latent-scale", type=float)
+    parser.add_argument(
+        "--latent-no-whiten",
+        action="store_true",
+        help="latent_std による次元ごとの白色化を使わず、スカラー latent_scale だけで割る",
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-name")
     return parser.parse_args()
@@ -69,6 +77,18 @@ def load_frozen_autoencoder(
     return model, checkpoint
 
 
+def build_validation_timesteps(config: ExperimentConfig) -> list[int]:
+    """検証で毎回使う固定タイムステップを返す。
+
+    タイムステップを乱択すると val loss が引いた t に強く依存し、エポック間で比較できず
+    best チェックポイントの選択がほぼ運になる。各ノイズ帯域の中央を等間隔に固定する。
+    """
+    count = int(config.diffusion_training.val_timesteps)
+    num_train_timesteps = int(config.diffusion_model.num_train_timesteps)
+    return [min(num_train_timesteps - 1, int((index + 0.5) * num_train_timesteps / count)) for index in range(count)]
+
+
+@torch.no_grad()
 def run_validation(
     model: ConditionalSegmentDiffusionModel,
     autoencoder: SegmentLatentAutoencoder,
@@ -76,44 +96,49 @@ def run_validation(
     device: torch.device,
     config: ExperimentConfig,
     epoch: int,
-    latent_scale: float,
-) -> float:
+    normalizer: LatentNormalizer,
+    validation_timesteps: list[int],
+) -> tuple[float, dict[int, float]]:
     model.eval()
-    losses = []
-    with torch.no_grad():
-        val_progress = tqdm(loader, desc=f"Epoch {epoch} val", dynamic_ncols=True, leave=False)
-        for batch in val_progress:
-            batch = move_batch_to_device(batch, device)
-            # ピアノカバーを潜在表現にエンコード
-            latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
-            latents = scale_latents_for_diffusion(latents, latent_scale)
+    totals = {timestep: 0.0 for timestep in validation_timesteps}
+    batch_count = 0
+    # 毎エポック同じノイズを引くための専用ジェネレータ
+    generator = torch.Generator(device=device)
 
-            timesteps = torch.randint(
-                0,
-                config.diffusion_model.num_train_timesteps,
-                (latents.shape[0],),
-                device=device,
-                dtype=torch.long,
-            )
-            noise = torch.randn_like(latents)
+    val_progress = tqdm(loader, desc=f"Epoch {epoch} val", dynamic_ncols=True, leave=False)
+    for batch_index, batch in enumerate(val_progress):
+        batch = move_batch_to_device(batch, device)
+        # ピアノカバーを潜在表現にエンコード
+        latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
+        latents = normalizer.normalize(latents)
 
-            # 1. ノイズ付与とモデル出力の計算
-            noisy_latents = model.q_sample(latents, timesteps, noise)
-            model_output = model(batch, noisy_latents, timesteps)
+        with get_autocast_context(device, config.diffusion_training.mixed_precision):
+            # 原曲エンコードは全タイムステップで共有する
+            conditioning = model.prepare_conditioning(batch)
+            for timestep_index, timestep_value in enumerate(validation_timesteps):
+                generator.manual_seed(config.seed * 1_000_003 + batch_index * 1009 + timestep_index)
+                noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
 
-            # 2. prediction_type に応じた教師ターゲットとの MSE を計算
-            target = model.compute_training_target(latents, noise, timesteps)
-            loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
-            losses.append(loss.detach().cpu())
-            val_progress.set_postfix(val_total=f"{loss.item():.4f}")
-    if not losses:
-        return float("nan")
-    return torch.stack(losses).mean().item()
+                noisy_latents = model.q_sample(latents, timesteps, noise)
+                model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
+                target = model.compute_training_target(latents, noise, timesteps)
+                loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                totals[timestep_value] += float(loss.detach().item())
+
+        batch_count += 1
+        val_progress.set_postfix(val_total=f"{sum(totals.values()) / (batch_count * len(validation_timesteps)):.4f}")
+
+    if batch_count == 0:
+        return float("nan"), {}
+    per_timestep = {timestep: value / batch_count for timestep, value in totals.items()}
+    return sum(per_timestep.values()) / len(per_timestep), per_timestep
 
 
 def main() -> None:
     args = parse_args()
     config = load_experiment_config(args.config)
+    set_global_seed(config.seed)
     if args.wandb:
         config.wandb.enabled = True
     if args.wandb_name is not None:
@@ -127,20 +152,22 @@ def main() -> None:
             limit_train_pairs=args.limit_train_pairs,
             limit_val_pairs=args.limit_val_pairs,
         )
-        # 演奏者IDの語彙サイズ
+        # 演奏者IDの語彙サイズ。末尾の1つは無条件（null）埋め込み用にモデル側で確保される
         performer_vocab_size = max(pair.performer_id for pair in (train_pairs + val_pairs + test_pairs)) + 1
+        null_performer_id = performer_vocab_size
+        train_performer_ids = {pair.performer_id for pair in train_pairs}
+        unseen_val_pairs = sum(1 for pair in val_pairs if pair.performer_id not in train_performer_ids)
         work_dir = Path(config.runtime.work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # フリーズされたオートエンコーダーのロード
         autoencoder_checkpoint = resolve_autoencoder_checkpoint(config, args.autoencoder_checkpoint)
         autoencoder, autoencoder_payload = load_frozen_autoencoder(config, autoencoder_checkpoint, device)
-        latent_scale = resolve_latent_scale(
-            override=args.latent_scale,
-            checkpoint=autoencoder_payload,
-            require=True,
-            source_name="autoencoder checkpoint",
-        )
+        normalizer = LatentNormalizer.from_autoencoder_checkpoint(
+            autoencoder_payload,
+            scale_override=args.latent_scale,
+            whiten=not args.latent_no_whiten,
+        ).to(device)
 
         train_dataset = SegmentDiffusionDataset(
             train_pairs,
@@ -155,6 +182,9 @@ def main() -> None:
             alignment_cache_dir=config.dataset.alignment_cache_dir,
             audio_sample_rate=config.tsumugi_model.sample_rate,
             audio_channels=config.tsumugi_model.audio_channels,
+            # 学習に出てこない演奏者の埋め込みは未学習のままなので null へ寄せる
+            known_performer_ids=train_performer_ids,
+            unknown_performer_id=null_performer_id,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -177,11 +207,16 @@ def main() -> None:
             performer_vocab_size,
             config.tsumugi_model,
         ).to(device)
-        model.set_gradient_checkpointing(True)
+        model.set_gradient_checkpointing(config.diffusion_model.gradient_checkpointing)
         optimizer = AdamW(
             model.parameters(),
             lr=config.diffusion_training.learning_rate,
             weight_decay=config.diffusion_training.weight_decay,
+        )
+        ema = (
+            ExponentialMovingAverage(model, config.diffusion_training.ema_decay)
+            if config.diffusion_training.ema_enabled
+            else None
         )
 
         # GradScalerの初期化
@@ -195,6 +230,8 @@ def main() -> None:
             total_steps = steps_per_epoch * config.diffusion_training.max_epochs
 
         scheduler = build_lr_scheduler(optimizer, config.diffusion_training, total_steps)
+        timesteps_per_sample = int(config.diffusion_training.timesteps_per_sample)
+        validation_timesteps = build_validation_timesteps(config)
 
         resume_state = ResumeState()
         if args.resume_from is not None:
@@ -205,6 +242,7 @@ def main() -> None:
                 scaler,
                 device,
                 scheduler=scheduler,
+                ema=ema,
             )
             checkpoint_config = extra_state.get("experiment_config")
             if isinstance(checkpoint_config, dict):
@@ -216,27 +254,40 @@ def main() -> None:
                             "resume checkpoint prediction_type does not match current config: "
                             f"{checkpoint_prediction_type!r} != {config.diffusion_model.prediction_type!r}"
                         )
-            checkpoint_latent_scale = extra_state.get("latent_scale")
-            if checkpoint_latent_scale is None:
-                raise ValueError("resume checkpoint does not contain latent_scale")
-            checkpoint_latent_scale = float(checkpoint_latent_scale)
-            if not math.isclose(latent_scale, checkpoint_latent_scale, rel_tol=1.0e-6, abs_tol=1.0e-8):
+            checkpoint_vocab_size = extra_state.get("performer_vocab_size")
+            if checkpoint_vocab_size is not None and int(checkpoint_vocab_size) != performer_vocab_size:
                 raise ValueError(
-                    "resume checkpoint latent_scale does not match current setting: "
-                    f"{checkpoint_latent_scale} != {latent_scale}"
+                    "resume checkpoint performer_vocab_size does not match current dataset: "
+                    f"{int(checkpoint_vocab_size)} != {performer_vocab_size}"
+                )
+            checkpoint_normalizer = LatentNormalizer.from_state_dict(extra_state)
+            if not normalizer.matches(checkpoint_normalizer.to(device)):
+                raise ValueError(
+                    "resume checkpoint latent normalization does not match current setting: "
+                    f"{checkpoint_normalizer.describe()} != {normalizer.describe()}"
                 )
 
         print(f"experiment={config.experiment_name}")
         print(f"device={device}")
+        print(f"seed={config.seed}")
         print(f"train_pairs={len(train_pairs)}")
         print(f"val_pairs={len(val_pairs)}")
         print(f"test_pairs={len(test_pairs)}")
-        print(f"performer_vocab_size={performer_vocab_size}")
+        print(f"performer_vocab_size={performer_vocab_size} (null_performer_id={null_performer_id})")
+        print(f"val_pairs_with_unseen_performer={unseen_val_pairs} (remapped to null_performer_id)")
         print(f"autoencoder_checkpoint={autoencoder_checkpoint}")
-        print(f"latent_scale={latent_scale}")
+        print(f"latent_normalization={normalizer.describe()}")
         print(f"diffusion_parameters={sum(parameter.numel() for parameter in model.parameters())}")
         print(f"prediction_type={config.diffusion_model.prediction_type}")
-        print("gradient_checkpointing=True")
+        print(f"zero_terminal_snr={config.diffusion_model.zero_terminal_snr}")
+        print(f"mixed_precision={config.diffusion_training.mixed_precision}")
+        print(f"timesteps_per_sample={timesteps_per_sample}")
+        print(f"validation_timesteps={validation_timesteps}")
+        if ema is None:
+            print("ema=disabled")
+        else:
+            print(f"ema_decay={config.diffusion_training.ema_decay}")
+        print(f"gradient_checkpointing: denoiser={config.diffusion_model.gradient_checkpointing} tsumugi={config.tsumugi_model.gradient_checkpointing}")
         print(f"optimizer_steps_per_epoch={steps_per_epoch}")
         if scheduler is None:
             print("lr_scheduler=none")
@@ -253,11 +304,17 @@ def main() -> None:
             val_pairs=len(val_pairs),
             test_pairs=len(test_pairs),
             performer_vocab_size=performer_vocab_size,
+            val_pairs_with_unseen_performer=unseen_val_pairs,
             autoencoder_checkpoint=str(autoencoder_checkpoint),
-            latent_scale=latent_scale,
+            latent_normalization=normalizer.describe(),
             diffusion_parameters=sum(parameter.numel() for parameter in model.parameters()),
             prediction_type=config.diffusion_model.prediction_type,
-            gradient_checkpointing=True,
+            zero_terminal_snr=config.diffusion_model.zero_terminal_snr,
+            mixed_precision=config.diffusion_training.mixed_precision,
+            timesteps_per_sample=timesteps_per_sample,
+            ema_decay=config.diffusion_training.ema_decay if ema is not None else None,
+            denoiser_gradient_checkpointing=config.diffusion_model.gradient_checkpointing,
+            tsumugi_gradient_checkpointing=config.tsumugi_model.gradient_checkpointing,
             device=str(device),
             optimizer_steps_per_epoch=steps_per_epoch,
             total_optimizer_steps=total_steps,
@@ -279,6 +336,29 @@ def main() -> None:
         best_val_loss = resume_state.best_val_loss
         optimizer.zero_grad(set_to_none=True)
 
+        def checkpoint_extra_state() -> dict[str, object]:
+            return {
+                "autoencoder_checkpoint": str(autoencoder_checkpoint),
+                "performer_vocab_size": performer_vocab_size,
+                **normalizer.state_dict(),
+            }
+
+        def apply_optimizer_step() -> None:
+            # 勾配クリップ → optimizer.step → scheduler / EMA 更新までを1か所にまとめる
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.diffusion_training.grad_clip_norm)
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(model)
+            optimizer.zero_grad(set_to_none=True)
+
         for epoch in range(resume_state.start_epoch, config.diffusion_training.max_epochs):
             model.train()
             running_total = 0.0
@@ -286,6 +366,8 @@ def main() -> None:
             epoch_start_batch = resume_state.start_batch_index if epoch == resume_state.start_epoch else 0
             epoch_step_limit = config.diffusion_training.max_steps_per_epoch
             epoch_step_count = epoch_start_batch // config.diffusion_training.grad_accum_steps
+            # 勾配累積の残量。batch_index に依存しないので途中再開でもズレない
+            pending_accumulation = 0
             stopped_by_epoch_step_limit = False
             train_progress = tqdm(
                 skip_to_batch(train_loader, epoch_start_batch),
@@ -304,25 +386,32 @@ def main() -> None:
                 # ピアノロールを潜在表現にエンコード
                 with torch.no_grad():
                     latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
-                    latents = scale_latents_for_diffusion(latents, latent_scale)
-
-                timesteps = torch.randint(
-                    0,
-                    config.diffusion_model.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=device,
-                    dtype=torch.long,
-                )
-                noise = torch.randn_like(latents)
+                    latents = normalizer.normalize(latents)
 
                 with get_autocast_context(device, config.diffusion_training.mixed_precision):
-                    # 1. 潜在変数にノイズを付与
-                    noisy_latents = model.q_sample(latents, timesteps, noise)
+                    # 1. 原曲エンコードと alignment bias は1曲につき1回だけ計算し、
+                    #    複数のタイムステップで共有する（計算時間の大半がここなので安い）
+                    conditioning = model.prepare_conditioning(batch)
 
-                    # 2. prediction_type に応じたターゲットを予測
-                    model_output = model(batch, noisy_latents, timesteps)
-                    target = model.compute_training_target(latents, noise, timesteps)
-                    loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                    loss = None
+                    for _ in range(timesteps_per_sample):
+                        timesteps = torch.randint(
+                            0,
+                            config.diffusion_model.num_train_timesteps,
+                            (latents.shape[0],),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        noise = torch.randn_like(latents)
+
+                        # 2. 潜在変数にノイズを付与し、prediction_type に応じたターゲットを予測
+                        noisy_latents = model.q_sample(latents, timesteps, noise)
+                        model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
+                        target = model.compute_training_target(latents, noise, timesteps)
+                        timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                        loss = timestep_loss if loss is None else loss + timestep_loss
+
+                    loss = loss / timesteps_per_sample
                     step_loss = loss / config.diffusion_training.grad_accum_steps
 
                 if scaler.is_enabled():
@@ -332,23 +421,12 @@ def main() -> None:
 
                 running_total += loss.detach().item()
                 batch_count += 1
+                pending_accumulation += 1
                 train_progress.set_postfix(total=f"{running_total / batch_count:.4f}", step=global_step)
 
-                should_step = (batch_index + 1) % config.diffusion_training.grad_accum_steps == 0
-                if should_step:
-                    if scaler.is_enabled():
-                        scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.diffusion_training.grad_clip_norm)
-                    if scaler.is_enabled():
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-
-                    if scheduler is not None:
-                        scheduler.step()
-
-                    optimizer.zero_grad(set_to_none=True)
+                if pending_accumulation >= config.diffusion_training.grad_accum_steps:
+                    apply_optimizer_step()
+                    pending_accumulation = 0
                     global_step += 1
                     epoch_step_count += 1
 
@@ -383,12 +461,9 @@ def main() -> None:
                             next_epoch,
                             next_batch_index,
                             "last",
-                            extra_state={
-                                "autoencoder_checkpoint": str(autoencoder_checkpoint),
-                                "latent_scale": latent_scale,
-                                "performer_vocab_size": performer_vocab_size,
-                            },
+                            extra_state=checkpoint_extra_state(),
                             scheduler=scheduler,
+                            ema=ema,
                         )
 
                     if args.max_steps is not None and global_step >= args.max_steps:
@@ -397,32 +472,33 @@ def main() -> None:
                         stopped_by_epoch_step_limit = True
                         break
 
-            if (
-                not stopped_by_epoch_step_limit
-                and batch_count > 0
-                and batch_count % config.diffusion_training.grad_accum_steps != 0
-            ):
-                if scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.diffusion_training.grad_clip_norm)
-                if scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-
-                if scheduler is not None:
-                    scheduler.step()
-
-                optimizer.zero_grad(set_to_none=True)
+            if not stopped_by_epoch_step_limit and pending_accumulation > 0:
+                apply_optimizer_step()
+                pending_accumulation = 0
                 global_step += 1
 
-            # 検証とチェックポイント更新
-            val_loss = run_validation(model, autoencoder, val_loader, device, config, epoch, latent_scale)
+            # 検証とチェックポイント更新。EMA重みで評価する（推論で使うのはEMA側のため）
+            evaluation_context = ema.as_active(model) if ema is not None else nullcontext()
+            with evaluation_context:
+                val_loss, val_per_timestep = run_validation(
+                    model,
+                    autoencoder,
+                    val_loader,
+                    device,
+                    config,
+                    epoch,
+                    normalizer,
+                    validation_timesteps,
+                )
             is_best = val_loss <= best_val_loss
             best_val_loss = min(best_val_loss, val_loss)
-            log_wandb_metrics(wandb_run, {"val/total": val_loss, "epoch": epoch}, step=global_step)
+            val_metrics: dict[str, float | int] = {"val/total": val_loss, "epoch": epoch}
+            for timestep_value, timestep_loss in val_per_timestep.items():
+                val_metrics[f"val/t{timestep_value:04d}"] = timestep_loss
+            log_wandb_metrics(wandb_run, val_metrics, step=global_step)
             update_wandb_summary(wandb_run, best_val_loss=best_val_loss)
+            per_timestep_text = " ".join(f"t{k}={v:.4f}" for k, v in sorted(val_per_timestep.items()))
+            tqdm.write(f"epoch={epoch} val_total={val_loss:.4f} {per_timestep_text}")
 
             save_checkpoint(
                 work_dir / "last.pt",
@@ -436,12 +512,9 @@ def main() -> None:
                 epoch + 1,
                 0,
                 "last",
-                extra_state={
-                    "autoencoder_checkpoint": str(autoencoder_checkpoint),
-                    "latent_scale": latent_scale,
-                    "performer_vocab_size": performer_vocab_size,
-                },
+                extra_state=checkpoint_extra_state(),
                 scheduler=scheduler,
+                ema=ema,
             )
             if is_best:
                 save_checkpoint(
@@ -456,12 +529,9 @@ def main() -> None:
                     epoch + 1,
                     0,
                     "best",
-                    extra_state={
-                        "autoencoder_checkpoint": str(autoencoder_checkpoint),
-                        "latent_scale": latent_scale,
-                        "performer_vocab_size": performer_vocab_size,
-                    },
+                    extra_state=checkpoint_extra_state(),
                     scheduler=scheduler,
+                    ema=ema,
                 )
 
             # CUDAキャッシュのクリア
