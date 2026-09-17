@@ -457,6 +457,8 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         sampling_steps: int | None = None,
         guidance_scale: float = 1.0,
         generator: torch.Generator | None = None,
+        known_latents: torch.Tensor | None = None,
+        known_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # === 1. 初期化と準備 ===
         device = batch["source_audio"].device
@@ -468,6 +470,32 @@ class ConditionalSegmentDiffusionModel(nn.Module):
 
         # 原曲のエンコード（全ステップで使い回すコンテキスト）
         conditioning = self.prepare_conditioning(batch)
+
+        known_residual: torch.Tensor | None = None
+        known_mask_expanded: torch.Tensor | None = None
+        if (known_latents is None) != (known_mask is None):
+            raise ValueError("known_latents and known_mask must be provided together")
+        if known_latents is not None and known_mask is not None:
+            if tuple(known_latents.shape) != tuple(latents.shape):
+                raise ValueError(
+                    f"known_latents shape {tuple(known_latents.shape)} does not match sampled latents "
+                    f"{tuple(latents.shape)}"
+                )
+            if tuple(known_mask.shape) != tuple(latents.shape[:2]):
+                raise ValueError(
+                    f"known_mask shape {tuple(known_mask.shape)} does not match sampled latents "
+                    f"{tuple(latents.shape[:2])}"
+                )
+            coarse_latent = conditioning.get("coarse_latent")
+            known_residual = known_latents.to(device=device, dtype=latents.dtype)
+            if coarse_latent is not None:
+                known_residual = known_residual - coarse_latent.to(dtype=latents.dtype)
+            known_mask_expanded = known_mask.to(device=device, dtype=torch.bool).unsqueeze(-1)
+
+        def apply_known_context(current: torch.Tensor) -> torch.Tensor:
+            if known_residual is None or known_mask_expanded is None:
+                return current
+            return torch.where(known_mask_expanded, known_residual, current)
 
         # 演奏者条件の classifier-free guidance 用に null ID を用意
         use_guidance = guidance_scale != 1.0
@@ -485,6 +513,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         for step_pos, timestep in enumerate(step_indices):
             # 2-1. ノイズの予測
             timestep_batch = torch.full((latent_shape[0],), int(timestep.item()), device=device, dtype=torch.long)
+            latents = apply_known_context(latents)
             model_output = self.denoise(batch, latents, timestep_batch, conditioning)
             if use_guidance:
                 # 無条件予測との差分を増幅して演奏者条件を強調する
@@ -504,6 +533,9 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             next_timestep = step_indices[step_pos + 1]
             alpha_bar_next = self.alpha_bars[next_timestep]
             latents = torch.sqrt(alpha_bar_next) * pred_x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
+
+        if known_residual is not None and known_mask_expanded is not None:
+            latents = torch.where(known_mask_expanded, known_residual, latents)
 
         coarse_latent = conditioning.get("coarse_latent")
         if coarse_latent is not None:

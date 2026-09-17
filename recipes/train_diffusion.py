@@ -35,6 +35,12 @@ from recipes.wandb_utils import (
     log_wandb_metrics,
     update_wandb_summary,
 )
+from recipes.windowing import (
+    apply_teacher_overlap_context,
+    deterministic_short_sequence_batch,
+    diffusion_loss_mask,
+    random_short_sequence_batch,
+)
 from tsumugi_piano_cover.config import ExperimentConfig, load_experiment_config
 from tsumugi_piano_cover.latent_scaling import LatentNormalizer
 from tsumugi_piano_cover.models.diffusion import ConditionalSegmentDiffusionModel
@@ -113,7 +119,9 @@ def on_policy_batch_key(batch: dict[str, object]) -> str:
     if not isinstance(metadata, list) or len(metadata) != 1 or not isinstance(metadata[0], tuple):
         raise ValueError("on-policy training requires batch_size=1 with song metadata")
     song_name, piano_id = metadata[0]
-    return f"{song_name}::{piano_id}"
+    crop_start = batch.get("short_sequence_start")
+    crop_suffix = f"::crop={int(crop_start)}" if isinstance(crop_start, int) else ""
+    return f"{song_name}::{piano_id}{crop_suffix}"
 
 
 def on_policy_loss_counts(config: ExperimentConfig) -> tuple[int, int, int]:
@@ -140,6 +148,7 @@ def collect_on_policy_states(
     device: torch.device,
     config: ExperimentConfig,
     seed: int,
+    teacher_latents: torch.Tensor | None = None,
 ) -> list[tuple[torch.Tensor, int]]:
     """Capture self-generated x_t states at the late reverse-diffusion steps used for replay."""
     on_policy = config.diffusion_training.on_policy
@@ -169,9 +178,11 @@ def collect_on_policy_states(
         with get_autocast_context(device, config.diffusion_training.mixed_precision):
             conditioning = model.prepare_conditioning(batch)  # type: ignore[arg-type]
             for step_position, timestep in enumerate(step_indices):
+                timestep_batch = torch.full((1,), int(timestep.item()), device=device, dtype=torch.long)
+                if teacher_latents is not None:
+                    current = apply_teacher_overlap_context(current, teacher_latents, batch)
                 if step_position in capture_positions:
                     states.append((current.float().detach().clone(), capture_positions[step_position]))
-                timestep_batch = torch.full((1,), int(timestep.item()), device=device, dtype=torch.long)
                 model_output = model.denoise(batch, current, timestep_batch, conditioning)  # type: ignore[arg-type]
                 pred_x0, pred_noise = model.predict_x0_and_noise(current, model_output, timestep_batch)
                 if step_position == len(step_indices) - 1:
@@ -242,6 +253,7 @@ def run_validation(
     val_progress = tqdm(loader, desc=f"Epoch {epoch} val", dynamic_ncols=True, leave=False)
     for batch_index, batch in enumerate(val_progress):
         batch = move_batch_to_device(batch, device)
+        batch = deterministic_short_sequence_batch(batch, config)
         # ピアノカバーを潜在表現にエンコード
         latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
         latents = normalizer.normalize(latents)
@@ -261,9 +273,10 @@ def run_validation(
                 timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
 
                 noisy_latents = model.q_sample(diffusion_latents, timesteps, noise)
+                noisy_latents = apply_teacher_overlap_context(noisy_latents, diffusion_latents, batch)
                 model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
                 target = model.compute_training_target(diffusion_latents, noise, timesteps)
-                loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                loss = diffusion_mse_loss(model_output, target, diffusion_loss_mask(batch))
                 totals[timestep_value] += float(loss.detach().item())
 
         batch_count += 1
@@ -344,6 +357,7 @@ def main() -> None:
         # 生成チェック用に val の先頭数曲を固定で取り出しておく（毎エポック同じ曲を見る）
         generation_every = config.diffusion_training.generation_eval_every_epochs
         generation_batches: list[dict] = []
+        window_generation_batches: list[dict] = []
         if generation_every > 0:
             probe_loader = DataLoader(
                 val_dataset,
@@ -356,6 +370,10 @@ def main() -> None:
                 if probe_index >= config.diffusion_training.generation_eval_songs:
                     break
                 generation_batches.append(probe_batch)
+            if config.diffusion_training.short_sequence_enabled:
+                window_generation_batches = [
+                    deterministic_short_sequence_batch(probe_batch, config) for probe_batch in generation_batches
+                ]
 
         model = ConditionalSegmentDiffusionModel(
             config.source_model,
@@ -445,6 +463,12 @@ def main() -> None:
         print(f"mixed_precision={config.diffusion_training.mixed_precision}")
         print(f"timesteps_per_sample={timesteps_per_sample}")
         print(
+            f"short_sequence={config.diffusion_training.short_sequence_enabled} "
+            f"segments={config.diffusion_training.short_sequence_segments} "
+            f"teacher_overlap={config.diffusion_training.teacher_overlap_enabled} "
+            f"overlap_segments={config.diffusion_training.teacher_overlap_segments}"
+        )
+        print(
             "on_policy="
             f"{on_policy_config.enabled} standard={standard_loss_count} replay={replay_loss_count} "
             f"fresh={fresh_loss_count} refresh_every_epochs={on_policy_config.refresh_every_epochs} "
@@ -489,6 +513,10 @@ def main() -> None:
             zero_terminal_snr=config.diffusion_model.zero_terminal_snr,
             mixed_precision=config.diffusion_training.mixed_precision,
             timesteps_per_sample=timesteps_per_sample,
+            short_sequence_enabled=config.diffusion_training.short_sequence_enabled,
+            short_sequence_segments=config.diffusion_training.short_sequence_segments,
+            teacher_overlap_enabled=config.diffusion_training.teacher_overlap_enabled,
+            teacher_overlap_segments=config.diffusion_training.teacher_overlap_segments,
             on_policy_enabled=on_policy_config.enabled,
             on_policy_replay_fraction=on_policy_config.replay_fraction,
             on_policy_fresh_fraction=on_policy_config.fresh_fraction,
@@ -566,11 +594,16 @@ def main() -> None:
                     stopped_by_epoch_step_limit = True
                     break
                 batch = move_batch_to_device(batch, device)
+                batch = random_short_sequence_batch(batch, config)
 
                 # ピアノロールを潜在表現にエンコード
                 with torch.no_grad():
                     latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
                     latents = normalizer.normalize(latents)
+
+                with get_autocast_context(device, config.diffusion_training.mixed_precision):
+                    conditioning = model.prepare_conditioning(batch)
+                    diffusion_latents = diffusion_latents_from_conditioning(latents, conditioning)
 
                 replay_states: list[tuple[torch.Tensor, int]] | None = None
                 fresh_states: list[tuple[torch.Tensor, int]] | None = None
@@ -590,6 +623,7 @@ def main() -> None:
                             device,
                             config,
                             seed=config.seed * 1_000_003 + epoch * 1_009 + batch_index,
+                            teacher_latents=diffusion_latents,
                         )
                         on_policy_replay.put(replay_key, fresh_states)
                         on_policy_epochs_since_refresh[replay_key] = 1
@@ -603,9 +637,6 @@ def main() -> None:
                 with get_autocast_context(device, config.diffusion_training.mixed_precision):
                     # 1. 原曲エンコードと alignment bias は1曲につき1回だけ計算し、
                     #    複数のタイムステップで共有する（計算時間の大半がここなので安い）
-                    conditioning = model.prepare_conditioning(batch)
-                    diffusion_latents = diffusion_latents_from_conditioning(latents, conditioning)
-
                     loss_terms: list[torch.Tensor] = []
                     standard_terms: list[torch.Tensor] = []
                     on_policy_terms: list[torch.Tensor] = []
@@ -621,9 +652,10 @@ def main() -> None:
 
                         # 2. 潜在変数にノイズを付与し、prediction_type に応じたターゲットを予測
                         noisy_latents = model.q_sample(diffusion_latents, timesteps, noise)
+                        noisy_latents = apply_teacher_overlap_context(noisy_latents, diffusion_latents, batch)
                         model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
                         target = model.compute_training_target(diffusion_latents, noise, timesteps)
-                        timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                        timestep_loss = diffusion_mse_loss(model_output, target, diffusion_loss_mask(batch))
                         loss_terms.append(timestep_loss)
                         standard_terms.append(timestep_loss)
 
@@ -636,7 +668,7 @@ def main() -> None:
                             )
                             target = on_policy_training_target(model, diffusion_latents, noisy_latents, timesteps)
                             model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
-                            timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                            timestep_loss = diffusion_mse_loss(model_output, target, diffusion_loss_mask(batch))
                             loss_terms.append(timestep_loss)
                             on_policy_terms.append(timestep_loss)
 
@@ -648,7 +680,7 @@ def main() -> None:
                             )
                             target = on_policy_training_target(model, diffusion_latents, noisy_latents, timesteps)
                             model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
-                            timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                            timestep_loss = diffusion_mse_loss(model_output, target, diffusion_loss_mask(batch))
                             loss_terms.append(timestep_loss)
                             on_policy_terms.append(timestep_loss)
 
@@ -751,6 +783,8 @@ def main() -> None:
                 # 実際に逆拡散を最後まで回して生成品質を見る。MSE では破綻を検知できないため
                 generation_metrics: dict[str, float] = {}
                 generation_images: list = []
+                window_generation_metrics: dict[str, float] = {}
+                window_generation_images: list = []
                 if generation_batches and epoch % generation_every == 0:
                     generation_metrics, generation_images = evaluate_generation(
                         model,
@@ -762,14 +796,36 @@ def main() -> None:
                         epoch,
                         sample_dir=work_dir / "samples",
                     )
+                    if window_generation_batches:
+                        window_generation_metrics, window_generation_images = evaluate_generation(
+                            model,
+                            autoencoder,
+                            window_generation_batches,
+                            device,
+                            config,
+                            normalizer,
+                            epoch,
+                            sample_dir=work_dir / "samples",
+                            metric_prefix="window_gen",
+                            target_metric_prefix="window_target",
+                            recon_metric_prefix="window_recon",
+                            sample_prefix="window_teacher_",
+                        )
             is_best = val_loss <= best_val_loss
             best_val_loss = min(best_val_loss, val_loss)
             val_metrics: dict[str, float | int] = {"val/total": val_loss, "epoch": epoch}
             for timestep_value, timestep_loss in val_per_timestep.items():
                 val_metrics[f"val/t{timestep_value:04d}"] = timestep_loss
             val_metrics.update(generation_metrics)
+            val_metrics.update(window_generation_metrics)
             log_wandb_metrics(wandb_run, val_metrics, step=global_step)
             log_wandb_images(wandb_run, generation_images, key="generation/piano_roll", step=global_step)
+            log_wandb_images(
+                wandb_run,
+                window_generation_images,
+                key="generation/window_teacher_piano_roll",
+                step=global_step,
+            )
             update_wandb_summary(wandb_run, best_val_loss=best_val_loss)
             if generation_metrics:
                 tqdm.write(

@@ -176,6 +176,10 @@ def evaluate_generation(
     epoch: int,
     sample_dir: Path | None = None,
     sampling_steps: int | None = None,
+    metric_prefix: str = "gen",
+    target_metric_prefix: str = "target",
+    recon_metric_prefix: str = "recon",
+    sample_prefix: str = "",
 ) -> tuple[dict[str, float], list[tuple[str, np.ndarray]]]:
     """固定の数曲を最後までサンプリングし、指標と可視化画像を返す。
 
@@ -195,6 +199,11 @@ def evaluate_generation(
         num_frames = int(batch["target_num_frames"][0].item())
         segment_times = batch["segment_times"][0]
 
+        target_latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
+        target_latents = target_latents.float()
+        teacher_mask = batch.get("teacher_overlap_mask")
+        use_teacher_overlap = isinstance(teacher_mask, torch.Tensor) and bool(teacher_mask.any().item())
+
         # 1. 逆拡散を最後まで回す
         generator.manual_seed(config.seed * 7919 + index)
         latents = model.sample(
@@ -202,11 +211,13 @@ def evaluate_generation(
             latent_shape=(1, num_segments, config.diffusion_model.latent_dim),
             sampling_steps=steps,
             generator=generator,
+            known_latents=normalizer.normalize(target_latents) if use_teacher_overlap else None,
+            known_mask=teacher_mask if use_teacher_overlap else None,
         ).float()
         # 正規化空間での統計。学習時の潜在は mean 0 / std 1 なので、ここがずれていれば
         # デコーダにとって未知の入力を渡していることになる
-        accumulated.setdefault("gen/latent_mean_abs", []).append(float(latents.mean().abs().item()))
-        accumulated.setdefault("gen/latent_std", []).append(float(latents.std().item()))
+        accumulated.setdefault(f"{metric_prefix}/latent_mean_abs", []).append(float(latents.mean().abs().item()))
+        accumulated.setdefault(f"{metric_prefix}/latent_std", []).append(float(latents.std().item()))
 
         # 2. 潜在をロールへ戻す
         generated_roll = autoencoder.reconstruct_roll(
@@ -215,7 +226,6 @@ def evaluate_generation(
         # 3. 正解ロールと、VAE 再構成（達成可能な上限）
         target_roll = segments_to_roll(batch["target_segments"][0], segment_times, num_frames, roll_config)
         # VAE を素通りさせた結果。正規化は往復すると恒等なのでここでは使わない
-        target_latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
         recon_roll = autoencoder.reconstruct_roll(autoencoder.decode(target_latents), segment_times, None, num_frames)
 
         length = min(generated_roll.shape[0], target_roll.shape[0], recon_roll.shape[0])
@@ -223,26 +233,52 @@ def evaluate_generation(
         target_roll = target_roll[:length].to(generated_roll.device)
         recon_roll = recon_roll[:length]
 
-        for key, value in describe_roll(generated_roll, roll_config, "gen").items():
+        window_start = max(0, min(int(batch.get("window_frame_start", 0)), length))
+        window_end = max(window_start + 1, min(int(batch.get("window_frame_end", length)), length))
+        metric_start = max(0, min(int(batch.get("generated_frame_start", window_start)), window_end - 1))
+        metric_end = max(metric_start + 1, min(int(batch.get("generated_frame_end", window_end)), window_end))
+        metric_generated_roll = generated_roll[metric_start:metric_end]
+        metric_target_roll = target_roll[metric_start:metric_end]
+        metric_recon_roll = recon_roll[metric_start:metric_end]
+        image_generated_roll = generated_roll[window_start:window_end]
+        image_target_roll = target_roll[window_start:window_end]
+
+        for key, value in describe_roll(metric_generated_roll, roll_config, metric_prefix).items():
             accumulated.setdefault(key, []).append(value)
-        for key, value in describe_roll(target_roll, roll_config, "target").items():
+        for key, value in describe_roll(metric_target_roll, roll_config, target_metric_prefix).items():
             accumulated.setdefault(key, []).append(value)
-        for key, value in compare_rolls(generated_roll, target_roll, roll_config, "gen").items():
+        for key, value in compare_rolls(metric_generated_roll, metric_target_roll, roll_config, metric_prefix).items():
             accumulated.setdefault(key, []).append(value)
         # VAE 再構成を天井として併記する。gen がこれに近ければ拡散側はやることをやっている
-        for key, value in compare_rolls(recon_roll, target_roll, roll_config, "recon").items():
+        for key, value in compare_rolls(
+            metric_recon_roll,
+            metric_target_roll,
+            roll_config,
+            recon_metric_prefix,
+        ).items():
             accumulated.setdefault(key, []).append(value)
 
         if index < 2:
             images.append(
-                (name, render_roll_image([("generated", generated_roll), ("target", target_roll)], roll_config))
+                (
+                    name,
+                    render_roll_image(
+                        [("generated", image_generated_roll), ("target", image_target_roll)], roll_config
+                    ),
+                )
             )
         if sample_dir is not None:
             sample_dir.mkdir(parents=True, exist_ok=True)
-            write_roll_midi(generated_roll.cpu(), roll_config, sample_dir / f"epoch{epoch:04d}_{name}.mid")
+            write_roll_midi(
+                image_generated_roll.cpu(),
+                roll_config,
+                sample_dir / f"epoch{epoch:04d}_{sample_prefix}{name}.mid",
+            )
 
     metrics = {key: float(np.mean(values)) for key, values in accumulated.items()}
-    if "gen/onset_f1" in metrics and metrics.get("recon/onset_f1", 0.0) > 0.0:
+    if f"{metric_prefix}/onset_f1" in metrics and metrics.get(f"{recon_metric_prefix}/onset_f1", 0.0) > 0.0:
         # 達成可能な上限に対してどこまで来ているか
-        metrics["gen/onset_f1_vs_recon"] = metrics["gen/onset_f1"] / metrics["recon/onset_f1"]
+        metrics[f"{metric_prefix}/onset_f1_vs_recon"] = (
+            metrics[f"{metric_prefix}/onset_f1"] / metrics[f"{recon_metric_prefix}/onset_f1"]
+        )
     return metrics, images
