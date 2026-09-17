@@ -172,7 +172,12 @@ diffusion_training:
     enabled: true
     replay_fraction: 0.25
     fresh_fraction: 0.25
-    refresh_steps: 10
-    sampling_steps: 50
+    # 生成し直したロールアウトを何エポック使い回すか。1 = 毎エポック生成し直す。
+    # 上げるほど学習は速くなるが、使う状態が古いポリシーのものになる。
+    refresh_every_epochs: 3
+    # 全曲・毎エポックでロールアウトが走るため、ここが速度を直接決める
+    sampling_steps: 20
     capture_timesteps: [591, 387, 183, 81]
-    replay_max_songs: 128
+    # 学習セット全体（2031曲）を覆う必要がある。下回ると前エポックの状態が
+    # 再訪前に追い出され、replay 側が fresh 側の複製に退化する
+    replay_max_songs: 4096

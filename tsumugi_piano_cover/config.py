@@ -227,12 +227,16 @@ class OnPolicyConfig:
     enabled: bool = False
     replay_fraction: float = 0.25
     fresh_fraction: float = 0.25
-    refresh_steps: int = 10
+    # How many epochs a song's rollout is reused before it is generated again.
+    # 1 曲が1バッチなので、ある曲は1エポックにちょうど1回学習に出てくる。
+    refresh_every_epochs: int = 1
     sampling_steps: int = 50
     # These are target timesteps; the nearest steps in the sampling schedule are captured.
     capture_timesteps: tuple[int, int, int, int] = (591, 387, 183, 81)
-    # Replay states are keyed by song and kept on CPU in float16.
-    replay_max_songs: int = 128
+    # Replay states are keyed by song and kept on CPU in float16. This must cover the whole
+    # training set, otherwise a song's previous states are evicted before it is seen again
+    # and the replay half silently degenerates into a second copy of the fresh states.
+    replay_max_songs: int = 4096
 
 
 @dataclass
@@ -414,8 +418,8 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
             raise ValueError(f"{name}.on_policy.fresh_fraction must be in [0, 1]")
         if on_policy.replay_fraction + on_policy.fresh_fraction >= 1.0:
             raise ValueError(f"{name}.on_policy replay_fraction + fresh_fraction must be < 1")
-        if on_policy.refresh_steps < 1:
-            raise ValueError(f"{name}.on_policy.refresh_steps must be >= 1")
+        if on_policy.refresh_every_epochs < 1:
+            raise ValueError(f"{name}.on_policy.refresh_every_epochs must be >= 1")
         if on_policy.sampling_steps < 1:
             raise ValueError(f"{name}.on_policy.sampling_steps must be >= 1")
         if on_policy.replay_max_songs < 1:
