@@ -220,6 +220,20 @@ class WandbConfig:
 
 
 @dataclass
+class OnPolicyConfig:
+    # Mix standard diffusion states with states visited by the model during sampling.
+    enabled: bool = False
+    replay_fraction: float = 0.25
+    fresh_fraction: float = 0.25
+    refresh_steps: int = 10
+    sampling_steps: int = 50
+    # These are target timesteps; the nearest steps in the sampling schedule are captured.
+    capture_timesteps: tuple[int, int, int, int] = (591, 387, 183, 81)
+    # Replay states are keyed by song and kept on CPU in float16.
+    replay_max_songs: int = 128
+
+
+@dataclass
 class TrainingConfig:
     batch_size: int = 1
     # 勾配累積ステップ数
@@ -252,6 +266,7 @@ class TrainingConfig:
     generation_eval_every_epochs: int = 1
     generation_eval_songs: int = 4
     generation_eval_sampling_steps: int = 50
+    on_policy: OnPolicyConfig = field(default_factory=OnPolicyConfig)
 
 
 @dataclass
@@ -390,6 +405,33 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
                 raise ValueError(f"{name}.generation_eval_songs must be >= 1")
             if training.generation_eval_sampling_steps < 1:
                 raise ValueError(f"{name}.generation_eval_sampling_steps must be >= 1")
+        on_policy = training.on_policy
+        if not 0.0 <= on_policy.replay_fraction <= 1.0:
+            raise ValueError(f"{name}.on_policy.replay_fraction must be in [0, 1]")
+        if not 0.0 <= on_policy.fresh_fraction <= 1.0:
+            raise ValueError(f"{name}.on_policy.fresh_fraction must be in [0, 1]")
+        if on_policy.replay_fraction + on_policy.fresh_fraction >= 1.0:
+            raise ValueError(f"{name}.on_policy replay_fraction + fresh_fraction must be < 1")
+        if on_policy.refresh_steps < 1:
+            raise ValueError(f"{name}.on_policy.refresh_steps must be >= 1")
+        if on_policy.sampling_steps < 1:
+            raise ValueError(f"{name}.on_policy.sampling_steps must be >= 1")
+        if on_policy.replay_max_songs < 1:
+            raise ValueError(f"{name}.on_policy.replay_max_songs must be >= 1")
+        if len(on_policy.capture_timesteps) != 4:
+            raise ValueError(f"{name}.on_policy.capture_timesteps must contain exactly 4 values")
+        if any(
+            timestep <= 0 or timestep >= config.diffusion_model.num_train_timesteps
+            for timestep in on_policy.capture_timesteps
+        ):
+            raise ValueError(
+                f"{name}.on_policy.capture_timesteps must be in (0, num_train_timesteps): "
+                f"{on_policy.capture_timesteps}"
+            )
+        if on_policy.enabled and name != "diffusion_training":
+            raise ValueError(f"{name}.on_policy.enabled is only supported for diffusion_training")
+        if on_policy.enabled and training.batch_size != 1:
+            raise ValueError("diffusion_training.on_policy currently requires batch_size=1")
 
     # 5. alignment 前計算の設定範囲を確認
     if config.alignment.method != "audio_sync":

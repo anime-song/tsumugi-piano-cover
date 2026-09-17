@@ -167,3 +167,11 @@ diffusion_training:
   generation_eval_every_epochs: 1
   generation_eval_songs: 4
   generation_eval_sampling_steps: 50
+  on_policy:
+    enabled: true
+    replay_fraction: 0.25
+    fresh_fraction: 0.25
+    refresh_steps: 10
+    sampling_steps: 50
+    capture_timesteps: [591, 387, 183, 81]
+    replay_max_songs: 128
