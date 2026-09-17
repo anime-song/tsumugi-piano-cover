@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -82,6 +83,121 @@ def load_frozen_autoencoder(
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return model, checkpoint
+
+
+class OnPolicyReplayBuffer:
+    """Keep recent self-generated latent states per song without retaining computation graphs."""
+
+    def __init__(self, max_songs: int) -> None:
+        self.max_songs = int(max_songs)
+        self._states: OrderedDict[str, list[tuple[torch.Tensor, int]]] = OrderedDict()
+
+    def get(self, key: str) -> list[tuple[torch.Tensor, int]] | None:
+        states = self._states.get(key)
+        if states is not None:
+            self._states.move_to_end(key)
+        return states
+
+    def put(self, key: str, states: list[tuple[torch.Tensor, int]]) -> None:
+        # Replay tensors are detached and kept in CPU float16 so full-song training does not
+        # retain GPU memory for every song in the dataset.
+        stored = [(state.detach().to(device="cpu", dtype=torch.float16), timestep) for state, timestep in states]
+        self._states[key] = stored
+        self._states.move_to_end(key)
+        while len(self._states) > self.max_songs:
+            self._states.popitem(last=False)
+
+
+def on_policy_batch_key(batch: dict[str, object]) -> str:
+    metadata = batch.get("metadata")
+    if not isinstance(metadata, list) or len(metadata) != 1 or not isinstance(metadata[0], tuple):
+        raise ValueError("on-policy training requires batch_size=1 with song metadata")
+    song_name, piano_id = metadata[0]
+    return f"{song_name}::{piano_id}"
+
+
+def on_policy_loss_counts(config: ExperimentConfig) -> tuple[int, int, int]:
+    """Return standard, replay, and fresh loss counts for one optimizer accumulation unit."""
+    total = int(config.diffusion_training.timesteps_per_sample)
+    on_policy = config.diffusion_training.on_policy
+    if not on_policy.enabled:
+        return total, 0, 0
+    replay_count = int(round(total * on_policy.replay_fraction))
+    fresh_count = int(round(total * on_policy.fresh_fraction))
+    standard_count = total - replay_count - fresh_count
+    if standard_count < 1 or replay_count + fresh_count < 1:
+        raise ValueError(
+            "on-policy fractions must leave at least one standard sample and one on-policy sample: "
+            f"timesteps_per_sample={total}, replay={replay_count}, fresh={fresh_count}"
+        )
+    return standard_count, replay_count, fresh_count
+
+
+@torch.no_grad()
+def collect_on_policy_states(
+    model: ConditionalSegmentDiffusionModel,
+    batch: dict[str, object],
+    device: torch.device,
+    config: ExperimentConfig,
+    seed: int,
+) -> list[tuple[torch.Tensor, int]]:
+    """Capture self-generated x_t states at the late reverse-diffusion steps used for replay."""
+    on_policy = config.diffusion_training.on_policy
+    was_training = model.training
+    model.eval()
+    try:
+        latent_shape = (
+            1,
+            int(batch["segment_mask"].shape[1]),  # type: ignore[index]
+            config.diffusion_model.latent_dim,
+        )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        current = torch.randn(latent_shape, device=device, generator=generator)
+        step_indices = torch.linspace(
+            config.diffusion_model.num_train_timesteps - 1,
+            0,
+            steps=on_policy.sampling_steps,
+            device=device,
+        ).long()
+        capture_positions: dict[int, int] = {}
+        for requested_timestep in on_policy.capture_timesteps:
+            position = int((step_indices - requested_timestep).abs().argmin().item())
+            capture_positions[position] = int(step_indices[position].item())
+
+        states: list[tuple[torch.Tensor, int]] = []
+        with get_autocast_context(device, config.diffusion_training.mixed_precision):
+            conditioning = model.prepare_conditioning(batch)  # type: ignore[arg-type]
+            for step_position, timestep in enumerate(step_indices):
+                if step_position in capture_positions:
+                    states.append((current.float().detach().clone(), capture_positions[step_position]))
+                timestep_batch = torch.full((1,), int(timestep.item()), device=device, dtype=torch.long)
+                model_output = model.denoise(batch, current, timestep_batch, conditioning)  # type: ignore[arg-type]
+                pred_x0, pred_noise = model.predict_x0_and_noise(current, model_output, timestep_batch)
+                if step_position == len(step_indices) - 1:
+                    break
+                next_timestep = step_indices[step_position + 1]
+                alpha_bar_next = model.alpha_bars[next_timestep]
+                current = torch.sqrt(alpha_bar_next) * pred_x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
+        if not states:
+            raise RuntimeError("on-policy rollout did not capture any latent states")
+        return states
+    finally:
+        model.train(was_training)
+
+
+@torch.no_grad()
+def on_policy_training_target(
+    model: ConditionalSegmentDiffusionModel,
+    clean_latents: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    timestep: torch.Tensor,
+) -> torch.Tensor:
+    """Build the v-target that brings an off-policy x_t back to the clean training latent."""
+    sqrt_alpha = model.sqrt_alpha_bars[timestep].view(-1, 1, 1).float()
+    sqrt_sigma = model.sqrt_one_minus_alpha_bars[timestep].view(-1, 1, 1).float().clamp_min(1.0e-5)
+    effective_noise = (noisy_latents.float() - sqrt_alpha * clean_latents.float()) / sqrt_sigma
+    return model.compute_training_target(clean_latents, effective_noise, timestep)
 
 
 def build_validation_timesteps(config: ExperimentConfig) -> list[int]:
@@ -254,6 +370,10 @@ def main() -> None:
 
         scheduler = build_lr_scheduler(optimizer, config.diffusion_training, total_steps)
         timesteps_per_sample = int(config.diffusion_training.timesteps_per_sample)
+        standard_loss_count, replay_loss_count, fresh_loss_count = on_policy_loss_counts(config)
+        on_policy_config = config.diffusion_training.on_policy
+        on_policy_replay = OnPolicyReplayBuffer(on_policy_config.replay_max_songs)
+        on_policy_last_refresh_step: dict[str, int] = {}
         validation_timesteps = build_validation_timesteps(config)
 
         resume_state = ResumeState()
@@ -305,6 +425,12 @@ def main() -> None:
         print(f"zero_terminal_snr={config.diffusion_model.zero_terminal_snr}")
         print(f"mixed_precision={config.diffusion_training.mixed_precision}")
         print(f"timesteps_per_sample={timesteps_per_sample}")
+        print(
+            "on_policy="
+            f"{on_policy_config.enabled} standard={standard_loss_count} replay={replay_loss_count} "
+            f"fresh={fresh_loss_count} refresh_steps={on_policy_config.refresh_steps} "
+            f"sampling_steps={on_policy_config.sampling_steps}"
+        )
         print(f"validation_timesteps={validation_timesteps}")
         if generation_every > 0:
             print(
@@ -344,6 +470,11 @@ def main() -> None:
             zero_terminal_snr=config.diffusion_model.zero_terminal_snr,
             mixed_precision=config.diffusion_training.mixed_precision,
             timesteps_per_sample=timesteps_per_sample,
+            on_policy_enabled=on_policy_config.enabled,
+            on_policy_replay_fraction=on_policy_config.replay_fraction,
+            on_policy_fresh_fraction=on_policy_config.fresh_fraction,
+            on_policy_refresh_steps=on_policy_config.refresh_steps,
+            on_policy_sampling_steps=on_policy_config.sampling_steps,
             ema_decay=config.diffusion_training.ema_decay if ema is not None else None,
             denoiser_gradient_checkpointing=config.diffusion_model.gradient_checkpointing,
             tsumugi_gradient_checkpointing=config.tsumugi_model.gradient_checkpointing,
@@ -394,6 +525,8 @@ def main() -> None:
         for epoch in range(resume_state.start_epoch, config.diffusion_training.max_epochs):
             model.train()
             running_total = 0.0
+            running_standard = 0.0
+            running_on_policy = 0.0
             batch_count = 0
             epoch_start_batch = resume_state.start_batch_index if epoch == resume_state.start_epoch else 0
             epoch_step_limit = config.diffusion_training.max_steps_per_epoch
@@ -420,13 +553,42 @@ def main() -> None:
                     latents, _, _ = autoencoder.encode(batch["target_segments"], sample_posterior=False)
                     latents = normalizer.normalize(latents)
 
+                replay_states: list[tuple[torch.Tensor, int]] | None = None
+                fresh_states: list[tuple[torch.Tensor, int]] | None = None
+                if on_policy_config.enabled:
+                    replay_key = on_policy_batch_key(batch)
+                    previous_states = on_policy_replay.get(replay_key)
+                    last_refresh_step = on_policy_last_refresh_step.get(replay_key)
+                    should_refresh = (
+                        previous_states is None
+                        or last_refresh_step is None
+                        or global_step - last_refresh_step >= on_policy_config.refresh_steps
+                    )
+                    if should_refresh:
+                        fresh_states = collect_on_policy_states(
+                            model,
+                            batch,
+                            device,
+                            config,
+                            seed=config.seed * 1_000_003 + epoch * 1_009 + batch_index,
+                        )
+                        on_policy_replay.put(replay_key, fresh_states)
+                        on_policy_last_refresh_step[replay_key] = global_step
+                    else:
+                        fresh_states = on_policy_replay.get(replay_key)
+                    replay_states = previous_states if previous_states is not None else fresh_states
+                    if not replay_states or not fresh_states:
+                        raise RuntimeError(f"on-policy state buffer is empty for {replay_key}")
+
                 with get_autocast_context(device, config.diffusion_training.mixed_precision):
                     # 1. 原曲エンコードと alignment bias は1曲につき1回だけ計算し、
                     #    複数のタイムステップで共有する（計算時間の大半がここなので安い）
                     conditioning = model.prepare_conditioning(batch)
 
-                    loss = None
-                    for _ in range(timesteps_per_sample):
+                    loss_terms: list[torch.Tensor] = []
+                    standard_terms: list[torch.Tensor] = []
+                    on_policy_terms: list[torch.Tensor] = []
+                    for _ in range(standard_loss_count):
                         timesteps = torch.randint(
                             0,
                             config.diffusion_model.num_train_timesteps,
@@ -441,9 +603,35 @@ def main() -> None:
                         model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
                         target = model.compute_training_target(latents, noise, timesteps)
                         timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
-                        loss = timestep_loss if loss is None else loss + timestep_loss
+                        loss_terms.append(timestep_loss)
+                        standard_terms.append(timestep_loss)
 
-                    loss = loss / timesteps_per_sample
+                    if replay_states is not None and fresh_states is not None:
+                        for sample_index in range(replay_loss_count):
+                            stored_state, timestep_value = replay_states[sample_index % len(replay_states)]
+                            noisy_latents = stored_state.to(device=device, dtype=latents.dtype)
+                            timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
+                            target = on_policy_training_target(model, latents, noisy_latents, timesteps)
+                            model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
+                            timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                            loss_terms.append(timestep_loss)
+                            on_policy_terms.append(timestep_loss)
+
+                        for sample_index in range(fresh_loss_count):
+                            stored_state, timestep_value = fresh_states[sample_index % len(fresh_states)]
+                            noisy_latents = stored_state.to(device=device, dtype=latents.dtype)
+                            timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
+                            target = on_policy_training_target(model, latents, noisy_latents, timesteps)
+                            model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
+                            timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
+                            loss_terms.append(timestep_loss)
+                            on_policy_terms.append(timestep_loss)
+
+                    loss = sum(loss_terms) / len(loss_terms)
+                    standard_loss = sum(standard_terms) / len(standard_terms) if standard_terms else loss.new_zeros(())
+                    on_policy_loss = (
+                        sum(on_policy_terms) / len(on_policy_terms) if on_policy_terms else loss.new_zeros(())
+                    )
                     step_loss = loss / config.diffusion_training.grad_accum_steps
 
                 if scaler.is_enabled():
@@ -452,9 +640,16 @@ def main() -> None:
                     step_loss.backward()
 
                 running_total += loss.detach().item()
+                running_standard += standard_loss.detach().item()
+                running_on_policy += on_policy_loss.detach().item()
                 batch_count += 1
                 pending_accumulation += 1
-                train_progress.set_postfix(total=f"{running_total / batch_count:.4f}", step=global_step)
+                train_progress.set_postfix(
+                    total=f"{running_total / batch_count:.4f}",
+                    standard=f"{running_standard / batch_count:.4f}",
+                    on_policy=f"{running_on_policy / batch_count:.4f}",
+                    step=global_step,
+                )
 
                 if pending_accumulation >= config.diffusion_training.grad_accum_steps:
                     apply_optimizer_step()
@@ -463,11 +658,17 @@ def main() -> None:
                     epoch_step_count += 1
 
                     if global_step % config.runtime.log_every_steps == 0:
-                        tqdm.write(f"epoch={epoch} step={global_step} train_total={running_total / batch_count:.4f}")
+                        tqdm.write(
+                            f"epoch={epoch} step={global_step} train_total={running_total / batch_count:.4f} "
+                            f"standard={running_standard / batch_count:.4f} "
+                            f"on_policy={running_on_policy / batch_count:.4f}"
+                        )
                         log_wandb_metrics(
                             wandb_run,
                             {
                                 "train/total": running_total / batch_count,
+                                "train/standard": running_standard / batch_count,
+                                "train/on_policy": running_on_policy / batch_count,
                                 "train/lr": optimizer.param_groups[0]["lr"],
                                 "epoch": epoch,
                             },
