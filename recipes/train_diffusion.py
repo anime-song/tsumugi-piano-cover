@@ -200,6 +200,17 @@ def on_policy_training_target(
     return model.compute_training_target(clean_latents, effective_noise, timestep)
 
 
+def diffusion_latents_from_conditioning(
+    latents: torch.Tensor,
+    conditioning: dict[str, torch.Tensor | None],
+) -> torch.Tensor:
+    """Convert absolute target latents to residual latents when coarse latents are enabled."""
+    coarse_latent = conditioning.get("coarse_latent")
+    if coarse_latent is None:
+        return latents
+    return latents - coarse_latent
+
+
 def build_validation_timesteps(config: ExperimentConfig) -> list[int]:
     """検証で毎回使う固定タイムステップを返す。
 
@@ -238,14 +249,20 @@ def run_validation(
         with get_autocast_context(device, config.diffusion_training.mixed_precision):
             # 原曲エンコードは全タイムステップで共有する
             conditioning = model.prepare_conditioning(batch)
+            diffusion_latents = diffusion_latents_from_conditioning(latents, conditioning)
             for timestep_index, timestep_value in enumerate(validation_timesteps):
                 generator.manual_seed(config.seed * 1_000_003 + batch_index * 1009 + timestep_index)
-                noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                noise = torch.randn(
+                    diffusion_latents.shape,
+                    generator=generator,
+                    device=device,
+                    dtype=diffusion_latents.dtype,
+                )
                 timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
 
-                noisy_latents = model.q_sample(latents, timesteps, noise)
+                noisy_latents = model.q_sample(diffusion_latents, timesteps, noise)
                 model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
-                target = model.compute_training_target(latents, noise, timesteps)
+                target = model.compute_training_target(diffusion_latents, noise, timesteps)
                 loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
                 totals[timestep_value] += float(loss.detach().item())
 
@@ -584,6 +601,7 @@ def main() -> None:
                     # 1. 原曲エンコードと alignment bias は1曲につき1回だけ計算し、
                     #    複数のタイムステップで共有する（計算時間の大半がここなので安い）
                     conditioning = model.prepare_conditioning(batch)
+                    diffusion_latents = diffusion_latents_from_conditioning(latents, conditioning)
 
                     loss_terms: list[torch.Tensor] = []
                     standard_terms: list[torch.Tensor] = []
@@ -592,16 +610,16 @@ def main() -> None:
                         timesteps = torch.randint(
                             0,
                             config.diffusion_model.num_train_timesteps,
-                            (latents.shape[0],),
+                            (diffusion_latents.shape[0],),
                             device=device,
                             dtype=torch.long,
                         )
-                        noise = torch.randn_like(latents)
+                        noise = torch.randn_like(diffusion_latents)
 
                         # 2. 潜在変数にノイズを付与し、prediction_type に応じたターゲットを予測
-                        noisy_latents = model.q_sample(latents, timesteps, noise)
+                        noisy_latents = model.q_sample(diffusion_latents, timesteps, noise)
                         model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
-                        target = model.compute_training_target(latents, noise, timesteps)
+                        target = model.compute_training_target(diffusion_latents, noise, timesteps)
                         timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
                         loss_terms.append(timestep_loss)
                         standard_terms.append(timestep_loss)
@@ -609,9 +627,11 @@ def main() -> None:
                     if replay_states is not None and fresh_states is not None:
                         for sample_index in range(replay_loss_count):
                             stored_state, timestep_value = replay_states[sample_index % len(replay_states)]
-                            noisy_latents = stored_state.to(device=device, dtype=latents.dtype)
-                            timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
-                            target = on_policy_training_target(model, latents, noisy_latents, timesteps)
+                            noisy_latents = stored_state.to(device=device, dtype=diffusion_latents.dtype)
+                            timesteps = torch.full(
+                                (diffusion_latents.shape[0],), timestep_value, device=device, dtype=torch.long
+                            )
+                            target = on_policy_training_target(model, diffusion_latents, noisy_latents, timesteps)
                             model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
                             timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
                             loss_terms.append(timestep_loss)
@@ -619,9 +639,11 @@ def main() -> None:
 
                         for sample_index in range(fresh_loss_count):
                             stored_state, timestep_value = fresh_states[sample_index % len(fresh_states)]
-                            noisy_latents = stored_state.to(device=device, dtype=latents.dtype)
-                            timesteps = torch.full((latents.shape[0],), timestep_value, device=device, dtype=torch.long)
-                            target = on_policy_training_target(model, latents, noisy_latents, timesteps)
+                            noisy_latents = stored_state.to(device=device, dtype=diffusion_latents.dtype)
+                            timesteps = torch.full(
+                                (diffusion_latents.shape[0],), timestep_value, device=device, dtype=torch.long
+                            )
+                            target = on_policy_training_target(model, diffusion_latents, noisy_latents, timesteps)
                             model_output = model.denoise(batch, noisy_latents, timesteps, conditioning)
                             timestep_loss = diffusion_mse_loss(model_output, target, batch["segment_mask"])
                             loss_terms.append(timestep_loss)

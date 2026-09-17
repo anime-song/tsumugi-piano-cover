@@ -116,6 +116,10 @@ class SegmentLatentDenoiser(nn.Module):
             use_cross_attention=True,
             output_norm=True,
         )
+        if diffusion_config.coarse_latent_enabled:
+            self.coarse_latent_projection = nn.Linear(diffusion_config.latent_dim, diffusion_config.d_model)
+            nn.init.zeros_(self.coarse_latent_projection.weight)
+            nn.init.zeros_(self.coarse_latent_projection.bias)
 
     def _apply_performer_dropout(self, performer_ids: torch.Tensor) -> torch.Tensor:
         # 学習時に一定確率で null ID へ置き換え、演奏者条件なしでも動くようにする
@@ -136,6 +140,7 @@ class SegmentLatentDenoiser(nn.Module):
         memory: torch.Tensor,
         memory_mask: torch.Tensor,
         context_attention_bias: torch.Tensor | None = None,
+        coarse_latent: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         ノイズが付加された潜在表現に対し、各種条件（時間、ノイズステップ、演奏者、原曲）を加味して
@@ -162,6 +167,9 @@ class SegmentLatentDenoiser(nn.Module):
         performer_ids = self._apply_performer_dropout(performer_ids)
         hidden = hidden + self.performer_norm(self.performer_embedding(performer_ids)).unsqueeze(1)
 
+        if self.diffusion_config.coarse_latent_enabled and coarse_latent is not None:
+            hidden = hidden + self.coarse_latent_projection(coarse_latent)
+
         hidden = self.transformer(
             hidden,
             context=memory,
@@ -169,6 +177,58 @@ class SegmentLatentDenoiser(nn.Module):
             context_attention_mask=memory_mask,
             context_attention_bias=context_attention_bias,
         )
+        return self.output_projection(hidden)
+
+
+class SegmentCoarseLatent(nn.Module):
+    """Predict a source-conditioned coarse latent center for each target segment."""
+
+    def __init__(self, diffusion_config: DiffusionConfig) -> None:
+        super().__init__()
+        self.source_projection = nn.Linear(diffusion_config.d_model, diffusion_config.d_model)
+        self.source_norm = nn.LayerNorm(diffusion_config.d_model)
+        self.segment_time_embedding = ScalarConditionEmbedding(
+            diffusion_config.d_model,
+            min_period=diffusion_config.segment_time_min_period_seconds,
+            max_period=diffusion_config.segment_time_max_period_seconds,
+        )
+        self.output_projection = nn.Sequential(
+            nn.Linear(diffusion_config.d_model, diffusion_config.d_model),
+            nn.SiLU(),
+            nn.Linear(diffusion_config.d_model, diffusion_config.latent_dim),
+        )
+        # Start from the baseline objective (coarse_latent == 0), then let the
+        # coarse branch learn a useful center without changing the initial prediction.
+        nn.init.zeros_(self.output_projection[-1].weight)
+        nn.init.zeros_(self.output_projection[-1].bias)
+
+    @staticmethod
+    def _aligned_source_summary(
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor,
+        context_attention_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if context_attention_bias is None:
+            weights = memory_mask.to(dtype=memory.dtype)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            return torch.bmm(weights.unsqueeze(1), memory).expand(-1, 1, -1)
+
+        logits = context_attention_bias.float().masked_fill(~memory_mask.unsqueeze(1), torch.finfo(torch.float32).min)
+        weights = torch.softmax(logits, dim=-1).to(dtype=memory.dtype)
+        return torch.bmm(weights, memory)
+
+    def forward(
+        self,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor,
+        context_attention_bias: torch.Tensor | None,
+        segment_times: torch.Tensor,
+    ) -> torch.Tensor:
+        aligned_source = self._aligned_source_summary(memory, memory_mask, context_attention_bias)
+        if aligned_source.shape[1] == 1 and segment_times.shape[1] != 1:
+            aligned_source = aligned_source.expand(-1, segment_times.shape[1], -1)
+        hidden = self.source_norm(self.source_projection(aligned_source))
+        hidden = hidden + self.segment_time_embedding(segment_times)
         return self.output_projection(hidden)
 
 
@@ -189,6 +249,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         self.diffusion_config = diffusion_config
         self.audio_encoder = TsumugiAudioEncoder(tsumugi_config, output_dim=source_config.d_model)
         self.denoiser = SegmentLatentDenoiser(diffusion_config, performer_vocab_size)
+        self.coarse_latent = SegmentCoarseLatent(diffusion_config) if diffusion_config.coarse_latent_enabled else None
 
         # ノイズスケジュールの事前計算
         betas = torch.linspace(
@@ -282,10 +343,19 @@ class ConditionalSegmentDiffusionModel(nn.Module):
         """
         memory, memory_mask, source_times = self.encode_source(batch)
         context_attention_bias = self._build_alignment_attention_bias(batch, source_times)
+        coarse_latent = None
+        if self.coarse_latent is not None:
+            coarse_latent = self.coarse_latent(
+                memory,
+                memory_mask,
+                context_attention_bias,
+                batch["segment_times"],
+            )
         return {
             "memory": memory,
             "memory_mask": memory_mask,
             "context_attention_bias": context_attention_bias,
+            "coarse_latent": coarse_latent,
         }
 
     def denoise(
@@ -305,6 +375,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             memory=conditioning["memory"],
             memory_mask=conditioning["memory_mask"],
             context_attention_bias=conditioning["context_attention_bias"],
+            coarse_latent=conditioning.get("coarse_latent"),
         )
 
     def _expand_noise_scales(self, timesteps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -434,4 +505,7 @@ class ConditionalSegmentDiffusionModel(nn.Module):
             alpha_bar_next = self.alpha_bars[next_timestep]
             latents = torch.sqrt(alpha_bar_next) * pred_x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
 
+        coarse_latent = conditioning.get("coarse_latent")
+        if coarse_latent is not None:
+            return latents + coarse_latent
         return latents

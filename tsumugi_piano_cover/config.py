@@ -162,6 +162,8 @@ class DiffusionConfig:
     # denoiser の gradient checkpointing。timesteps_per_sample の回数だけ再計算が走るので
     # VRAM に余裕があるなら切った方が速い（実測 1.4x）
     gradient_checkpointing: bool = False
+    # Learn a source-conditioned coarse latent center and diffuse only the residual.
+    coarse_latent_enabled: bool = False
 
     @property
     def head_dim(self) -> int:

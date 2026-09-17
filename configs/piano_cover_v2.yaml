@@ -122,6 +122,7 @@ diffusion_model:
   zero_terminal_snr: true
   sampling_steps: 50
   gradient_checkpointing: false
+  coarse_latent_enabled: true
 
 autoencoder_training:
   batch_size: 512
