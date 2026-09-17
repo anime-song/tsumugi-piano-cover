@@ -390,7 +390,9 @@ def main() -> None:
         standard_loss_count, replay_loss_count, fresh_loss_count = on_policy_loss_counts(config)
         on_policy_config = config.diffusion_training.on_policy
         on_policy_replay = OnPolicyReplayBuffer(on_policy_config.replay_max_songs)
-        on_policy_last_refresh_step: dict[str, int] = {}
+        # ある曲のロールアウトを何エポック使い回したか。global_step で数えると、
+        # 1曲は1エポックに1回しか学習に出てこないので条件が常に成立してしまう
+        on_policy_epochs_since_refresh: dict[str, int] = {}
         validation_timesteps = build_validation_timesteps(config)
 
         resume_state = ResumeState()
@@ -445,7 +447,7 @@ def main() -> None:
         print(
             "on_policy="
             f"{on_policy_config.enabled} standard={standard_loss_count} replay={replay_loss_count} "
-            f"fresh={fresh_loss_count} refresh_steps={on_policy_config.refresh_steps} "
+            f"fresh={fresh_loss_count} refresh_every_epochs={on_policy_config.refresh_every_epochs} "
             f"sampling_steps={on_policy_config.sampling_steps}"
         )
         print(f"validation_timesteps={validation_timesteps}")
@@ -490,7 +492,7 @@ def main() -> None:
             on_policy_enabled=on_policy_config.enabled,
             on_policy_replay_fraction=on_policy_config.replay_fraction,
             on_policy_fresh_fraction=on_policy_config.fresh_fraction,
-            on_policy_refresh_steps=on_policy_config.refresh_steps,
+            on_policy_refresh_every_epochs=on_policy_config.refresh_every_epochs,
             on_policy_sampling_steps=on_policy_config.sampling_steps,
             ema_decay=config.diffusion_training.ema_decay if ema is not None else None,
             denoiser_gradient_checkpointing=config.diffusion_model.gradient_checkpointing,
@@ -575,11 +577,11 @@ def main() -> None:
                 if on_policy_config.enabled:
                     replay_key = on_policy_batch_key(batch)
                     previous_states = on_policy_replay.get(replay_key)
-                    last_refresh_step = on_policy_last_refresh_step.get(replay_key)
+                    reused_epochs = on_policy_epochs_since_refresh.get(replay_key)
                     should_refresh = (
                         previous_states is None
-                        or last_refresh_step is None
-                        or global_step - last_refresh_step >= on_policy_config.refresh_steps
+                        or reused_epochs is None
+                        or reused_epochs >= on_policy_config.refresh_every_epochs
                     )
                     if should_refresh:
                         fresh_states = collect_on_policy_states(
@@ -590,9 +592,10 @@ def main() -> None:
                             seed=config.seed * 1_000_003 + epoch * 1_009 + batch_index,
                         )
                         on_policy_replay.put(replay_key, fresh_states)
-                        on_policy_last_refresh_step[replay_key] = global_step
+                        on_policy_epochs_since_refresh[replay_key] = 1
                     else:
                         fresh_states = on_policy_replay.get(replay_key)
+                        on_policy_epochs_since_refresh[replay_key] = reused_epochs + 1
                     replay_states = previous_states if previous_states is not None else fresh_states
                     if not replay_states or not fresh_states:
                         raise RuntimeError(f"on-policy state buffer is empty for {replay_key}")
