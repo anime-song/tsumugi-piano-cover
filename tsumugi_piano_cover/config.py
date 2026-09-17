@@ -265,6 +265,13 @@ class TrainingConfig:
     ema_decay: float = 0.999
     # 1サンプルあたりに引くタイムステップ数。原曲エンコードを共有して勾配分散を下げる
     timesteps_per_sample: int = 1
+    # Crop target segments during training while keeping full source audio and absolute times.
+    short_sequence_enabled: bool = False
+    # With the default 2.56 s phrase / 1.28 s hop, 22 segments cover about 29.4 s.
+    short_sequence_segments: int = 22
+    # Use the target overlap from the previous window as clean teacher context.
+    teacher_overlap_enabled: bool = False
+    teacher_overlap_segments: int = 4
     # 検証で使う固定タイムステップの本数（毎エポック同じ値を使い、val lossを比較可能にする）
     val_timesteps: int = 5
     # 実際に逆拡散を回して生成品質を測る間隔（エポック）。0 で無効
@@ -402,6 +409,23 @@ def _validate_experiment_config(config: ExperimentConfig) -> None:
             raise ValueError(f"{name}.ema_decay must be in (0, 1): {training.ema_decay}")
         if training.timesteps_per_sample < 1:
             raise ValueError(f"{name}.timesteps_per_sample must be >= 1: {training.timesteps_per_sample}")
+        if training.short_sequence_segments < 1:
+            raise ValueError(f"{name}.short_sequence_segments must be >= 1: {training.short_sequence_segments}")
+        if training.short_sequence_enabled and name != "diffusion_training":
+            raise ValueError(f"{name}.short_sequence_enabled is only supported for diffusion_training")
+        if training.short_sequence_enabled and training.batch_size != 1:
+            raise ValueError("diffusion_training.short_sequence currently requires batch_size=1")
+        if training.teacher_overlap_segments < 1:
+            raise ValueError(f"{name}.teacher_overlap_segments must be >= 1: {training.teacher_overlap_segments}")
+        if training.teacher_overlap_enabled and name != "diffusion_training":
+            raise ValueError(f"{name}.teacher_overlap_enabled is only supported for diffusion_training")
+        if training.teacher_overlap_enabled and not training.short_sequence_enabled:
+            raise ValueError("diffusion_training.teacher_overlap_enabled requires short_sequence_enabled")
+        if training.teacher_overlap_enabled and training.teacher_overlap_segments >= training.short_sequence_segments:
+            raise ValueError(
+                "diffusion_training.teacher_overlap_segments must be smaller than short_sequence_segments: "
+                f"{training.teacher_overlap_segments} >= {training.short_sequence_segments}"
+            )
         if training.val_timesteps < 1:
             raise ValueError(f"{name}.val_timesteps must be >= 1: {training.val_timesteps}")
         if training.generation_eval_every_epochs < 0:

@@ -163,6 +163,11 @@ diffusion_training:
   # 1曲あたり4つのタイムステップを引く。原曲エンコードを共有するので
   # コストは約2.3倍で済み、optimizer step あたりのタイムステップ数は 4 -> 16 になる
   timesteps_per_sample: 4
+  short_sequence_enabled: true
+  # 2.56 s phrase / 1.28 s hop で約29.4秒。先頭4セグメント（約6.4秒）をteacher overlapにする
+  short_sequence_segments: 22
+  teacher_overlap_enabled: true
+  teacher_overlap_segments: 4
   val_timesteps: 5
   # 毎エポック実際に逆拡散を回して生成を確認する。4曲で約4秒、1エポック12.6分に対して0.5%
   generation_eval_every_epochs: 1
@@ -175,7 +180,7 @@ diffusion_training:
     # 生成し直したロールアウトを何エポック使い回すか。1 = 毎エポック生成し直す。
     # 上げるほど学習は速くなるが、使う状態が古いポリシーのものになる。
     refresh_every_epochs: 3
-    # 全曲・毎エポックでロールアウトが走るため、ここが速度を直接決める
+    # ロールアウト1回あたりのコスト。refresh_every_epochs と合わせて速度が決まる
     sampling_steps: 20
     capture_timesteps: [591, 387, 183, 81]
     # 学習セット全体（2031曲）を覆う必要がある。下回ると前エポックの状態が
