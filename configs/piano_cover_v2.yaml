@@ -164,10 +164,11 @@ diffusion_training:
   # コストは約2.3倍で済み、optimizer step あたりのタイムステップ数は 4 -> 16 になる
   timesteps_per_sample: 4
   short_sequence_enabled: true
-  # 2.56 s phrase / 1.28 s hop で約29.4秒。先頭4セグメント（約6.4秒）をteacher overlapにする
-  short_sequence_segments: 22
+  # phrase 1.28s / hop 0.64s なので 45 セグメント = 44*0.64 + 1.28 = 29.44 秒
+  short_sequence_segments: 45
   teacher_overlap_enabled: true
-  teacher_overlap_segments: 4
+  # 先頭 9 セグメント = 8*0.64 + 1.28 = 6.4 秒を teacher overlap にする
+  teacher_overlap_segments: 9
   val_timesteps: 5
   # 毎エポック実際に逆拡散を回して生成を確認する。4曲で約4秒、1エポック12.6分に対して0.5%
   generation_eval_every_epochs: 1
