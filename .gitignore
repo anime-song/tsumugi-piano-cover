@@ -28,6 +28,10 @@ checkpoints/
 # OS
 .DS_Store
 
+# piano_ar
+data/piano_ar/
+outputs/
+
 # WireGuard configs (private keys)
 *.conf
 
