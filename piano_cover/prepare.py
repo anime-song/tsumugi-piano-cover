@@ -21,6 +21,9 @@
     原曲側  : 旧 tsumugi の原曲 MIDI (Dataset/original_midis/merged) の最初の音の onset -> source_offsets.json
 新しい原曲 MIDI は音声の絶対時刻なので、原曲側に source_offsets の秒数を足して戻す。
 
+音声の DTW は音符の単位では粗い (平均 40ms 早く、±40ms 揺れる) ので、最後に音符の onset 同士が合うよう
+窓ごとに細かく補正する (refine_alignment)。
+
 DTW の経路をそのまま使うとガタつく (4 秒の平滑化との差が上位 5% で 0.14 秒) ので、
 --smooth-seconds の移動平均をかける。カバーのリズムは伸縮せず、この対応は cross-attention の位置にだけ使う。
 """
@@ -85,6 +88,65 @@ def cover_alignment(
     return mapped.astype(np.float32)
 
 
+def refine_alignment(
+    align: np.ndarray,
+    cover_notes: np.ndarray,
+    source_rows: np.ndarray,
+    window: int = 1000,
+    hop: int = 500,
+    max_lag: int = 25,
+) -> tuple[np.ndarray, float]:
+    """音声の DTW で求めた対応を、音符の onset 同士が合うように細かく補正する。
+
+    音声の DTW を平滑化したものは、onset の単位で見ると平均 40ms 早く、カバーの中でも ±40ms ほど揺れていた。
+    Local の cross-attention は原曲の音の正確な時刻を見るので、このずれがあると onset の予測がぼやけて、
+    生成のリズムがばらつく (和音が 10〜40ms に割れるなど)。
+    カバーの window フレームの窓ごとに、写した onset を ±max_lag フレームずらして、原曲 (ドラム以外) の
+    同じ音名の onset と ±1 フレームで一致する数が最も多いずれを探し、窓の間を補間して足す。
+    はっきりした山がない窓 (音が少ない・原曲と違う弾き方) は使わない。
+    返り値は補正後の対応と、使えた窓の割合。
+    """
+    from .source import DRUM_ID, ROW_A, ROW_D, ROW_ONSET, ROW_TYPE, TYPE_NOTE
+
+    notes = source_rows[(source_rows[:, ROW_TYPE] == TYPE_NOTE) & (source_rows[:, ROW_D] != DRUM_ID)]
+    source_onsets = [np.unique(notes[notes[:, ROW_A] % 12 == pc, ROW_ONSET]).astype(np.float64) for pc in range(12)]
+    cover_onsets = cover_notes[:, ONSET].astype(np.float64)
+    mapped = np.interp(cover_onsets / ALIGN_STEP, np.arange(len(align)), align)
+    pitch_class = cover_notes[:, 2] % 12
+    lags = np.arange(-max_lag, max_lag + 1)
+
+    centers, found, total = [], [], 0
+    for start in range(0, int(cover_onsets.max(initial=0)) + 1, hop):
+        selected = (cover_onsets >= start) & (cover_onsets < start + window)
+        if selected.sum() < 30:
+            continue
+        total += 1
+        hits = np.zeros(len(lags))
+        for pc in range(12):
+            targets = source_onsets[pc]
+            x = mapped[selected & (pitch_class == pc)]
+            if len(targets) < 2 or len(x) == 0:
+                continue
+            shifted = x[None, :] + lags[:, None]
+            k = np.clip(np.searchsorted(targets, shifted), 1, len(targets) - 1)
+            distance = np.minimum(np.abs(targets[k] - shifted), np.abs(targets[k - 1] - shifted))
+            hits += (distance <= 1).sum(axis=1)
+        rate = hits / selected.sum()
+        if rate.max() > 0.15 and rate.max() > 2 * np.median(rate):
+            centers.append(start + window / 2)
+            found.append(lags[rate.argmax()])
+    if not found:
+        return align, 0.0
+    found = np.asarray(found, dtype=np.float64)
+    # 1 つだけ外れた窓に引っ張られないよう、隣と合わせた 3 つの中央値にする
+    if len(found) >= 3:
+        padded = np.pad(found, 1, mode="edge")
+        found = np.median(np.stack([padded[:-2], padded[1:-1], padded[2:]]), axis=0)
+    grid = np.arange(len(align)) * ALIGN_STEP
+    correction = np.interp(grid, np.asarray(centers), found)
+    return (align + correction).astype(np.float32), len(centers) / max(total, 1)
+
+
 def _load_song(args: tuple) -> dict | str:
     original_id, covers, source_dir, cover_dir, alignment_dir, source_offset, config, smooth = args
     try:
@@ -112,7 +174,8 @@ def _load_song(args: tuple) -> dict | str:
                 config.frame_rate,
                 smooth,
             )
-            results.append((piano_id, events, end_frame, align))
+            align, refined = refine_alignment(align, events[events[:, KIND] == KIND_NOTE], rows)
+            results.append((piano_id, events, end_frame, align, refined))
         return {"original_id": original_id, "rows": rows, "end_frame": source_end, "covers": results}
     except Exception as e:  # 壊れた MIDI などは飛ばす
         return f"{original_id}: {e!r}"
@@ -162,6 +225,7 @@ def main() -> None:
     source_rows, source_ids, source_ends, source_lengths = [], [], [], []
     cover_events, cover_ids, cover_ends, cover_lengths, cover_source, channels, splits = [], [], [], [], [], [], []
     aligns, align_lengths = [], []
+    refined_rates: list[float] = []
     failed = 0
     with ProcessPoolExecutor(args.workers) as pool:
         for result in pool.map(_load_song, jobs, chunksize=4):
@@ -177,7 +241,8 @@ def main() -> None:
             source_lengths.append(len(result["rows"]))
             source_ends.append(result["end_frame"])
             split = split_of(result["original_id"], args.val_percent, args.test_percent)
-            for piano_id, events, end_frame, align in result["covers"]:
+            for piano_id, events, end_frame, align, refined in result["covers"]:
+                refined_rates.append(refined)
                 cover_ids.append(piano_id)
                 cover_events.append(events)
                 cover_lengths.append(len(events))
@@ -219,6 +284,7 @@ def main() -> None:
         f"原曲 {len(source_ids)} 曲 / カバー {len(cover_ids)} 本 ({hours:.0f} 時間) / "
         f"学習 {(splits_array == 0).sum()} 検証 {(splits_array == 1).sum()} テスト {(splits_array == 2).sum()} / 失敗 {failed}"
     )
+    print(f"音符の onset で補正できた窓の割合: 平均 {np.mean(refined_rates):.0%}")
     print(f"出力: {out_dir}")
 
 
