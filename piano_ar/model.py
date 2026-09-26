@@ -43,8 +43,8 @@ class GenerationCondition(Protocol):
 
 
 class GenerationConditionSource(Protocol):
-    def bind(self, num_samples: int, use_cfg: bool) -> GenerationCondition:
-        """生成の行数に合わせたフックを作る。use_cfg なら後半の num_samples 行は条件なしにする"""
+    def bind(self, conditioned: list[bool]) -> GenerationCondition:
+        """生成の行ごとに条件を入れるか (conditioned[i]) を決めたフックを作る。False の行は条件なしにする"""
         ...
 
 
@@ -307,22 +307,43 @@ class PianoARModel(nn.Module):
         context_patches: int = 32,
         prompts: list[list[list[int]]] | None = None,
         condition: GenerationConditionSource | None = None,
+        condition_cfg_scale: float = 1.0,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
         context_patches を超えたら、学習時の「途中から始まる窓」と同じ形 (BOS(途中) + 直近のパッチ) で続ける。
         cfg_scale > 1 ならチャンネル指定なしとの差を強調する classifier-free guidance を使う。
         prompts[i] (パッチごとのトークン列) を渡すと、サンプル i の先頭のパッチはそのトークンで埋めて続きを生成する。
-        condition (原曲など) を渡すと cross-attention で条件を入れる。このとき cfg_scale > 1 なら
-        条件もチャンネルも外したものとの差を強調する。
+        condition (原曲など) を渡すと cross-attention で条件を入れる。
+
+        条件とチャンネルの強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。L(条件, チャンネル) を
+        それぞれを外したときの予測として
+            L(なし, なし) + condition_cfg_scale * (L(条件, なし) - L(なし, なし)) + cfg_scale * (L(条件, ch) - L(条件, なし))
+        にする。両方 1 なら L(条件, ch) そのもの。必要な組み合わせだけを num_samples 行ずつ並べて一緒に計算する。
         """
         device = self.token_embedding.weight.device
-        use_cfg = cfg_scale != 1.0 and (channel != 0 or condition is not None)
-        rows = num_samples * (2 if use_cfg else 1)
-        channels = torch.full((rows,), channel, dtype=torch.long, device=device)
-        if use_cfg:
-            channels[num_samples:] = 0
-        bound = condition.bind(num_samples, use_cfg) if condition is not None else None
+        channel_guidance = cfg_scale != 1.0 and channel != 0
+        condition_guidance = condition is not None and condition_cfg_scale != 1.0
+        # (条件を入れるか, チャンネル) の組。先頭が本来の予測
+        blocks = [(True, channel)]
+        if channel != 0 and (channel_guidance or condition_guidance):
+            blocks.append((True, 0))
+        if condition_guidance:
+            blocks.append((False, 0))
+        rows = num_samples * len(blocks)
+        channels = torch.tensor([c for _, c in blocks for _ in range(num_samples)], dtype=torch.long, device=device)
+        conditioned = [flag for flag, _ in blocks for _ in range(num_samples)]
+        bound = condition.bind(conditioned) if condition is not None else None
+
+        def guide(logits: Tensor) -> Tensor:
+            parts = logits.split(num_samples)
+            full = parts[0]
+            no_channel = parts[1] if channel != 0 and len(parts) > 1 else full
+            guided = no_channel + cfg_scale * (full - no_channel)
+            if condition_guidance:
+                nothing = parts[-1]
+                guided = nothing + condition_cfg_scale * (no_channel - nothing) + cfg_scale * (full - no_channel)
+            return guided
 
         patches: list[list[list[int]]] = [[] for _ in range(num_samples)]
         summaries: list[Tensor] = []  # パッチごとの要約 [rows, D]
@@ -357,9 +378,7 @@ class PianoARModel(nn.Module):
             while not all(g.finished for g in grammars):
                 local_cross = bound.local_cross(p, sequence) if bound is not None else None
                 logits = self.local_forward(sequence, context, local_cross)[:, -1].float()
-                if use_cfg:
-                    conditional, unconditional = logits[:num_samples], logits[num_samples:]
-                    logits = unconditional + cfg_scale * (conditional - unconditional)
+                logits = guide(logits)
                 allowed = torch.stack([g.allowed() for g in grammars]).to(device)
                 next_token = _sample(logits.masked_fill(~allowed, float("-inf")), temperature, top_p)
                 step = sequence.shape[1]

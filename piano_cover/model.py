@@ -342,18 +342,17 @@ class SourceCondition:
         self.num_patches = int(batch["src_patch_valid"].shape[1])
         self.memory = model.encode_source(batch, batch["src_patch_valid"])
 
-    def bind(self, num_samples: int, use_cfg: bool) -> _BoundSourceCondition:
-        return _BoundSourceCondition(self, num_samples, use_cfg)
+    def bind(self, conditioned: list[bool]) -> _BoundSourceCondition:
+        return _BoundSourceCondition(self, conditioned)
 
 
 class _BoundSourceCondition:
-    def __init__(self, source: SourceCondition, num_samples: int, use_cfg: bool) -> None:
+    def __init__(self, source: SourceCondition, conditioned: list[bool]) -> None:
         self.model = source.model
         self.memory = source.memory
-        self.rows = num_samples * (2 if use_cfg else 1)
-        # CFG のときは後半の行を「原曲なし」にする
-        self.conditioned = torch.zeros(self.rows, dtype=torch.bool, device=self.memory.song.device)
-        self.conditioned[:num_samples] = True
+        self.rows = len(conditioned)
+        # False の行 (CFG の「原曲なし」) は原曲を見せない
+        self.conditioned = torch.tensor(conditioned, dtype=torch.bool, device=self.memory.song.device)
 
     def global_cross(self, first: int, last: int) -> CrossHook:
         model, memory = self.model, self.memory

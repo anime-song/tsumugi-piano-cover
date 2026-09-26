@@ -1,7 +1,7 @@
 """原曲の MIDI (tsumugi で採譜したもの) からピアノカバーを生成する。
 
 python -m piano_cover.generate --checkpoint checkpoints/piano_cover/best.pt --source Dataset/original_midis_v2/merged/<id>.mid
-python -m piano_cover.generate ... --channel UCxxxxxxxx --cfg-scale 1.5 --seconds 60 --wav
+python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.3 --channel-cfg 1.5 --seconds 60 --wav
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
 """
@@ -35,7 +35,10 @@ def main() -> None:
     parser.add_argument("--channel", default=None, help="チャンネル ID (UC...) か channel_index の番号。省略で指定なし")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--cfg-scale", type=float, default=1.0, help="> 1 で原曲 (とチャンネル) の条件を強める")
+    parser.add_argument("--source-cfg", type=float, default=1.0, help="> 1 で原曲に忠実にする (原曲なしとの差を強調)")
+    parser.add_argument(
+        "--channel-cfg", type=float, default=1.0, help="> 1 で演奏者らしさを強める (--channel を指定したときだけ効く)"
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
     args = parser.parse_args()
@@ -76,7 +79,8 @@ def main() -> None:
             num_samples=args.num_samples,
             temperature=args.temperature,
             top_p=args.top_p,
-            cfg_scale=args.cfg_scale,
+            cfg_scale=args.channel_cfg,
+            condition_cfg_scale=args.source_cfg,
             context_patches=round(checkpoint["args"]["window_seconds"] / patch_seconds),
             condition=condition,
         )
