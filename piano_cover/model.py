@@ -21,7 +21,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from piano_ar.config import ModelConfig
-from piano_ar.model import CrossHook, PianoARModel, RMSNorm, Transformer, _apply_rope, _rope
+from piano_ar.model import Block, CrossHook, PianoARModel, RMSNorm, Transformer, _apply_rope, _rope
 from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
@@ -148,6 +148,20 @@ class CoverModel(nn.Module):
         self.patch_encoder.gradient_checkpointing = enabled
         self.song_encoder.gradient_checkpointing = enabled
         self.gradient_checkpointing = enabled
+
+    def compile_blocks(self) -> None:
+        """Transformer のブロックと CrossBlock を 1 つずつ torch.compile する。
+
+        piano_ar のように Transformer ごと compile すると、cross-attention のフック (毎回作り直す関数) が
+        compile の対象に入って作り直しが続くので、中身の決まったブロック単位にする。
+        学習時間の多くは行列積ではなく RMSNorm・RoPE・型変換などの細かい演算なので、融合の効果が大きい
+        (batch 16 で 1 ステップ 1.49 秒 -> 1.02 秒)。最初の 1 ステップは compile に 2 分ほどかかる。
+        """
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 64
+        for module in self.modules():
+            if isinstance(module, (Block, CrossBlock)):
+                module.compile(dynamic=True)
 
     def run_cross(self, block: CrossBlock, *args: Tensor) -> Tensor:
         if self.gradient_checkpointing and self.training:

@@ -61,6 +61,11 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--no-grad-checkpoint", action="store_true")
     parser.add_argument("--length-buckets", type=int, default=8)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Transformer のブロックを torch.compile する (triton-windows と、日本語版 Windows では PYTHONUTF8=1 が必要)",
+    )
     parser.add_argument("--gpu-memory-limit", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", default=None)
@@ -273,6 +278,13 @@ def main() -> None:
     else:
         model.decoder.load_state_dict(pretrained["model"])
         print(f"{args.pretrained} (step {pretrained['step']}) でデコーダを初期化")
+    if args.compile:
+        # inductor は内部のテンプレートを既定の文字コードで読むため、日本語版 Windows (cp932) では失敗する
+        if not sys.flags.utf8_mode:
+            raise SystemExit(
+                "--compile には Python の UTF-8 モードが必要です。PYTHONUTF8=1 を設定するか python -X utf8 で起動してください"
+            )
+        model.compile_blocks()
     new_count = sum(p.numel() for p in model.new_parameters())
     print(f"パラメータ数 {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M (新規 {new_count / 1e6:.1f}M)")
 
@@ -342,10 +354,13 @@ def main() -> None:
             # cross-attention のゲートがどれだけ開いたか (0 なら原曲をまったく使っていない)
             gates = [torch.tanh(b.attn_gate).abs().item() for b in (*model.global_cross, *model.local_cross)]
             logs["train/cross_gate_mean"] = float(np.mean(gates))
+            if device.type == "cuda":
+                logs["train/max_memory_gb"] = torch.cuda.max_memory_allocated() / 1e9
             print(
                 f"step {step} loss {logs['train/loss']:.4f} "
                 + " ".join(f"{g} {logs[f'train/loss_{g}']:.3f}" for g in TOKEN_GROUPS)
                 + f" gate {logs['train/cross_gate_mean']:.3f} lr {logs['train/lr']:.2e}"
+                + f" mem {logs.get('train/max_memory_gb', 0):.1f}GB"
                 + f" {logs['train/tokens_per_sec']:.0f} tok/s"
             )
             if wandb_run:
