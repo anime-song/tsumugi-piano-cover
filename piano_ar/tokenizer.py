@@ -233,7 +233,7 @@ class PianoTokenizer:
                         pending = []
         if not rows:
             return np.zeros((0, 5), dtype=np.int32)
-        return sort_events(np.asarray(rows, dtype=np.int64)).astype(np.int32)
+        return trim_overlapping_notes(sort_events(np.asarray(rows, dtype=np.int64))).astype(np.int32)
 
     def events_to_midi(self, events: np.ndarray, path: str | Path) -> None:
         from symusic import ControlChange, Note, Score, Track
@@ -252,6 +252,26 @@ class PianoTokenizer:
 
 def sort_events(events: np.ndarray) -> np.ndarray:
     return events[np.lexsort((events[:, PITCH], events[:, KIND], events[:, ONSET]))]
+
+
+def trim_overlapping_notes(events: np.ndarray) -> np.ndarray:
+    """同じ鍵盤の音が次の音に重なっていたら、次の音を優先して前の音をその onset で切る。
+
+    duration はビン化 (長い音ほど粗い) と予測の誤差で長めに出ることがあり、同じ鍵盤で次の音と重なると
+    MIDI の再生では前の音の note off が次の音を止めてしまう。実際のピアノでも同じ鍵盤は重ねて鳴らせない。
+    違う鍵盤どうしの重なり (和音やレガート) はそのまま残す。
+    """
+    events = events.copy()
+    note_index = np.flatnonzero(events[:, KIND] == KIND_NOTE)
+    notes = events[note_index]
+    order = np.lexsort((notes[:, ONSET], notes[:, PITCH]))
+    onset, pitch = notes[order, ONSET], notes[order, PITCH]
+    end = onset + notes[order, DURATION]
+    same_key_next = np.flatnonzero(pitch[:-1] == pitch[1:])
+    overlap = same_key_next[end[same_key_next] > onset[same_key_next + 1]]
+    target = note_index[order[overlap]]
+    events[target, DURATION] = np.maximum(1, onset[overlap + 1] - onset[overlap])
+    return events
 
 
 class PatchGrammar:
