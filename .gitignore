@@ -1,7 +1,6 @@
 .venv*
 .vscode
 .idea/
-artifacts/
 Dataset/
 wandb/
 runs/
