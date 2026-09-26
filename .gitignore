@@ -1,4 +1,6 @@
 .venv*
+.transkun/
+.tsumugi/
 .vscode
 .idea/
 Dataset/
@@ -25,3 +27,12 @@ checkpoints/
 
 # OS
 .DS_Store
+
+# WireGuard configs (private keys)
+*.conf
+
+local/
+
+data/metadata/
+
+data/alignments/
