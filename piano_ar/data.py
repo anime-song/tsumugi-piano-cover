@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, WeightedRandomSampler
+
+from .config import TokenizerConfig
+from .tokenizer import (
+    DURATION,
+    KIND,
+    KIND_NOTE,
+    KIND_PEDAL_OFF,
+    KIND_PEDAL_ON,
+    ONSET,
+    PAD,
+    PITCH,
+    VELOCITY,
+    PianoTokenizer,
+    sort_events,
+)
+
+
+@dataclass(frozen=True)
+class AugmentConfig:
+    # 半音単位の移調幅 (±)
+    transpose: int = 5
+    # テンポの伸縮率 (±)
+    time_stretch: float = 0.1
+    # 全体のベロシティのずらし幅 (±)
+    velocity_shift: int = 10
+
+
+class PretrainingCache:
+    """prepare.py が作ったキャッシュ。events.npy は DataLoader の各ワーカーで遅延して mmap で開く"""
+
+    def __init__(self, cache_dir: str | Path) -> None:
+        self.cache_dir = Path(cache_dir)
+        songs = np.load(self.cache_dir / "songs.npz")
+        self.offsets = songs["offsets"]
+        self.end_frames = songs["end_frames"]
+        self.channels = songs["channels"]
+        self.video_ids = songs["video_ids"]
+        self.is_val = songs["is_val"]
+        self.meta = json.loads((self.cache_dir / "meta.json").read_text(encoding="utf-8"))
+        self.tokenizer_config = TokenizerConfig(**self.meta["tokenizer"])
+        self._events: np.ndarray | None = None
+
+    def song_events(self, index: int) -> np.ndarray:
+        if self._events is None:
+            self._events = np.load(self.cache_dir / "events.npy", mmap_mode="r")
+        return np.asarray(self._events[self.offsets[index] : self.offsets[index + 1]])
+
+    def __getstate__(self) -> dict:
+        # mmap を pickle するとデータごとコピーされるので、ワーカーには開く前の状態で渡す
+        state = self.__dict__.copy()
+        state["_events"] = None
+        return state
+
+
+def stretch_events(events: np.ndarray, end_frame: int, factor: float) -> tuple[np.ndarray, int]:
+    events = events.astype(np.int64)
+    events[:, ONSET] = np.round(events[:, ONSET] * factor)
+    notes = events[:, KIND] == KIND_NOTE
+    events[notes, DURATION] = np.maximum(1, np.round(events[notes, DURATION] * factor))
+    end_frame = int(round(end_frame * factor))
+    # 丸めでペダルの on と off が同じフレームに潰れないよう、on < off <= 次の on を保つ
+    on = np.flatnonzero(events[:, KIND] == KIND_PEDAL_ON)
+    off = np.flatnonzero(events[:, KIND] == KIND_PEDAL_OFF)
+    if len(on):
+        on_frames = events[on, ONSET]
+        off_frames = np.maximum(events[off, ONSET], on_frames + 1)
+        on_frames[1:] = np.maximum(on_frames[1:], off_frames[:-1])
+        off_frames = np.maximum(off_frames, on_frames + 1)
+        events[on, ONSET] = on_frames
+        events[off, ONSET] = off_frames
+        end_frame = max(end_frame, int(off_frames.max()) + 1)
+    return sort_events(events), end_frame
+
+
+def transpose_events(events: np.ndarray, shift: int, tokenizer_config: TokenizerConfig) -> np.ndarray:
+    events = events.astype(np.int64)
+    notes = events[:, KIND] == KIND_NOTE
+    events[notes, PITCH] += shift
+    pitch = events[:, PITCH]
+    return events[~notes | ((pitch >= tokenizer_config.pitch_min) & (pitch <= tokenizer_config.pitch_max))]
+
+
+def shift_velocity(events: np.ndarray, shift: int) -> np.ndarray:
+    events = events.astype(np.int64)
+    notes = events[:, KIND] == KIND_NOTE
+    events[notes, VELOCITY] = np.clip(events[notes, VELOCITY] + shift, 1, 127)
+    return events
+
+
+def _augment(
+    events: np.ndarray, end_frame: int, config: AugmentConfig, tokenizer_config: TokenizerConfig
+) -> tuple[np.ndarray, int]:
+    if config.time_stretch > 0:
+        events, end_frame = stretch_events(
+            events, end_frame, random.uniform(1 - config.time_stretch, 1 + config.time_stretch)
+        )
+    if config.transpose > 0:
+        events = transpose_events(events, random.randint(-config.transpose, config.transpose), tokenizer_config)
+    if config.velocity_shift > 0:
+        events = shift_velocity(events, random.randint(-config.velocity_shift, config.velocity_shift))
+    return sort_events(events), end_frame
+
+
+class PianoWindowDataset(Dataset):
+    """曲から固定長の窓を切り出してパッチごとのトークンにする。
+
+    学習用 (split="train") は index を曲番号として受け取り、窓の位置はランダム。曲の選び方は
+    make_sampler の重みで決める。検証用は曲の冒頭の窓に固定して、毎回同じ入力で損失を測る。
+    """
+
+    def __init__(
+        self,
+        cache: PretrainingCache,
+        *,
+        split: str,
+        window_patches: int,
+        augment: AugmentConfig | None = None,
+        song_start_prob: float = 0.1,
+        channel_dropout: float = 0.15,
+    ) -> None:
+        self.cache = cache
+        self.tokenizer = PianoTokenizer(cache.tokenizer_config)
+        self.window_patches = window_patches
+        self.train = split == "train"
+        self.augment = augment if self.train else None
+        self.song_start_prob = song_start_prob
+        self.channel_dropout = channel_dropout if self.train else 0.0
+        self.songs = np.flatnonzero(~cache.is_val if self.train else cache.is_val)
+
+    def __len__(self) -> int:
+        return len(self.songs)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        song = int(self.songs[index])
+        events = self.cache.song_events(song)
+        end_frame = int(self.cache.end_frames[song])
+        if self.augment is not None:
+            events, end_frame = _augment(events, end_frame, self.augment, self.tokenizer.config)
+
+        window_frames = self.window_patches * self.tokenizer.patch_frames
+        song_start = not self.train or random.random() < self.song_start_prob
+        if song_start:
+            start = 0
+        else:
+            # 曲の終わり (EOS) も学習できるよう、窓の後半が曲の外にはみ出す位置まで選ぶ
+            start = random.randint(0, max(0, end_frame - window_frames // 2))
+            song_start = start == 0
+        window = self.tokenizer.tokenize_window(events, end_frame, start, self.window_patches)
+
+        channel = int(self.cache.channels[song])
+        if random.random() < self.channel_dropout:
+            channel = 0
+        return {
+            "tokens": torch.from_numpy(window["tokens"]),
+            "patch_valid": torch.from_numpy(window["patch_valid"]),
+            "pedal_state": torch.from_numpy(window["pedal_state"]),
+            "channel": torch.tensor(channel),
+            "song_start": torch.tensor(int(song_start)),
+        }
+
+
+def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    out = {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
+    # パッチ内トークン長はバッチ内の最長に詰める (大半のパッチは上限よりずっと短い)
+    used = int((out["tokens"] != PAD).sum(-1).max())
+    out["tokens"] = out["tokens"][..., : max(used, 1)]
+    return out
+
+
+def make_sampler(dataset: PianoWindowDataset, num_samples: int, channel_alpha: float = 0.5) -> WeightedRandomSampler:
+    """曲の長さに比例して選びつつ、チャンネルの偏りを和らげる。
+
+    チャンネル c が選ばれる確率が (チャンネルの総時間)^channel_alpha に比例するよう曲ごとに重みを付ける。
+    1 で偏りそのまま、0 でチャンネル均等。
+    """
+    lengths = dataset.cache.end_frames[dataset.songs].astype(np.float64)
+    channels = dataset.cache.channels[dataset.songs]
+    totals: dict[int, float] = {}
+    for channel, length in zip(channels.tolist(), lengths.tolist()):
+        totals[channel] = totals.get(channel, 0.0) + length
+    channel_total = np.array([totals[c] for c in channels.tolist()])
+    weights = lengths * channel_total ** (channel_alpha - 1)
+    return WeightedRandomSampler(torch.from_numpy(weights), num_samples=num_samples, replacement=True)

@@ -3,3 +3,5 @@ torch==2.13.0+cu130
 numpy
 symusic
 wandb
+# torch.compile 用 (torch 2.13 は triton 3.7 系)
+triton-windows>=3.7,<3.8; sys_platform == "win32"
