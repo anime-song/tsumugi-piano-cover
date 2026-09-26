@@ -30,6 +30,7 @@ checkpoints/
 
 # piano_ar
 data/piano_ar/
+data/piano_cover/
 outputs/
 
 # WireGuard configs (private keys)
