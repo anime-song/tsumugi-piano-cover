@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
+from .config import ScoreTokenizerConfig
 from .score import (
     ARTICULATIONS,
     CLEFS,
@@ -138,11 +139,22 @@ def _tolerance(divisions: int) -> Fraction:
     return min(Fraction(3, divisions), Fraction(1, 32))
 
 
-def _snap(value: Fraction, tolerance: Fraction) -> Fraction:
-    """丸められた位置 (23/160 など) を、tolerance 以内でいちばん分母の小さい分数 (1/7) に寄せる"""
-    if 96 % value.denominator == 0:
+# 拍の中の位置として書ける分数の分母 (トークナイザーの既定)。これで表せる位置は丸められていないとみなす
+EXACT_DENOMINATORS = (1, *ScoreTokenizerConfig().fraction_denominators)
+
+
+def _snap(value: Fraction, divisions: int) -> Fraction:
+    """divisions で丸められた位置 (7 連符の 23/160 など) を、丸めの誤差の範囲で書ける分数 (1/7) に寄せる。
+
+    書ける分数ならそのまま返す。寄せる先は divisions で割り切れない分母 (割り切れるならそもそも丸められない) の中で、
+    分母のいちばん小さいもの。
+    """
+    if (value % 1).denominator in EXACT_DENOMINATORS:
         return value
-    for denominator in range(1, 129):
+    tolerance = _tolerance(divisions)
+    for denominator in EXACT_DENOMINATORS:
+        if divisions % denominator == 0:
+            continue
         candidate = Fraction(round(value * denominator), denominator)
         if abs(candidate - value) <= tolerance:
             return candidate
@@ -208,7 +220,7 @@ def _parse_part(
                 cursor += Fraction(int(el.findtext("duration")), divisions)
                 max_position = max(max_position, cursor)
             elif tag == "direction":
-                position = _snap(cursor + Fraction(int(el.findtext("offset") or 0), divisions), _tolerance(divisions))
+                position = _snap(cursor + Fraction(int(el.findtext("offset") or 0), divisions), divisions)
                 for direction_type in el.findall("direction-type"):
                     for child in direction_type:
                         if child.tag == "dynamics":
@@ -270,7 +282,7 @@ def _parse_part(
                     if expected is not None and abs(cursor - expected) <= tolerance:
                         onset = expected
                     else:
-                        onset = _snap(cursor, tolerance)
+                        onset = _snap(cursor, divisions)
                     if grace is None:
                         cursor += length
                         max_position = max(max_position, cursor)
@@ -334,7 +346,7 @@ def _parse_part(
                     order += 1
         # 長さも丸めの誤差を含むので、音価どおりに積み上げた終わりと比べて寄せる (拍子どおりの長さに近ければそれにする)
         tolerance = _tolerance(divisions)
-        length = _snap(max([max_position, *voice_end.values()]), tolerance)
+        length = _snap(max([max_position, *voice_end.values()]), divisions)
         if raw.time_signature is not None:
             nominal = Fraction(4 * raw.time_signature[0], raw.time_signature[1])
             if abs(length - nominal) <= tolerance:

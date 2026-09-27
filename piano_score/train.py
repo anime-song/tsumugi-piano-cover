@@ -5,6 +5,7 @@
 途中から再開する場合は --resume checkpoints/piano_score/latest.pt (wandb も同じ run に続けて記録する)。
 検証の損失がそれまでで最も低くなったら out-dir/best.pt にも保存する。
 この段階では演奏がないので、MTIME はテンポ記号どおりの時刻に倍率と揺れをかけたものを使う (data.py)。
+--sample-every ごとに楽譜を生成して out-dir/samples に MusicXML で保存する。MuseScore があれば PNG にもして wandb に送る。
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import time
 from dataclasses import asdict, fields
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -24,7 +26,9 @@ from piano_ar.model import PianoARModel
 from piano_ar.train import limit_gpu_memory, lr_at, make_optimizer, to_device
 
 from .data import ScoreAugmentConfig, ScoreCache, ScoreWindowDataset, make_sampler
-from .tokenizer import TOKEN_GROUPS, ScoreTokenizer
+from .generate import find_musescore, generate, render_png, score_stats
+from .musicxml import write_musicxml
+from .tokenizer import PAD, TOKEN_GROUPS, ScoreTokenizer
 
 
 def build_args() -> argparse.Namespace:
@@ -64,6 +68,16 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="auto", help="auto / cuda / cpu (動作確認を CPU で回すときなど)")
     parser.add_argument("--seed", type=int, default=0)
+    # 学習中の生成評価
+    parser.add_argument("--sample-every", type=int, default=5000, help="0 で生成評価をしない")
+    parser.add_argument("--sample-count", type=int, default=2, help="冒頭からの生成と続きの生成、それぞれの本数")
+    parser.add_argument("--sample-measures", type=int, default=16)
+    parser.add_argument("--prompt-measures", type=int, default=4, help="続きの生成で検証曲の冒頭から与える小節数")
+    parser.add_argument("--sample-temperature", type=float, default=1.0)
+    parser.add_argument("--sample-top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--musescore", default="auto", help="PNG にする MuseScore の実行ファイル (auto で探す、none で使わない)"
+    )
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     # モデルの大きさ (ModelConfig の各項目を --dim などで上書きできる)。楽譜ではチャンネルとスタイル参照は使わない
@@ -87,6 +101,79 @@ def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device) -> d
         count += tokens
     model.train()
     return {key: value / max(count, 1) for key, value in sums.items()}
+
+
+def sample_evaluation(
+    model: PianoARModel,
+    tokenizer: ScoreTokenizer,
+    val_set: ScoreWindowDataset,
+    args: argparse.Namespace,
+    step: int,
+    out_dir: Path,
+    wandb_run,
+) -> None:
+    """冒頭から生成した楽譜と、検証曲の冒頭をプロンプトにして続きを生成した楽譜を残す。
+
+    続きの生成のプロンプトは毎回同じ検証曲を使うので、学習が進むにつれて同じ入力への応答がどう変わるかを比べられる。
+    """
+    cache = val_set.cache
+    indices = [i for i, s in enumerate(val_set.songs.tolist()) if cache.num_measures(s) >= args.sample_measures]
+    references = []
+    for index in indices[: args.sample_count]:
+        item = val_set[index]
+        rows = item["tokens"][item["patch_valid"]].tolist()
+        references.append([[t for t in row if t != PAD] for row in rows][: args.sample_measures])
+    prompts = [reference[: args.prompt_measures] for reference in references]
+
+    model.eval()
+    started = time.time()
+    common = {
+        "num_measures": args.sample_measures,
+        "temperature": args.sample_temperature,
+        "top_p": args.sample_top_p,
+        "context_measures": args.window_measures,
+    }
+    device = next(model.parameters()).device
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        free = generate(model, tokenizer, num_samples=args.sample_count, **common)
+        continued = generate(model, tokenizer, num_samples=len(prompts), prompts=prompts, **common) if prompts else []
+    model.train()
+
+    sample_dir = out_dir / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    musescore = find_musescore() if args.musescore == "auto" else (None if args.musescore == "none" else args.musescore)
+    logs: dict[str, object] = {}
+    if wandb_run:
+        import wandb
+
+    def add(name: str, patches: list[list[int]], log_name: str | None = None) -> None:
+        path = sample_dir / f"{name}.musicxml"
+        write_musicxml(tokenizer.decode(patches)[0], path)
+        pages = render_png(path, musescore) if musescore else []
+        if wandb_run:
+            wandb_run.save(str(path), base_path=str(out_dir), policy="now")
+            if pages:
+                logs[f"samples/{log_name or name}"] = wandb.Image(str(pages[0]))
+
+    stats = []
+    for i, patches in enumerate(free):
+        add(f"step{step:07d}_free{i}", patches, f"free{i}")
+        stats.append(score_stats(patches, tokenizer))
+    for i, patches in enumerate(continued):
+        add(f"step{step:07d}_continuation{i}", patches, f"continuation{i}")
+        if not (sample_dir / f"reference{i}.musicxml").exists():  # 比べる用の元の曲 (最初の評価のときだけ)
+            add(f"reference{i}", references[i])
+
+    mean_stats = {key: float(np.mean([s.get(key, 0.0) for s in stats])) for key in stats[0]} if stats else {}
+    mean_stats["ended_rate"] = float(np.mean([len(p) < args.sample_measures for p in free])) if free else 0.0
+    logs.update({f"sample_stats/{k}": v for k, v in mean_stats.items()})
+    print(
+        f"[sample] step {step} {time.time() - started:.0f}s "
+        + " ".join(f"{k} {v:.2f}" for k, v in mean_stats.items())
+        + f" -> {sample_dir}"
+    )
+    if wandb_run:
+        wandb_run.log(logs, step=step)
 
 
 def format_losses(values: dict[str, float], prefix: str = "") -> str:
@@ -240,6 +327,9 @@ def main() -> None:
                 print(f"[val] 最良を更新したので best.pt に保存 (step {step})")
                 if wandb_run:
                     wandb_run.summary.update({"best/val_loss": best_val_loss, "best/step": step})
+
+        if args.sample_every and step % args.sample_every == 0 and len(val_set):
+            sample_evaluation(model, tokenizer, val_set, args, step, out_dir, wandb_run)
 
         if step % args.save_every == 0 or step == args.steps:
             save(out_dir / "latest.pt")
