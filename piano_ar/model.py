@@ -203,6 +203,8 @@ class PianoARModel(nn.Module):
         self.config = config
         self.vocab_size = tokenizer.vocab_size
         self.register_buffer("token_group", torch.from_numpy(tokenizer.token_group), persistent=False)
+        # 損失をトークンの種類別に見るときの名前。楽譜のトークナイザーなど、別の語彙で使うときは tokenizer.group_names に持たせる
+        self.group_names: tuple[str, ...] = tuple(getattr(tokenizer, "group_names", TOKEN_GROUPS))
         dim = config.dim
 
         self.token_embedding = nn.Embedding(self.vocab_size, dim)
@@ -395,8 +397,8 @@ class PianoARModel(nn.Module):
             style_present=style_present,
         )[valid]
 
-        loss_sum = torch.zeros(len(TOKEN_GROUPS), device=tokens.device)
-        counts = torch.zeros(len(TOKEN_GROUPS), device=tokens.device)
+        loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
+        counts = torch.zeros(len(self.group_names), device=tokens.device)
         for index, length in buckets:
             target = flat[index, :length]
             cross = condition.local_cross(index, target[:, :-1]) if condition is not None else None
@@ -410,7 +412,7 @@ class PianoARModel(nn.Module):
             counts = counts.index_add(0, group[keep], torch.ones_like(token_loss[keep]))
 
         output = {"loss": loss_sum.sum() / counts.sum().clamp_min(1), "tokens": counts.sum()}
-        for index, name in enumerate(TOKEN_GROUPS):
+        for index, name in enumerate(self.group_names):
             output[f"loss_{name}"] = loss_sum[index] / counts[index].clamp_min(1)
         return output
 
