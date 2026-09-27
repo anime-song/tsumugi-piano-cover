@@ -1,14 +1,16 @@
 """楽譜の中間表現 (score.py) <-> 小節ごとのトークン列の変換。
 
 1 小節 (= Global の 1 パッチ) のトークン列の文法:
-    measure   := MTIME TS KEY CLEF1 CLEF2 OTTAVA* [MLEN position] onset* (EOM | EOS)
-    onset     := position CLEF* OTTAVA* DIRECTION* group*  position は小節の中で昇順
+    measure   := MTIME TS KEY CLEF1 CLEF2 OTTAVA* [SWING] [MLEN position] onset* (EOM | EOS)
+    onset     := position CLEF* OTTAVA* [SWING] DIRECTION* group*  position は小節の中で昇順
     position  := BEAT [FRAC]                                BEAT = 4 分音符単位の整数部、FRAC = 拍の中の分数
-    group     := SV [CROSS] DUR ART* (PITCH [TIE] [GLISS])+  同じ位置・同じ声部の和音。音高は昇順
+    group     := SV [CROSS] DUR ART* SLUR_STOP* SLUR_START* (PITCH [TIE] [GLISS])+
+                                                           同じ位置・同じ声部の和音。音高は昇順
 MTIME は演奏上の小節の開始時刻。最初の小節は「最初の音から小節の頭まで何秒さかのぼるか」、それ以降は
 「前の小節の (トークンから復元した) 開始時刻から何秒後か」。復元した時刻との差を取るので、ビンの丸め誤差が積もらない。
 ヘッダ (拍子・調・音部記号) は毎小節入れる。オクターブ記号は段ごとの状態として、ヘッダでは効いている段だけ入れ、
-小節の途中では状態が変わる位置に入れる (none で終わり)。MLEN は小節の長さが拍子と違うとき (弱起など) だけ入れる。
+小節の途中では状態が変わる位置に入れる (none で終わり)。スイングの指定も同じく曲全体の状態として入れる。
+MLEN は小節の長さが拍子と違うとき (弱起など) だけ入れる。
 同じ位置の中は、音部記号の変更 -> 強弱などの指示 -> 塊 (段・声部の順、同じ声部では装飾音が先) の順に並べる。
 """
 
@@ -26,23 +28,27 @@ from .score import (
     DYNAMICS,
     OTTAVAS,
     PEDALS,
+    STEP_PITCH_CLASS,
+    STEPS,
+    SWINGS,
     WEDGES,
     Group,
     Measure,
     Note,
     all_durations,
     first_onset_seconds,
+    group_order,
     measure_seconds,
-    STEP_PITCH_CLASS,
-    STEPS,
     spell,
 )
 
-PAD, EOM, EOS, MLEN, CROSS, TIE, GLISS = range(7)
-SPECIAL_NAMES = ("PAD", "EOM", "EOS", "MLEN", "CROSS", "TIE", "GLISS")
+PAD, EOM, EOS, MLEN, CROSS, TIE, GLISS, SLUR_STOP, SLUR_START = range(9)
+SPECIAL_NAMES = ("PAD", "EOM", "EOS", "MLEN", "CROSS", "TIE", "GLISS", "SLUR_STOP", "SLUR_START")
 
 # 損失をトークンの種類別に見るためのグループ
-TOKEN_GROUPS = ("end", "mtime", "header", "position", "direction", "voice", "duration", "articulation", "pitch", "tie")
+TOKEN_GROUPS = (
+    "end", "mtime", "header", "position", "direction", "voice", "duration", "articulation", "slur", "pitch", "tie",
+)  # fmt: skip
 
 TIME_SIGNATURE_BEATS = range(1, 25)
 TIME_SIGNATURE_BEAT_TYPES = (1, 2, 4, 8, 16, 32)
@@ -69,6 +75,7 @@ class ScoreTokenizer:
         entries += [("key", k, "header") for k in range(-7, 8)]
         entries += [("clef", (s, name), "header") for s in (1, 2) for name in CLEFS]
         entries += [("ottava", (s, name), "direction") for s in (1, 2) for name in OTTAVAS]
+        entries += [("swing", name, "direction") for name in SWINGS]
         entries += [("beat", b, "position") for b in range(c.max_measure_quarters + 1)]
         entries += [("frac", f, "position") for f in self.fractions]
         entries += [("direction", d, "direction") for d in DIRECTIONS]
@@ -85,6 +92,7 @@ class ScoreTokenizer:
         group[[CROSS]] = TOKEN_GROUPS.index("voice")
         group[[TIE]] = TOKEN_GROUPS.index("tie")
         group[[GLISS]] = TOKEN_GROUPS.index("articulation")
+        group[[SLUR_STOP, SLUR_START]] = TOKEN_GROUPS.index("slur")
         group[[PAD]] = -1
         self.token_group = group
         self.group_names = TOKEN_GROUPS
@@ -183,6 +191,8 @@ class ScoreTokenizer:
             self.token("clef", (2, measure.clefs[1])),
         ]
         tokens += [self.token("ottava", (s + 1, name)) for s, name in enumerate(measure.ottavas) if name != "none"]
+        if measure.swing != "none":
+            tokens.append(self.token("swing", measure.swing))
         if measure.length != measure.nominal_length:
             tokens += [MLEN, *self.position_tokens(measure.length)]
         directions: dict[Fraction, list[int]] = {}
@@ -191,6 +201,8 @@ class ScoreTokenizer:
                 token = self.token("clef", (int(name[4]), name.split("_", 1)[1]))
             elif name.startswith("ottava"):
                 token = self.token("ottava", (int(name[6]), name.split("_", 1)[1]))
+            elif name.startswith("swing"):
+                token = self.token("swing", name.split("_", 1)[1])
             else:
                 token = self.token("direction", name)
             directions.setdefault(position, []).append(token)
@@ -201,12 +213,13 @@ class ScoreTokenizer:
             tokens += self.position_tokens(position)
             tokens += sorted(set(directions.get(position, [])))
             # 同じ声部の中の順 (装飾音 -> 本体) は読み込んだ順のまま保つ (安定ソート)
-            for g in sorted(groups.get(position, []), key=_group_order):
+            for g in sorted(groups.get(position, []), key=group_order):
                 tokens.append(self.token("sv", (g.staff, g.voice)))
                 if g.cross:
                     tokens.append(CROSS)
                 tokens.append(self.token("dur", g.duration))
                 tokens += [self.token("art", a) for a in ARTICULATIONS if a in g.articulations]
+                tokens += [SLUR_STOP] * g.slur_stop + [SLUR_START] * g.slur_start
                 for note in sorted(g.notes, key=lambda n: n.pitch):
                     tokens.append(self.token("pitch", (note.pitch, note.alter)))
                     if note.tie:
@@ -237,6 +250,7 @@ class ScoreTokenizer:
         mtime = 0
         time_signature, key, clefs = previous.time_signature, previous.key, list(previous.clefs)
         ottavas = ["none", "none"]
+        swing = "none"
         length: Fraction | None = None
         position: Fraction | None = None
         mode = "header"  # header / length / onset
@@ -266,6 +280,11 @@ class ScoreTokenizer:
                     ottavas[value[0] - 1] = value[1]
                 else:
                     directions.append((position, f"ottava{value[0]}_{value[1]}"))
+            elif kind == "swing":
+                if position is None:
+                    swing = value
+                else:
+                    directions.append((position, f"swing_{value}"))
             elif kind == "beat":
                 if mode == "length" and length is None:
                     length = Fraction(value)
@@ -290,6 +309,10 @@ class ScoreTokenizer:
                 group.duration = value
             elif kind == "art" and group is not None:
                 group.articulations = (*group.articulations, value)
+            elif token == SLUR_STOP and group is not None:
+                group.slur_stop += 1
+            elif token == SLUR_START and group is not None:
+                group.slur_start += 1
             elif kind == "pitch" and group is not None and group.duration is not None:
                 if all(n.pitch != value[0] for n in group.notes):
                     group.notes.append(Note(value[0], value[1]))
@@ -297,12 +320,12 @@ class ScoreTokenizer:
                 group.notes[-1].tie = True
             elif token == GLISS and group is not None and group.notes:
                 group.notes[-1].glissando = True
-        measure = Measure(time_signature, key, (clefs[0], clefs[1]), Fraction(0), (ottavas[0], ottavas[1]))
+        measure = Measure(time_signature, key, (clefs[0], clefs[1]), Fraction(0), (ottavas[0], ottavas[1]), swing)
         measure.length = length if length is not None else measure.nominal_length
         measure.directions = sorted(set(directions))
         # 声部の中で前の音に重なる塊と、小節からはみ出す塊は捨てる (生成が文法から外れた場合の保険)
         busy: dict[tuple[int, int], Fraction] = {}
-        for g in sorted((g for g in groups if g.duration is not None and g.notes), key=_group_order):
+        for g in sorted((g for g in groups if g.duration is not None and g.notes), key=group_order):
             voice = (g.staff, g.voice)
             if g.onset < busy.get(voice, 0) or g.end > measure.length or g.onset >= measure.length:
                 continue
@@ -311,10 +334,6 @@ class ScoreTokenizer:
             g.notes.sort(key=lambda n: n.pitch)
             measure.groups.append(g)
         return measure, mtime
-
-
-def _group_order(g: Group) -> tuple:
-    return (g.onset, g.staff, g.voice, g.duration.grace is None)
 
 
 def _spellable(pitch: int, alter: int) -> bool:
