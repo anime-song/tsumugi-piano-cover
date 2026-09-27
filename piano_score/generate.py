@@ -45,12 +45,14 @@ def generate(
     context_measures: int = 32,
     prompts: list[list[list[int]]] | None = None,
     condition: GenerationConditionSource | None = None,
+    banned: torch.Tensor | None = None,
 ) -> list[list[list[int]]]:
     """曲の冒頭から小節ごとに生成し、サンプルごとに小節のトークン列のリストを返す。
 
     context_measures を超えたら、学習時の「途中から始まる窓」と同じ形 (BOS(途中) + 直近の小節) で続ける。
     prompts[i] (小節ごとのトークン列) を渡すと、サンプル i の先頭の小節はそのトークンで埋めて続きを生成する。
     condition (演奏など) を渡すと cross-attention で条件を入れる。各トークンは ScoreGrammar で文法に合うものに絞る。
+    banned [vocab] (学習データに出てこないトークンなど) は出さない (プロンプトの小節には効かない)。
     """
     device = model.token_embedding.weight.device
     bound = condition.bind([True] * num_samples) if condition is not None else None
@@ -71,7 +73,7 @@ def generate(
         global_cross = bound.global_cross(first, p) if bound is not None else None
         context = model.global_forward(stacked, song_start, pedal, channels, global_cross)[:, -1]
 
-        grammars = [ScoreGrammar(tokenizer, open_slurs[i]) for i in range(num_samples)]
+        grammars = [ScoreGrammar(tokenizer, open_slurs[i], banned) for i in range(num_samples)]
         for i in range(num_samples):
             grammars[i].finished = done[i]
         forced = [prompts[i][p] if prompts is not None and p < len(prompts[i]) else None for i in range(num_samples)]
@@ -97,6 +99,13 @@ def generate(
             done[i] = g.song_end
         summaries.append(model.summarize_patches(sequence))
     return patches
+
+
+def unseen_tokens(counts: np.ndarray, tokenizer: ScoreTokenizer) -> torch.Tensor:
+    """学習データに一度も出てこないトークン [vocab] (bool)。MTIME は学習時に入れるのでキャッシュの回数によらず残す"""
+    banned = torch.from_numpy(np.asarray(counts) == 0)
+    banned[[i for i, kind in enumerate(tokenizer.kinds) if kind in ("mtime", "special")]] = False
+    return banned
 
 
 def load_checkpoint(path: str | Path, device: torch.device) -> tuple[PianoARModel, ScoreTokenizer, dict]:
@@ -169,6 +178,7 @@ def main() -> None:
     if args.prompt:
         prompt = tokenizer.encode(read_musicxml(args.prompt))[: args.prompt_measures]
         prompts = [prompt] * args.num_samples
+    banned = unseen_tokens(checkpoint["token_counts"], tokenizer) if "token_counts" in checkpoint else None
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         samples = generate(
             model,
@@ -179,6 +189,7 @@ def main() -> None:
             top_p=args.top_p,
             context_measures=args.context_measures or checkpoint["args"]["window_measures"],
             prompts=prompts,
+            banned=banned,
         )
 
     out_dir = Path(args.out_dir)

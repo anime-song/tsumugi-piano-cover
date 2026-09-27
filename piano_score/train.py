@@ -25,8 +25,8 @@ from piano_ar.data import collate
 from piano_ar.model import PianoARModel
 from piano_ar.train import limit_gpu_memory, lr_at, make_optimizer, to_device
 
-from .data import ScoreAugmentConfig, ScoreCache, ScoreWindowDataset, make_sampler
-from .generate import find_musescore, generate, render_png, score_stats
+from .data import ScoreAugmentConfig, ScoreCache, ScoreWindowDataset, make_sampler, rare_meter_songs
+from .generate import find_musescore, generate, render_png, score_stats, unseen_tokens
 from .musicxml import write_musicxml
 from .tokenizer import PAD, TOKEN_GROUPS, ScoreTokenizer
 
@@ -47,6 +47,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--song-start-prob", type=float, default=0.1, help="窓を曲の冒頭から切り出す確率")
     parser.add_argument("--no-augment", action="store_true", help="移調とテンポの変化をかけない")
+    parser.add_argument(
+        "--rare-meter-weight", type=float, default=2.5, help="珍しい拍子か変拍子を含む曲の選ばれやすさの倍率"
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=2000)
@@ -113,6 +116,7 @@ def sample_evaluation(
     wandb_run,
 ) -> None:
     """冒頭から生成した楽譜と、検証曲の冒頭をプロンプトにして続きを生成した楽譜を残す。
+    学習データに一度も出てこないトークンは出さない (val_set.banned)。
 
     続きの生成のプロンプトは毎回同じ検証曲を使うので、学習が進むにつれて同じ入力への応答がどう変わるかを比べられる。
     """
@@ -135,6 +139,7 @@ def sample_evaluation(
     }
     device = next(model.parameters()).device
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        common["banned"] = val_set.banned
         free = generate(model, tokenizer, num_samples=args.sample_count, **common)
         continued = generate(model, tokenizer, num_samples=len(prompts), prompts=prompts, **common) if prompts else []
     model.train()
@@ -211,10 +216,17 @@ def main() -> None:
         song_start_prob=args.song_start_prob,
     )
     val_set = ScoreWindowDataset(cache, split="val", window_measures=args.window_measures)
+    token_counts = cache.token_counts(tokenizer.vocab_size)
+    val_set.banned = unseen_tokens(token_counts, tokenizer)
+    # 珍しい拍子か変拍子を含む検証曲だけの損失も測る (弱点が改善しているかを見る)
+    rare = rare_meter_songs(cache)
+    val_rare = ScoreWindowDataset(
+        cache, split="val", window_measures=args.window_measures, songs=val_set.songs[rare[val_set.songs]]
+    )
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
-        sampler=make_sampler(train_set, args.steps * args.grad_accum * args.batch_size),
+        sampler=make_sampler(train_set, args.steps * args.grad_accum * args.batch_size, args.rare_meter_weight),
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=device.type == "cuda",
@@ -222,8 +234,11 @@ def main() -> None:
         drop_last=True,
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
+    val_rare_loader = DataLoader(val_rare, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
     print(
-        f"学習 {len(train_set)} 曲 / 検証 {len(val_set)} 曲 / 窓 {args.window_measures} 小節 / 語彙 {tokenizer.vocab_size}"
+        f"学習 {len(train_set)} 曲 / 検証 {len(val_set)} 曲 (珍しい拍子・変拍子 {len(val_rare)} 曲)"
+        f" / 窓 {args.window_measures} 小節 / 語彙 {tokenizer.vocab_size}"
+        f" / 学習データに出てこないトークン {int(val_set.banned.sum())}"
     )
 
     model = PianoARModel(model_config, tokenizer).to(device)
@@ -270,6 +285,8 @@ def main() -> None:
                 "step": step,
                 "model_config": asdict(model_config),
                 "tokenizer_config": asdict(cache.tokenizer_config),
+                # 生成で学習データに出てこないトークンを出さないようにするため
+                "token_counts": token_counts,
                 "args": vars(args),
                 "wandb_id": wandb_run.id if wandb_run else None,
                 "best_val_loss": best_val_loss,
@@ -318,7 +335,12 @@ def main() -> None:
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
-            print(f"[val] step {step} loss {val['loss']:.4f} {format_losses(val)}")
+            if len(val_rare):
+                val["loss_rare_meter"] = evaluate(model, val_rare_loader, device)["loss"]
+            print(
+                f"[val] step {step} loss {val['loss']:.4f} {format_losses(val)}"
+                + (f" (珍しい拍子・変拍子 {val['loss_rare_meter']:.4f})" if "loss_rare_meter" in val else "")
+            )
             if wandb_run:
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=step)
             if val["loss"] < best_val_loss:
