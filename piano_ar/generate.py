@@ -2,6 +2,10 @@
 
 python -m piano_ar.generate --checkpoint checkpoints/piano_ar/latest.pt --seconds 60 --num-samples 4
 python -m piano_ar.generate --checkpoint ... --channel UCxxxxxxxx --cfg-scale 1.5
+python -m piano_ar.generate --checkpoint ... --style-midi 参考.mid --style-start 30 --style-seconds 16 --cfg-scale 1.5
+
+スタイル参照で学習したモデルは --style-midi の一部 (--style-start 秒から --style-seconds 秒) のような弾き方で生成する。
+--cfg-scale はチャンネル、またはスタイルの強さ。
 """
 
 from __future__ import annotations
@@ -28,7 +32,10 @@ def main() -> None:
     parser.add_argument("--channel", default=None, help="チャンネル ID (UC...) か channel_index の番号。省略で無条件")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0, help="> 1 でチャンネル / スタイルを強める")
+    parser.add_argument("--style-midi", default=None, help="スタイル参照にするピアノ曲の MIDI")
+    parser.add_argument("--style-start", type=float, default=0.0, help="参照に使う位置 (秒)")
+    parser.add_argument("--style-seconds", type=float, default=16.0, help="参照に使う長さ (秒)")
     parser.add_argument("--context-seconds", type=float, default=None, help="Global が見る長さ。省略で学習時の窓の長さ")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
@@ -50,6 +57,19 @@ def main() -> None:
             channel = json.loads(Path(checkpoint["channel_index"]).read_text(encoding="utf-8"))[args.channel]
 
     patch_seconds = tokenizer.config.patch_seconds
+    style = None
+    if args.style_midi:
+        if not model.config.style_tokens:
+            raise SystemExit("このチェックポイントはスタイル参照で学習していません")
+        events, end_frame = tokenizer.midi_to_events(args.style_midi)
+        fr = tokenizer.config.frame_rate
+        window = tokenizer.tokenize_window(
+            events, end_frame, round(args.style_start * fr), max(1, round(args.style_seconds / patch_seconds))
+        )
+        tokens = torch.from_numpy(window["tokens"]).to(device)[None]
+        valid = torch.from_numpy(window["patch_valid"]).to(device)[None]
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            style = model.encode_style(tokens, valid)[0]
     context_seconds = args.context_seconds or checkpoint["args"]["window_seconds"]
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         samples = model.generate(
@@ -61,6 +81,7 @@ def main() -> None:
             top_p=args.top_p,
             cfg_scale=args.cfg_scale,
             context_patches=round(context_seconds / patch_seconds),
+            style=style,
         )
 
     out_dir = Path(args.out_dir)
