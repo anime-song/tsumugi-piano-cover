@@ -13,7 +13,7 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +21,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import ModelConfig
-from .data import AugmentConfig, PianoWindowDataset, PretrainingCache, collate, make_sampler
+from .data import AugmentConfig, PianoWindowDataset, PretrainingCache, StyleConfig, collate, make_sampler
 from .evaluation import piano_roll_image, sample_stats, synthesize
 from .model import PianoARModel
 from .tokenizer import PAD, TOKEN_GROUPS, PianoTokenizer
@@ -44,9 +44,25 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--song-start-prob", type=float, default=0.1, help="窓を曲の冒頭から切り出す確率")
     parser.add_argument("--channel-dropout", type=float, default=0.15, help="チャンネル条件を落とす確率")
     parser.add_argument(
-        "--channel-alpha", type=float, default=0.5, help="1 で偏りそのまま、0 でチャンネル均等に曲を選ぶ"
+        "--channel-alpha",
+        type=float,
+        default=0.5,
+        help="曲の多い演奏者をどれだけ抑えるか (1 で抑えない、0 でしきい値の時間まで)",
+    )
+    parser.add_argument(
+        "--performer-balance-hours", type=float, default=10.0, help="これより総時間の長い演奏者だけを抑える"
     )
     parser.add_argument("--no-augment", action="store_true")
+    # スタイル参照 (--style-tokens 0 で使わず、以前と同じチャンネル条件で学習する)
+    parser.add_argument("--style-min-seconds", type=float, default=8.0, help="参照の長さの下限")
+    parser.add_argument("--style-max-seconds", type=float, default=32.0, help="参照の長さの上限")
+    parser.add_argument("--style-same-song-prob", type=float, default=0.7, help="参照を同じ曲から取る確率")
+    parser.add_argument("--style-dropout", type=float, default=0.15, help="スタイルを外す確率 (CFG 用)")
+    parser.add_argument(
+        "--source-weights",
+        default="",
+        help="データセットごとの選ばれやすさの倍率。例: maestro=0.5,pijama=1.5 (名前は prepare の sources)",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=2000)
@@ -80,6 +96,8 @@ def build_args() -> argparse.Namespace:
     for field in fields(ModelConfig):
         if field.name != "num_channels":
             parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(field.default), default=field.default)
+    # 新しく学習するときはスタイル参照を使う (ModelConfig の既定値 0 は以前のチェックポイントを読むためのもの)
+    parser.set_defaults(style_tokens=4)
     return parser.parse_args()
 
 
@@ -137,6 +155,20 @@ def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device) -> d
     return {key: value / max(count, 1) for key, value in sums.items()}
 
 
+def reference_style(
+    model: PianoARModel, tokenizer: PianoTokenizer, cache: PretrainingCache, song: int, after_frame: int, patches: int
+) -> torch.Tensor:
+    """検証曲の after_frame から patches パッチ (足りなければ冒頭から) をスタイル参照にする"""
+    end_frame = int(cache.end_frames[song])
+    start = after_frame if after_frame + patches * tokenizer.patch_frames <= end_frame else 0
+    window = tokenizer.tokenize_window(cache.song_events(song), end_frame, start, patches)
+    device = next(model.parameters()).device
+    tokens = torch.from_numpy(window["tokens"]).to(device)[None]
+    valid = torch.from_numpy(window["patch_valid"]).to(device)[None]
+    with torch.no_grad():
+        return model.encode_style(tokens, valid)[0]
+
+
 def sample_evaluation(
     model: PianoARModel,
     tokenizer: PianoTokenizer,
@@ -171,8 +203,22 @@ def sample_evaluation(
         "context_patches": round(args.window_seconds / c.patch_seconds),
     }
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-        free = model.generate(tokenizer, num_samples=args.sample_count, **common)
-        continued = model.generate(tokenizer, num_samples=len(prompts), prompts=prompts, **common) if prompts else []
+        if model.config.style_tokens:
+            # スタイル参照のモデルは、同じ検証曲の生成範囲より後ろの 16 秒をスタイルにして、冒頭からの生成と続き生成をする
+            styles = [
+                reference_style(model, tokenizer, cache, song, num_patches * tokenizer.patch_frames, 8)
+                for song in songs
+            ]
+            free = [model.generate(tokenizer, num_samples=1, style=style, **common)[0] for style in styles]
+            continued = [
+                model.generate(tokenizer, num_samples=1, prompts=[prompt], style=style, **common)[0]
+                for prompt, style in zip(prompts, styles)
+            ]
+        else:
+            free = model.generate(tokenizer, num_samples=args.sample_count, **common)
+            continued = (
+                model.generate(tokenizer, num_samples=len(prompts), prompts=prompts, **common) if prompts else []
+            )
     model.train()
 
     sample_dir = out_dir / "samples"
@@ -247,8 +293,21 @@ def main() -> None:
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
     model_config = ModelConfig(
         **{f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name != "num_channels"},
-        num_channels=cache.meta["num_channels"],
+        # スタイル参照で学習するときはチャンネルを使わない (常に 0)
+        num_channels=1 if args.style_tokens else cache.meta["num_channels"],
     )
+    style_config = None
+    if args.style_tokens:
+        patch_seconds = cache.tokenizer_config.patch_seconds
+        style_config = StyleConfig(
+            min_patches=max(1, round(args.style_min_seconds / patch_seconds)),
+            max_patches=max(1, round(args.style_max_seconds / patch_seconds)),
+            same_song_prob=args.style_same_song_prob,
+            dropout=args.style_dropout,
+        )
+    source_weights = {
+        name: float(value) for name, value in (item.split("=") for item in args.source_weights.split(",") if item)
+    }
 
     train_set = PianoWindowDataset(
         cache,
@@ -257,13 +316,22 @@ def main() -> None:
         augment=None if args.no_augment else AugmentConfig(),
         song_start_prob=args.song_start_prob,
         channel_dropout=args.channel_dropout,
+        style=style_config,
     )
-    val_set = PianoWindowDataset(cache, split="val", window_patches=window_patches)
+    val_set = PianoWindowDataset(cache, split="val", window_patches=window_patches, style=style_config)
+    # スタイルなしの検証損失との差で、スタイル参照がどれだけ効いているかを見る
+    val_nostyle = (
+        PianoWindowDataset(cache, split="val", window_patches=window_patches, style=replace(style_config, dropout=1.0))
+        if style_config
+        else None
+    )
     micro_steps = args.steps * args.grad_accum
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
-        sampler=make_sampler(train_set, micro_steps * args.batch_size, args.channel_alpha),
+        sampler=make_sampler(
+            train_set, micro_steps * args.batch_size, args.channel_alpha, source_weights, args.performer_balance_hours
+        ),
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=True,
@@ -271,6 +339,11 @@ def main() -> None:
         drop_last=True,
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
+    val_nostyle_loader = (
+        DataLoader(val_nostyle, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
+        if val_nostyle
+        else None
+    )
     print(
         f"学習 {len(train_set)} 曲 / 検証 {len(val_set)} 曲 / 窓 {window_patches} パッチ / 語彙 {tokenizer.vocab_size}"
     )
@@ -294,7 +367,7 @@ def main() -> None:
             raise SystemExit(
                 "--compile には Python の UTF-8 モードが必要です。PYTHONUTF8=1 を設定するか python -X utf8 で起動してください"
             )
-        model.compile_transformers()
+        model.compile_blocks()
 
     wandb_run = None
     if args.wandb_project:
@@ -374,9 +447,13 @@ def main() -> None:
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
+            if val_nostyle_loader is not None:
+                val["loss_nostyle"] = evaluate(model, val_nostyle_loader, device)["loss"]
+                val["style_gain"] = val["loss_nostyle"] - val["loss"]
             print(
                 f"[val] step {step} loss {val['loss']:.4f} "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+                + (f" (スタイルなし {val['loss_nostyle']:.4f})" if "loss_nostyle" in val else "")
             )
             if wandb_run:
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=step)

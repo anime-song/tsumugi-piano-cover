@@ -39,4 +39,12 @@ class ModelConfig:
     dropout: float = 0.1
     # 0 は「チャンネル指定なし」。事前学習で条件を落として学習するので無条件生成にも使える
     num_channels: int = 1
-
+    # スタイル参照: 参照曲の一部 (数十秒) を style_tokens 本のベクトルにまとめ、Global に cross-attention で入れる。
+    # 演奏者 ID より具体的な「この曲のようなアレンジで」という条件にする。0 なら使わない (以前のチェックポイントとの互換)
+    style_tokens: int = 0
+    # 参照のパッチ要約 (PatchSummarizer を共有) を style_tokens 本にまとめる双方向 Transformer の層数
+    style_layers: int = 2
+    # 参照のメロディなど中身まで写さないよう、スタイルのベクトルをこの次元に一度絞る
+    style_bottleneck: int = 64
+    # Global の何ブロックごとにスタイルへの cross-attention を挟むか
+    style_cross_every: int = 4

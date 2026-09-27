@@ -11,7 +11,15 @@ import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
 from piano_ar.config import TokenizerConfig
-from piano_ar.data import AugmentConfig, PianoWindowDataset, collate, shift_velocity, stretch_events, transpose_events
+from piano_ar.data import (
+    AugmentConfig,
+    PianoWindowDataset,
+    collate,
+    sampling_weights,
+    shift_velocity,
+    stretch_events,
+    transpose_events,
+)
 from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
@@ -234,12 +242,6 @@ def make_cover_sampler(
     cover_weights /= cover_weights.sum()
     weights = [cover_weights * (1 - pretrain_mix if dataset.pretraining is not None else 1.0)]
     if dataset.pretraining is not None:
-        pretraining = dataset.pretraining
-        lengths = pretraining.cache.end_frames[pretraining.songs].astype(np.float64)
-        channels = pretraining.cache.channels[pretraining.songs]
-        totals: dict[int, float] = {}
-        for channel, length in zip(channels.tolist(), lengths.tolist()):
-            totals[channel] = totals.get(channel, 0.0) + length
-        pretrain_weights = lengths * np.array([totals[c] for c in channels.tolist()]) ** (channel_alpha - 1)
+        pretrain_weights = sampling_weights(dataset.pretraining, channel_alpha)
         weights.append(pretrain_weights / pretrain_weights.sum() * pretrain_mix)
     return WeightedRandomSampler(torch.from_numpy(np.concatenate(weights)), num_samples=num_samples, replacement=True)

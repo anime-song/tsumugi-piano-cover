@@ -21,56 +21,10 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from piano_ar.config import ModelConfig
-from piano_ar.model import Block, CrossHook, PianoARModel, RMSNorm, Transformer, _apply_rope, _rope
+from piano_ar.model import Block, CrossBlock, CrossHook, PianoARModel, Transformer
 from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
-
-
-class CrossBlock(nn.Module):
-    """ゲート付きの cross-attention + MLP (Flamingo 型)。キーには常に見られる学習済みの「空」のキーを 1 つ足す
-    (原曲がない窓や、範囲内に何もないときの行き先)"""
-
-    def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
-        super().__init__()
-        self.heads = heads
-        self.dropout = dropout
-        head_dim = dim // heads
-        self.norm = RMSNorm(dim)
-        self.memory_norm = RMSNorm(dim)
-        self.q = nn.Linear(dim, dim, bias=False)
-        self.kv = nn.Linear(dim, dim * 2, bias=False)
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
-        self.null_k = nn.Parameter(torch.randn(heads, head_dim) * 0.02)
-        self.null_v = nn.Parameter(torch.zeros(heads, head_dim))
-        self.out = nn.Linear(dim, dim, bias=False)
-        self.mlp_norm = RMSNorm(dim)
-        hidden = int(dim * mlp_ratio * 2 / 3 + 63) // 64 * 64
-        self.gate_up = nn.Linear(dim, hidden * 2, bias=False)
-        self.down = nn.Linear(hidden, dim, bias=False)
-        self.attn_gate = nn.Parameter(torch.zeros(1))
-        self.mlp_gate = nn.Parameter(torch.zeros(1))
-        self.residual_dropout = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
-        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, D], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
-        batch, length, dim = x.shape
-        head_dim = dim // self.heads
-        q = self.q(self.norm(x)).view(batch, length, self.heads, head_dim).transpose(1, 2)
-        k, v = self.kv(self.memory_norm(memory)).view(batch, -1, 2, self.heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
-        q, k = _apply_rope(q, *_rope(q_pos, head_dim)), _apply_rope(k, *_rope(k_pos, head_dim))
-        # 空のキーは位置によらないよう回転をかけない
-        null_k = self.k_norm(self.null_k).to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
-        null_v = self.null_v.to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
-        k, v = torch.cat((null_k, k), dim=2), torch.cat((null_v, v), dim=2)
-        mask = F.pad(mask, (1, 0), value=True)[:, None]
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
-        attn = self.out(attn.transpose(1, 2).reshape(batch, length, dim))
-        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(attn)
-        gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
-        return x + torch.tanh(self.mlp_gate).to(x.dtype) * self.residual_dropout(self.down(F.silu(gate) * up))
 
 
 @dataclass
@@ -150,13 +104,8 @@ class CoverModel(nn.Module):
         self.gradient_checkpointing = enabled
 
     def compile_blocks(self) -> None:
-        """Transformer のブロックと CrossBlock を 1 つずつ torch.compile する。
-
-        piano_ar のように Transformer ごと compile すると、cross-attention のフック (毎回作り直す関数) が
-        compile の対象に入って作り直しが続くので、中身の決まったブロック単位にする。
-        学習時間の多くは行列積ではなく RMSNorm・RoPE・型変換などの細かい演算なので、融合の効果が大きい
-        (batch 16 で 1 ステップ 1.49 秒 -> 1.02 秒)。最初の 1 ステップは compile に 2 分ほどかかる。
-        """
+        """デコーダ・原曲エンコーダ・cross-attention のブロックを 1 つずつ torch.compile する (PianoARModel.compile_blocks と同じ)。
+        batch 16 で 1 ステップ 1.49 秒 -> 1.02 秒。"""
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.cache_size_limit = 64
         for module in self.modules():

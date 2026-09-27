@@ -151,6 +151,52 @@ class Transformer(nn.Module):
         return self.norm(x)
 
 
+class CrossBlock(nn.Module):
+    """ゲート付きの cross-attention + MLP (Flamingo 型)。キーには常に見られる学習済みの「空」のキーを 1 つ足す
+    (原曲がない窓や、範囲内に何もないときの行き先)"""
+
+    def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
+        super().__init__()
+        self.heads = heads
+        self.dropout = dropout
+        head_dim = dim // heads
+        self.norm = RMSNorm(dim)
+        self.memory_norm = RMSNorm(dim)
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.kv = nn.Linear(dim, dim * 2, bias=False)
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
+        self.null_k = nn.Parameter(torch.randn(heads, head_dim) * 0.02)
+        self.null_v = nn.Parameter(torch.zeros(heads, head_dim))
+        self.out = nn.Linear(dim, dim, bias=False)
+        self.mlp_norm = RMSNorm(dim)
+        hidden = int(dim * mlp_ratio * 2 / 3 + 63) // 64 * 64
+        self.gate_up = nn.Linear(dim, hidden * 2, bias=False)
+        self.down = nn.Linear(hidden, dim, bias=False)
+        self.attn_gate = nn.Parameter(torch.zeros(1))
+        self.mlp_gate = nn.Parameter(torch.zeros(1))
+        self.residual_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
+        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, D], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
+        batch, length, dim = x.shape
+        head_dim = dim // self.heads
+        q = self.q(self.norm(x)).view(batch, length, self.heads, head_dim).transpose(1, 2)
+        k, v = self.kv(self.memory_norm(memory)).view(batch, -1, 2, self.heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+        q, k = _apply_rope(q, *_rope(q_pos, head_dim)), _apply_rope(k, *_rope(k_pos, head_dim))
+        # 空のキーは位置によらないよう回転をかけない
+        null_k = self.k_norm(self.null_k).to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
+        null_v = self.null_v.to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
+        k, v = torch.cat((null_k, k), dim=2), torch.cat((null_v, v), dim=2)
+        mask = F.pad(mask, (1, 0), value=True)[:, None]
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
+        attn = self.out(attn.transpose(1, 2).reshape(batch, length, dim))
+        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(attn)
+        gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
+        return x + torch.tanh(self.mlp_gate).to(x.dtype) * self.residual_dropout(self.down(F.silu(gate) * up))
+
+
 class PianoARModel(nn.Module):
     def __init__(self, config: ModelConfig, tokenizer: PianoTokenizer) -> None:
         super().__init__()
@@ -172,6 +218,22 @@ class PianoARModel(nn.Module):
         self.pedal_embedding = nn.Embedding(2, dim)
         self.channel_embedding = nn.Embedding(config.num_channels, dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
+
+        # スタイル参照 (config.style_tokens > 0 のとき)。参照曲の数パッチを PatchSummarizer で要約し、
+        # 学習できる style_tokens 本のクエリと一緒に双方向 Transformer に通して、クエリ側の出力をスタイルにする。
+        # 途中で style_bottleneck 次元に絞るのは、メロディや和声まで写せないようにするため
+        self.style_cross_blocks: list[int] = []
+        if config.style_tokens:
+            self.style_queries = nn.Parameter(torch.randn(config.style_tokens, dim) * 0.02)
+            self.style_encoder = Transformer(config, config.style_layers, causal=False)
+            self.style_down = nn.Linear(dim, config.style_bottleneck)
+            self.style_up = nn.Linear(config.style_bottleneck, dim)
+            self.style_cross_blocks = [
+                i for i in range(config.global_layers) if (i + 1) % config.style_cross_every == 0
+            ]
+            self.style_cross = nn.ModuleList(
+                CrossBlock(dim, config.heads, config.mlp_ratio, config.dropout) for _ in self.style_cross_blocks
+            )
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
         self.local_context = nn.Linear(dim, dim)
@@ -200,6 +262,43 @@ class PianoARModel(nn.Module):
         key_valid = torch.cat((torch.ones_like(tokens[:, :1], dtype=torch.bool), tokens != PAD), dim=1)
         return self.summary_projection(self.patch_summarizer(x, key_valid)[:, 0])
 
+    def encode_style(self, ref_tokens: Tensor, ref_valid: Tensor) -> Tensor:
+        """参照曲のパッチ [B, R, L] (ref_valid [B, R]) を [B, style_tokens, D] のスタイルにする"""
+        batch, num_ref = ref_valid.shape
+        K = self.config.style_tokens
+        device = ref_tokens.device
+        summarized = self.summarize_patches(ref_tokens[ref_valid]) if ref_valid.any() else None
+        dtype = summarized.dtype if summarized is not None else self.style_queries.dtype
+        summaries = torch.zeros(batch, num_ref, self.config.dim, device=device, dtype=dtype)
+        if summarized is not None:
+            summaries[ref_valid] = summarized
+        queries = self.style_queries.to(dtype).expand(batch, -1, -1)
+        # クエリは位置 0、参照のパッチは 1, 2, ... (パッチの順番だけが分かる)
+        positions = torch.cat((torch.zeros(K, device=device), torch.arange(1, num_ref + 1, device=device)))
+        key_valid = torch.cat((torch.ones_like(ref_valid[:, :1]).expand(-1, K), ref_valid), dim=1)
+        out = self.style_encoder(torch.cat((queries, summaries), dim=1), key_valid, positions=positions)[:, :K]
+        return self.style_up(self.style_down(out))
+
+    def style_hook(self, style: Tensor, present: Tensor) -> CrossHook | None:
+        """Global のブロックの後にスタイルへの cross-attention を挟むフック。present が False の行はスタイルなし"""
+        if not self.style_cross_blocks:
+            return None
+        batch, K, _ = style.shape
+        k_pos = torch.zeros(batch, K, device=style.device)
+        mask = present[:, None, None].expand(batch, 1, K)
+        checkpointing = self.global_transformer.gradient_checkpointing and self.training
+
+        def hook(i: int, x: Tensor) -> Tensor:
+            if i not in self.style_cross_blocks:
+                return x
+            block = self.style_cross[self.style_cross_blocks.index(i)]
+            # スタイルに時間の位置はないので、クエリもキーも位置 0 (回転なし)
+            q_pos = torch.zeros(batch, x.shape[1], device=x.device)
+            args = (x, q_pos, style, k_pos, mask)
+            return checkpoint(block, *args, use_reentrant=False) if checkpointing else block(*args)
+
+        return hook
+
     def global_forward(
         self,
         summaries: Tensor,
@@ -207,11 +306,18 @@ class PianoARModel(nn.Module):
         pedal_state: Tensor,
         channel: Tensor,
         cross: CrossHook | None = None,
+        style: Tensor | None = None,
+        style_present: Tensor | None = None,
     ) -> Tensor:
         """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
-        return self.global_transformer(inputs, cross=cross)
+        style_cross = self.style_hook(style, style_present) if style is not None else None
+        hooks = [hook for hook in (style_cross, cross) if hook is not None]
+        if len(hooks) == 2:
+            first, second = hooks
+            return self.global_transformer(inputs, cross=lambda i, x: second(i, first(i, x)))
+        return self.global_transformer(inputs, cross=hooks[0] if hooks else None)
 
     def local_forward(self, prefix: Tensor, context: Tensor, cross: CrossHook | None = None) -> Tensor:
         """prefix [N, T] の続きを予測する logits [N, T+1, V] を返す"""
@@ -225,19 +331,34 @@ class PianoARModel(nn.Module):
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         for transformer in (self.patch_summarizer, self.global_transformer, self.local_transformer):
             transformer.gradient_checkpointing = enabled
+        if self.config.style_tokens:
+            self.style_encoder.gradient_checkpointing = enabled
 
-    def compile_transformers(self) -> None:
-        """計算の大半を占める 3 つの Transformer だけを torch.compile する。
+    def batch_style(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
+        """バッチの参照曲からスタイルを作る。参照がないバッチ (カバー学習など) はスタイルなしとして扱う"""
+        if not self.config.style_tokens:
+            return None, None
+        if "ref_tokens" in batch:
+            return self.encode_style(batch["ref_tokens"], batch["ref_valid"]), batch["style_present"]
+        batch_size = batch["tokens"].shape[0]
+        style = self.style_queries.new_zeros(batch_size, self.config.style_tokens, self.config.dim)
+        return style, torch.zeros(batch_size, dtype=torch.bool, device=style.device)
 
-        モデル全体を compile すると、バッチごとに変わるパッチ数やトークン長 (有効なパッチの抜き出し・長さ順の塊) の
-        たびに作り直しになる。Transformer は [N, L, D] を受け取るだけなので、N と L を可変 (dynamic) にして 1 回で済ませる。
-        nn.Module.compile はその場で置き換えるので、state_dict のキー名は変わらない。
+    def compile_blocks(self) -> None:
+        """Transformer のブロック (と cross-attention のブロック) を 1 つずつ torch.compile する。
+
+        Transformer ごと compile すると、スタイルや原曲の cross-attention のフック (毎回作り直す関数) が
+        compile の対象に入って作り直しが続く。中身の決まったブロック単位なら、パッチ数やトークン長を可変 (dynamic) にして
+        使い回せる。学習時間の多くは行列積ではなく RMSNorm・RoPE・型変換などの細かい演算なので、融合の効果が大きい。
+        nn.Module.compile はその場で置き換えるので、state_dict のキー名は変わらない。最初の 1 ステップは数分かかる。
         """
-        # 3 つの Transformer x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。
+        # ブロックの種類 x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。
         # 既定の上限 (8) を超えると以降は compile されずに通常実行になるので、余裕を持たせる
         torch._dynamo.config.recompile_limit = 64
-        for transformer in (self.patch_summarizer, self.global_transformer, self.local_transformer):
-            transformer.compile(dynamic=True)
+        torch._dynamo.config.cache_size_limit = 64
+        for module in self.modules():
+            if isinstance(module, (Block, CrossBlock)):
+                module.compile(dynamic=True)
 
     def forward(
         self, batch: dict[str, Tensor], num_length_buckets: int = 8, condition: Condition | None = None
@@ -263,12 +384,15 @@ class PianoARModel(nn.Module):
         summarized = summarized[order.argsort()]
         summaries = summarized.new_zeros(*valid.shape, self.config.dim)
         summaries[valid] = summarized
+        style, style_present = self.batch_style(batch)
         context = self.global_forward(
             summaries,
             batch["song_start"],
             batch["pedal_state"],
             batch["channel"],
             cross=condition.global_cross() if condition is not None else None,
+            style=style,
+            style_present=style_present,
         )[valid]
 
         loss_sum = torch.zeros(len(TOKEN_GROUPS), device=tokens.device)
@@ -308,6 +432,7 @@ class PianoARModel(nn.Module):
         prompts: list[list[list[int]]] | None = None,
         condition: GenerationConditionSource | None = None,
         condition_cfg_scale: float = 1.0,
+        style: Tensor | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -316,29 +441,41 @@ class PianoARModel(nn.Module):
         prompts[i] (パッチごとのトークン列) を渡すと、サンプル i の先頭のパッチはそのトークンで埋めて続きを生成する。
         condition (原曲など) を渡すと cross-attention で条件を入れる。
 
-        条件とチャンネルの強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。L(条件, チャンネル) を
-        それぞれを外したときの予測として
-            L(なし, なし) + condition_cfg_scale * (L(条件, なし) - L(なし, なし)) + cfg_scale * (L(条件, ch) - L(条件, なし))
-        にする。両方 1 なら L(条件, ch) そのもの。必要な組み合わせだけを num_samples 行ずつ並べて一緒に計算する。
+        style ([style_tokens, D]、encode_style の出力の 1 曲分) を渡すと、そのスタイルで生成する。
+
+        条件と「演奏の仕方」(スタイル、またはチャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
+        それぞれを外したときの予測を使って
+            L(なし, なし) + condition_cfg_scale * (L(条件, なし) - L(なし, なし)) + cfg_scale * (L(条件, 仕方) - L(条件, なし))
+        にする。両方 1 なら L(条件, 仕方) そのもの。必要な組み合わせだけを num_samples 行ずつ並べて一緒に計算する。
         """
         device = self.token_embedding.weight.device
-        channel_guidance = cfg_scale != 1.0 and channel != 0
+        has_manner = channel != 0 or style is not None
+        manner_guidance = cfg_scale != 1.0 and has_manner
         condition_guidance = condition is not None and condition_cfg_scale != 1.0
-        # (条件を入れるか, チャンネル) の組。先頭が本来の予測
-        blocks = [(True, channel)]
-        if channel != 0 and (channel_guidance or condition_guidance):
-            blocks.append((True, 0))
+        # (条件を入れるか, 演奏の仕方を入れるか) の組。先頭が本来の予測
+        blocks = [(True, True)]
+        if has_manner and (manner_guidance or condition_guidance):
+            blocks.append((True, False))
         if condition_guidance:
-            blocks.append((False, 0))
+            blocks.append((False, False))
         rows = num_samples * len(blocks)
-        channels = torch.tensor([c for _, c in blocks for _ in range(num_samples)], dtype=torch.long, device=device)
+        manner = torch.tensor([m for _, m in blocks for _ in range(num_samples)], device=device)
+        channels = torch.where(manner, channel, 0).long()
         conditioned = [flag for flag, _ in blocks for _ in range(num_samples)]
         bound = condition.bind(conditioned) if condition is not None else None
+        style_rows = style_present = None
+        if self.config.style_tokens:
+            if style is None:
+                style_rows = self.style_queries.new_zeros(rows, self.config.style_tokens, self.config.dim)
+                style_present = torch.zeros(rows, dtype=torch.bool, device=device)
+            else:
+                style_rows = style.reshape(1, self.config.style_tokens, -1).expand(rows, -1, -1)
+                style_present = manner
 
         def guide(logits: Tensor) -> Tensor:
             parts = logits.split(num_samples)
             full = parts[0]
-            no_channel = parts[1] if channel != 0 and len(parts) > 1 else full
+            no_channel = parts[1] if has_manner and len(parts) > 1 else full
             guided = no_channel + cfg_scale * (full - no_channel)
             if condition_guidance:
                 nothing = parts[-1]
@@ -365,7 +502,9 @@ class PianoARModel(nn.Module):
             pedal = pedal.repeat(rows // num_samples, 1)
             song_start_tensor = torch.full((rows,), song_start, dtype=torch.long, device=device)
             global_cross = bound.global_cross(first, p) if bound is not None else None
-            context = self.global_forward(stacked, song_start_tensor, pedal, channels, global_cross)[:, -1]
+            context = self.global_forward(
+                stacked, song_start_tensor, pedal, channels, global_cross, style_rows, style_present
+            )[:, -1]
 
             grammars = [PatchGrammar(tokenizer, pedal_states[i]) for i in range(num_samples)]
             for i in range(num_samples):
