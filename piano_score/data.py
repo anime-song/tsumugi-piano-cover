@@ -64,6 +64,23 @@ class ScoreCache:
         flat = np.asarray(self._tokens[offsets[0] : offsets[-1]], dtype=np.int64)
         return np.split(flat, offsets[1:-1] - offsets[0])
 
+    def measure_time_signatures(self) -> np.ndarray:
+        """全小節の拍子のトークン [M] (キャッシュの各小節の先頭が拍子)"""
+        tokens = np.load(self.cache_dir / "tokens.npy", mmap_mode="r")
+        return np.asarray(tokens[self.token_offsets[:-1]], dtype=np.int64)
+
+    def token_counts(self, vocab_size: int) -> np.ndarray:
+        """学習データでの各トークンの出現回数。初回に数えて token_counts.npy に保存する (MTIME はキャッシュにないので 0)"""
+        path = self.cache_dir / "token_counts.npy"
+        if path.exists():
+            return np.load(path)
+        tokens = np.load(self.cache_dir / "tokens.npy", mmap_mode="r")
+        counts = np.zeros(vocab_size, dtype=np.int64)
+        for start in range(0, len(tokens), 50_000_000):
+            counts += np.bincount(np.asarray(tokens[start : start + 50_000_000], dtype=np.int64), minlength=vocab_size)
+        np.save(path, counts)
+        return counts
+
     def song_seconds(self, song: int) -> np.ndarray:
         """テンポ記号どおりの各小節の開始時刻 (最初の音 = 0 秒)"""
         return self.seconds[self.measure_offsets[song] : self.measure_offsets[song + 1]].astype(np.float64)
@@ -98,6 +115,7 @@ class ScoreWindowDataset(Dataset):
         window_measures: int,
         augment: ScoreAugmentConfig | None = None,
         song_start_prob: float = 0.1,
+        songs: np.ndarray | None = None,
     ) -> None:
         self.cache = cache
         self.tokenizer = ScoreTokenizer(cache.tokenizer_config)
@@ -105,7 +123,8 @@ class ScoreWindowDataset(Dataset):
         self.train = split == "train"
         self.augment = augment if self.train else None
         self.song_start_prob = song_start_prob
-        self.songs = np.flatnonzero(~cache.is_val if self.train else cache.is_val)
+        # songs を渡すとその曲だけを使う (検証曲の一部だけで損失を測るときなど)
+        self.songs = np.flatnonzero(~cache.is_val if self.train else cache.is_val) if songs is None else songs
         self.key_first = self.tokenizer.ids[("key", -7)]
         self.mtime_first = self.tokenizer.ids[("mtime", 0)]
         self._tables: dict[tuple[int, frozenset[int]], np.ndarray | None] = {}
@@ -167,8 +186,35 @@ class ScoreWindowDataset(Dataset):
         return moved
 
 
-def make_sampler(dataset: ScoreWindowDataset, num_samples: int) -> WeightedRandomSampler:
-    """曲の選ばれやすさを小節数に比例させる (長い曲ほど多くの窓を取る)"""
+def rare_meter_songs(cache: ScoreCache, common_share: float = 0.01, min_changes: int = 2) -> np.ndarray:
+    """珍しい拍子か変拍子を含む曲 [S] (bool)。
+
+    珍しい拍子は、全小節に占める割合が common_share 未満の拍子 (4/4・3/4・2/4・6/8・2/2 以外の 5/4 や 7/8 など)。
+    変拍子は、曲の中で拍子が min_changes 回以上変わるもの。
+    """
+    signatures = cache.measure_time_signatures()
+    share = np.bincount(signatures) / len(signatures)
+    rare_measure = share[signatures] < common_share
+    offsets = cache.measure_offsets
+    song = np.repeat(np.arange(len(offsets) - 1), np.diff(offsets))
+    changed = (signatures[1:] != signatures[:-1]) & (song[1:] == song[:-1])
+    changes = np.bincount(song[1:][changed], minlength=len(offsets) - 1)
+    rare = np.bincount(song[rare_measure], minlength=len(offsets) - 1) > 0
+    return rare | (changes >= min_changes)
+
+
+def make_sampler(
+    dataset: ScoreWindowDataset, num_samples: int, rare_meter_weight: float = 1.0
+) -> WeightedRandomSampler:
+    """曲の選ばれやすさを小節数に比例させる (長い曲ほど多くの窓を取る)。
+
+    rare_meter_weight > 1 なら、珍しい拍子か変拍子を含む曲 (rare_meter_songs) をその倍率だけ選ばれやすくする。
+    """
     offsets = dataset.cache.measure_offsets
     weights = (offsets[dataset.songs + 1] - offsets[dataset.songs]).astype(np.float64)
+    if rare_meter_weight != 1.0:
+        rare = rare_meter_songs(dataset.cache)[dataset.songs]
+        before = weights[rare].sum() / weights.sum()
+        weights[rare] *= rare_meter_weight
+        print(f"珍しい拍子・変拍子の曲 {rare.mean():.1%}: 選ばれる割合 {before:.1%} -> {weights[rare].sum() / weights.sum():.1%}")
     return WeightedRandomSampler(torch.from_numpy(weights), num_samples=num_samples, replacement=True)

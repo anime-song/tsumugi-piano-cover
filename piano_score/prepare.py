@@ -90,7 +90,10 @@ def main() -> None:
 
     token_offsets = np.concatenate([[0], np.cumsum(token_lengths)]).astype(np.int64)
     measure_offsets = np.concatenate([[0], np.cumsum(measure_counts)]).astype(np.int64)
-    np.save(out_dir / "tokens.npy", np.concatenate(tokens_list))
+    all_tokens = np.concatenate(tokens_list)
+    np.save(out_dir / "tokens.npy", all_tokens)
+    # 生成で学習データに出てこないトークンを出さないようにするため、出現回数も残す
+    np.save(out_dir / "token_counts.npy", np.bincount(all_tokens.astype(np.int64), minlength=tokenizer.vocab_size))
     np.savez(out_dir / "measures.npz", token_offsets=token_offsets, seconds=np.concatenate(seconds_list))
     is_val = np.array([zlib.crc32(i.encode()) % 10000 < args.val_percent * 100 for i in ids])
     np.savez(out_dir / "songs.npz", measure_offsets=measure_offsets, ids=np.asarray(ids), is_val=is_val)

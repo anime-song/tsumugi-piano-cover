@@ -70,8 +70,11 @@ _VOCABS: dict[int, _Vocab] = {}
 class ScoreGrammar:
     """1 小節分の生成の状態。open_slurs は前の小節までに開いて閉じていないスラーの数"""
 
-    def __init__(self, tokenizer: ScoreTokenizer, open_slurs: int = 0) -> None:
+    def __init__(self, tokenizer: ScoreTokenizer, open_slurs: int = 0, banned: torch.Tensor | None = None) -> None:
+        """banned [vocab] は出さないトークン (学習データに一度も出てこないものなど)。
+        それを除くと出せるトークンがなくなる場面では除かない"""
         self.tok = tokenizer
+        self.banned = banned
         if id(tokenizer) not in _VOCABS:
             _VOCABS[id(tokenizer)] = _Vocab(tokenizer)
         self.v = _VOCABS[id(tokenizer)]
@@ -108,6 +111,14 @@ class ScoreGrammar:
     # 次に出せるトークン
     # ------------------------------------------------------------------
     def allowed(self) -> torch.Tensor:
+        mask = self._allowed()
+        if self.banned is not None:
+            kept = mask & ~self.banned
+            if kept.any():
+                return kept
+        return mask
+
+    def _allowed(self) -> torch.Tensor:
         mask = torch.zeros(self.tok.vocab_size, dtype=torch.bool)
         if self.finished:
             mask[PAD] = True
