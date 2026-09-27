@@ -84,6 +84,8 @@ TREMOLO_PAIR = (2, 1)
 TREMOLO_PAIR_TYPES = ("whole", "half", "quarter", "eighth", "16th")
 # オクターブ記号 (段ごとの状態)。8va / 15ma は実音が記譜より高い
 OTTAVAS = ("none", "8va", "15ma", "8vb", "15mb")
+# スイングの指定 (曲全体の状態)。楽譜はまっすぐな 8 分 (16 分) で書き、この指定で長短を付けて弾く
+SWINGS = ("none", "8th", "16th")
 
 STEPS = "CDEFGAB"
 STEP_PITCH_CLASS = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -138,6 +140,9 @@ class Group:
     notes: list[Note]
     articulations: tuple[str, ...] = ()
     cross: bool = False  # もう一方の段に書かれている (段をまたぐ声部)
+    # この塊で終わるスラーと始まるスラーの数。対の相手は持たず pair_slurs の規則で決める
+    slur_stop: int = 0
+    slur_start: int = 0
 
     @property
     def end(self) -> Fraction:
@@ -155,6 +160,7 @@ class Measure:
     clefs: tuple[str, str]  # 小節の頭の音部記号 (上段, 下段)
     length: Fraction
     ottavas: tuple[str, str] = ("none", "none")  # 小節の頭のオクターブ記号の状態 (上段, 下段)
+    swing: str = "none"  # 小節の頭のスイングの状態
     groups: list[Group] = field(default_factory=list)
     # 小節内の指示 (位置, 名前)。名前は dyn_p / wedge_crescendo / pedal_start / clef1_G2 など
     directions: list[tuple[Fraction, str]] = field(default_factory=list)
@@ -165,6 +171,45 @@ class Measure:
     def nominal_length(self) -> Fraction:
         beats, beat_type = self.time_signature
         return Fraction(4 * beats, beat_type)
+
+
+def group_order(group: Group) -> tuple:
+    """小節の中の塊の並び (位置 -> 段 -> 声部、同じ声部では装飾音が先)。同じ値の塊は元の順のまま (安定ソート)"""
+    return (group.onset, group.staff, group.voice, group.duration.grace is None)
+
+
+def pair_slurs(measures: list[Measure]) -> list[tuple[int, Group, str, int]]:
+    """スラーの始まりと終わりを対にする。
+
+    小節と塊を並びの順に見て、終わりは「同じ声部でいちばん最近開いたスラー」を閉じる。同じ声部に開いたものがなければ
+    同じ段、それもなければ全体でいちばん最近開いたものを閉じる (声部や段をまたぐスラー)。同じ塊では終わりを先に見る。
+    返り値は出てくる順の (小節番号, 塊, "start" / "stop", スラーの番号) で、相手のない始まりと終わりは含めない。
+    読み込み (相手のないものを消す) と書き出し (MusicXML の番号を振る) で同じ規則を使う。
+    """
+    events: list[tuple[int, Group, str, int]] = []
+    open_slurs: list[tuple[int, Group]] = []  # (スラーの番号, 始まりの塊) を開いた順に
+    next_id = 0
+    for mi, measure in enumerate(measures):
+        for g in sorted(measure.groups, key=group_order):
+            for _ in range(g.slur_stop):
+                index = None
+                for same in (
+                    lambda s: (s.staff, s.voice) == (g.staff, g.voice),
+                    lambda s: s.staff == g.staff,
+                    lambda s: True,
+                ):
+                    index = next((i for i in range(len(open_slurs) - 1, -1, -1) if same(open_slurs[i][1])), None)
+                    if index is not None:
+                        break
+                if index is not None:
+                    slur_id, _ = open_slurs.pop(index)
+                    events.append((mi, g, "stop", slur_id))
+            for _ in range(g.slur_start):
+                open_slurs.append((next_id, g))
+                events.append((mi, g, "start", next_id))
+                next_id += 1
+    closed = {slur_id for _, _, kind, slur_id in events if kind == "stop"}
+    return [event for event in events if event[3] in closed]
 
 
 def spell(pitch: int, alter: int) -> tuple[str, int]:

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -19,19 +20,21 @@ from pathlib import Path
 from .score import (
     ARTICULATIONS,
     CLEFS,
-    ORNAMENTS,
-    TREMOLO_PAIR,
-    TREMOLOS,
     DEFAULT_CLEFS,
     DYNAMICS,
     NOTE_TYPES,
+    ORNAMENTS,
     STEP_PITCH_CLASS,
+    TREMOLO_PAIR,
+    TREMOLOS,
     TUPLETS,
     Duration,
     Group,
     Measure,
     Note,
+    group_order,
     key_alters,
+    pair_slurs,
     spell,
 )
 
@@ -53,6 +56,7 @@ class _RawGroup:
     display_staves: list[int]
     articulations: set[str]
     order: int
+    slurs: set[tuple[str, str]] = field(default_factory=set)  # (start / stop, number)
 
 
 @dataclass
@@ -87,6 +91,39 @@ def _ottava_name(shift: ET.Element) -> str:
     if kind == "down":
         return number + ("va" if number == "8" else "ma")
     return number + ("vb" if number == "8" else "mb")
+
+
+SWING_OFF = re.compile(r"swing\s*off|no\s*swing|remove\s*swing|without\s*swing|straight")
+SWING_ON = re.compile(r"swing|shuffle")
+
+
+def _swing_from_words(text: str) -> str | None:
+    """演奏指示の文字からスイングの状態を読む。"Swing" / "Swing 16ths" / "Swing off" / "Straight" など。関係なければ None"""
+    text = text.lower()
+    if SWING_OFF.search(text):
+        return "none"
+    if SWING_ON.search(text):
+        return "16th" if "16" in text else "8th"
+    return None
+
+
+def _swing_from_sound(swing: ET.Element) -> str:
+    """<sound><swing> (再生用の指定) からスイングの状態を読む"""
+    if swing.find("straight") is not None:
+        return "none"
+    return "16th" if swing.findtext("swing-type") == "16th" else "8th"
+
+
+def _swing_from_metronome(metronome: ET.Element) -> str | None:
+    """<metronome> の音符の等式 (♫ = 3 連符の ♩♪ など) からスイングの状態を読む。等式でなければ None"""
+    if metronome.find("metronome-relation") is None:
+        return None
+    notes = metronome.findall("metronome-note")
+    if not notes:
+        return None
+    if not any(n.find("metronome-tuplet") is not None for n in notes):
+        return "none"  # ♫ = ♫ (まっすぐに戻す)
+    return "16th" if notes[0].findtext("metronome-type") == "16th" else "8th"
 
 
 def _ending_numbers(text: str) -> frozenset[int]:
@@ -183,6 +220,13 @@ def _parse_part(
                         elif child.tag == "octave-shift":
                             staff = staff_offset + int(el.findtext("staff") or 1)
                             raw.events.append((position, "ottava", (staff, _ottava_name(child))))
+                        elif child.tag in ("words", "metronome"):
+                            if child.tag == "words":
+                                swing = _swing_from_words(child.text or "")
+                            else:
+                                swing = _swing_from_metronome(child)
+                            if swing is not None:
+                                raw.events.append((position, "swing", swing))
                         elif child.tag == "pedal":
                             kind = child.get("type")
                             if kind in ("stop", "change"):
@@ -192,6 +236,8 @@ def _parse_part(
                 sound = el.find("sound")
                 if sound is not None and sound.get("tempo"):
                     raw.events.append((position, "tempo", float(sound.get("tempo"))))
+                if sound is not None and sound.find("swing") is not None:
+                    raw.events.append((position, "swing", _swing_from_sound(sound.find("swing"))))
             elif tag == "sound" and el.get("tempo"):
                 raw.events.append((cursor, "tempo", float(el.get("tempo"))))
             elif tag == "barline" and part_index == 0:
@@ -259,6 +305,13 @@ def _parse_part(
                         elif child.tag == "tremolo" and child.get("type", "single") in ("single", "start"):
                             # 2 音間のトレモロは始まりの音にだけ付ける (終わりは次の 2:1 の音)
                             articulations.add(f"tremolo{min(max(int(child.text or 3), 1), 4)}")
+                slurs = set()
+                if notations is not None:
+                    slurs = {
+                        (s.get("type"), s.get("number", "1"))
+                        for s in notations.findall("slur")
+                        if s.get("type") in ("start", "stop")
+                    }
                 tie = any(t.get("type") == "start" for t in el.findall("tie"))
                 glissando = notations is not None and any(
                     child.get("type") == "start" for child in notations if child.tag in ("glissando", "slide")
@@ -271,10 +324,11 @@ def _parse_part(
                     last_group.notes.append(note)
                     last_group.display_staves.append(display_staff)
                     last_group.articulations |= articulations
+                    last_group.slurs |= slurs  # 和音の各音に同じスラーが書かれていても番号で 1 本にまとまる
                 else:
                     last_group = _RawGroup(
                         mi, onset, (part_index, el.findtext("voice") or "1"), duration, [note], [display_staff],
-                        articulations, order,
+                        articulations, order, slurs,
                     )  # fmt: skip
                     groups.append(last_group)
                     order += 1
@@ -355,7 +409,9 @@ def score_title(root: ET.Element) -> str:
         if text:
             return text
     credits = [
-        (float(w.get("font-size") or 0), (w.text or "").strip()) for w in root.iter("credit-words") if (w.text or "").strip()
+        (float(w.get("font-size") or 0), (w.text or "").strip())
+        for w in root.iter("credit-words")
+        if (w.text or "").strip()
     ]
     return max(credits)[1] if credits else ""
 
@@ -413,6 +469,7 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
     time_signature, key = None, 0
     clefs = list(DEFAULT_CLEFS)
     ottavas = ["none", "none"]
+    swing = "none"
     carried: list[tuple[Fraction, str, object]] = []  # 小節の終わりに書かれた指示は次の小節の頭へ
     for raw in raw_measures:
         if raw.time_signature is not None:
@@ -428,7 +485,9 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
         carried = []
         header_clefs = list(clefs)
         header_ottavas = list(ottavas)
-        changes: dict[tuple[Fraction, int], str] = {}  # 小節の途中のオクターブ記号の変化 (同じ位置は最後の状態)
+        header_swing = swing
+        # 小節の途中のオクターブ記号 (段ごと) とスイング (段 0 として扱う) の変化。同じ位置は最後の状態
+        changes: dict[tuple[Fraction, int], str] = {}
         for position, kind, value in sorted(events, key=lambda e: e[0]):
             if position >= measure.length:
                 carried.append((position, kind, value))
@@ -446,17 +505,24 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
                 else:
                     changes[(position, staff)] = name
                 ottavas[staff - 1] = name
+            elif kind == "swing":
+                if position == 0:
+                    header_swing = value
+                else:
+                    changes[(position, 0)] = value
+                swing = value
             elif kind == "direction":
                 measure.directions.append((position, value))
             elif kind == "tempo":
                 measure.tempos.append((position, value))
         measure.clefs = tuple(header_clefs)
         measure.ottavas = tuple(header_ottavas)
-        state = list(header_ottavas)
+        measure.swing = header_swing
+        state = [header_swing, *header_ottavas]
         for (position, staff), name in sorted(changes.items()):
-            if name != state[staff - 1]:
-                measure.directions.append((position, f"ottava{staff}_{name}"))
-                state[staff - 1] = name
+            if name != state[staff]:
+                measure.directions.append((position, f"ottava{staff}_{name}" if staff else f"swing_{name}"))
+                state[staff] = name
         measure.directions = sorted(set(measure.directions))
         measures.append(measure)
 
@@ -465,23 +531,37 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
         group = Group(
             g.onset, staff, voice_index[g.raw_voice], g.duration, sorted(g.notes, key=lambda n: n.pitch),
             tuple(a for a in ARTICULATIONS if a in g.articulations), g.display_staves[0] != staff,
+            sum(kind == "stop" for kind, _ in g.slurs), sum(kind == "start" for kind, _ in g.slurs),
         )  # fmt: skip
         measures[g.measure].groups.append(group)
 
     for measure in measures:
         _check_voices(measure)
     if unfold:
-        measures = [measures[i] for i in _unfold(raw_measures)]
+        # 2 回目以降に出てくる小節は別のものにする (スラーの後始末で塊ごとに数を変えるため)
+        seen: set[int] = set()
+        unfolded = []
+        for i in _unfold(raw_measures):
+            unfolded.append(copy.deepcopy(measures[i]) if i in seen else measures[i])
+            seen.add(i)
+        measures = unfolded
+    _drop_unpaired_slurs(measures)
     return measures
 
 
-def _group_sort_key(group: Group) -> tuple:
-    return (group.onset, group.staff, group.voice, group.duration.grace is None)
+def _drop_unpaired_slurs(measures: list[Measure]) -> None:
+    """相手のないスラーの始まりと終わりを消す (反復の展開で 1 番カッコに入るスラーが切れた場合など)"""
+    counts: Counter = Counter()
+    for _, g, kind, _ in pair_slurs(measures):
+        counts[(id(g), kind)] += 1
+    for measure in measures:
+        for g in measure.groups:
+            g.slur_start, g.slur_stop = counts[(id(g), "start")], counts[(id(g), "stop")]
 
 
 def _check_voices(measure: Measure) -> None:
     """声部ごとに音が重ならず、小節からはみ出さないことを確かめ、塊を位置・段・声部の順に並べる"""
-    measure.groups.sort(key=_group_sort_key)
+    measure.groups.sort(key=group_order)
     busy: dict[tuple[int, int], Fraction] = {}
     for g in measure.groups:
         voice = (g.staff, g.voice)
@@ -678,7 +758,7 @@ def _set_tremolos(items: list[_Item]) -> None:
 def _voice_items(measure: Measure) -> dict[tuple[int, int], list[_Item]]:
     """段・声部ごとに、塊の間を休符で埋めた列を作る。音のない段は声部 1 に小節全体の休符を置く"""
     by_voice: dict[tuple[int, int], list[Group]] = defaultdict(list)
-    for g in sorted(measure.groups, key=_group_sort_key):
+    for g in sorted(measure.groups, key=group_order):
         by_voice[(g.staff, g.voice)].append(g)
     result: dict[tuple[int, int], list[_Item]] = {}
     for staff in (1, 2):
@@ -753,6 +833,20 @@ def _glissando_stops(measures: list[Measure]) -> dict[tuple[int, int, int], str]
     return stops
 
 
+def _slur_marks(measures: list[Measure]) -> dict[int, list[tuple[str, int]]]:
+    """塊ごとに書くスラー id(塊) -> [(start / stop, MusicXML の番号)]。同時に開いているスラーには別の番号を振る"""
+    marks: dict[int, list[tuple[str, int]]] = defaultdict(list)
+    numbers: dict[int, int] = {}
+    for _, g, kind, slur_id in pair_slurs(measures):
+        if kind == "start":
+            used = set(numbers.values())
+            numbers[slur_id] = next(n for n in range(1, 17) if n not in used)
+            marks[id(g)].append(("start", numbers[slur_id]))
+        else:
+            marks[id(g)].append(("stop", numbers.pop(slur_id)))
+    return marks
+
+
 def _divisions(measures: list[Measure], items: list[dict[tuple[int, int], list[_Item]]]) -> int:
     denominators = {1}
     for measure, voices in zip(measures, items):
@@ -791,7 +885,7 @@ def _accidentals(measure: Measure, tie_stops: set, measure_index: int) -> dict[t
         state: dict[tuple[str, int], int] = {}
         alters = key_alters(measure.key)
         groups = [g for g in measure.groups if g.display_staff == staff]
-        for g in sorted(groups, key=_group_sort_key):
+        for g in sorted(groups, key=group_order):
             for note in g.notes:
                 step, octave = spell(note.pitch, note.alter)
                 current = state.get((step, octave), alters.get(step, 0))
@@ -806,6 +900,7 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
     divisions = _divisions(measures, items)
     tie_stops = _tie_stops(measures)
     glissando_stops = _glissando_stops(measures)
+    slur_marks = _slur_marks(measures)
 
     def ticks(value: Fraction) -> int:
         return int(value * divisions)
@@ -821,6 +916,7 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
     previous: Measure | None = None
     clefs = [None, None]
     ottavas = ["none", "none"]
+    swing = "none"
     for mi, (measure, voices) in enumerate(zip(measures, items)):
         element = _sub(part, "measure", number=str(mi + 1))
         if mi == 0 and measure.length != measure.nominal_length:
@@ -860,14 +956,16 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
             cursor = 0
             for item in voice_items:
                 _write_item(
-                    element, item, staff, voice, ticks, accidentals, tie_stops, glissando_stops, mi, voices_per_staff
-                )
+                    element, item, staff, voice, ticks, accidentals, tie_stops, glissando_stops, slur_marks, mi,
+                    voices_per_staff,
+                )  # fmt: skip
                 cursor += ticks(item.quarters)
 
         # 指示 (強弱・松葉・ペダル・音部記号とオクターブ記号の変更・テンポ) は backup / forward で位置を合わせて書く。
         # オクターブ記号は状態で持っているので、次の小節の頭で状態が変わるときはこの小節の終わりで止める
         extra = [(p, name) for p, name in measure.directions] + [(p, t) for p, t in measure.tempos if p > 0]
         extra += [(Fraction(0), f"ottava{s + 1}_{name}") for s, name in enumerate(measure.ottavas)]
+        extra.append((Fraction(0), f"swing_{measure.swing}"))
         if mi + 1 < len(measures):
             end_state = list(measure.ottavas)
             for _, name in sorted(measure.directions):
@@ -875,7 +973,8 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
                     end_state[int(name[6]) - 1] = name.split("_", 1)[1]
             following = measures[mi + 1].ottavas
             extra += [(measure.length, f"ottava{s}_none") for s in (1, 2) if end_state[s - 1] != following[s - 1]]
-        for position, value in sorted(extra, key=lambda e: e[0]):
+        # 同じ位置ではペダルや松葉の終わりを始まりより先に書く (後に書くと始めた直後に止めたことになる)
+        for position, value in sorted(extra, key=lambda e: (e[0], not str(e[1]).endswith("_stop"))):
             target = ticks(position)
             if target < cursor:
                 _sub(_sub(element, "backup"), "duration", cursor - target)
@@ -893,6 +992,11 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
                 if name != ottavas[staff - 1]:
                     _write_ottava(element, staff, ottavas[staff - 1], name)
                     ottavas[staff - 1] = name
+            elif value.startswith("swing"):
+                name = value.split("_", 1)[1]
+                if name != swing:
+                    _write_swing(element, name)
+                    swing = name
             else:
                 _write_direction(element, value)
         if cursor < ticks(measure.length):
@@ -902,6 +1006,20 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
     ET.indent(root)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _write_swing(parent: ET.Element, name: str) -> None:
+    """スイングの指定を、表示用の文字 (Swing / Swing 16ths / Straight) と再生用の <sound><swing> で書く"""
+    direction = _sub(parent, "direction", placement="above")
+    text = {"none": "Straight", "8th": "Swing", "16th": "Swing 16ths"}[name]
+    _sub(_sub(direction, "direction-type"), "words", text, **{"font-weight": "bold"})
+    swing = _sub(_sub(direction, "sound"), "swing")
+    if name == "none":
+        _sub(swing, "straight")
+    else:
+        _sub(swing, "first", 2)
+        _sub(swing, "second", 1)
+        _sub(swing, "swing-type", "eighth" if name == "8th" else "16th")
 
 
 def _write_ottava(parent: ET.Element, staff: int, before: str, after: str) -> None:
@@ -942,6 +1060,7 @@ def _write_item(
     accidentals: dict,
     tie_stops: set,
     glissando_stops: dict,
+    slur_marks: dict,
     measure_index: int,
     voices_per_staff: Counter,
 ) -> None:
@@ -1009,6 +1128,8 @@ def _write_item(
         if n.glissando:
             _sub(notations, "glissando", "gliss.", type="start", number=str(i + 1), **{"line-type": "wavy"})
         if i == 0:
+            for kind, number in slur_marks.get(id(g), []):
+                _sub(notations, "slur", type=kind, number=str(number))
             _write_tuplet(notations, item, standalone=False)
             marks = [a for a in g.articulations if a not in ("fermata", "arpeggiate", *ORNAMENTS, *TREMOLOS)]
             ornaments = [a for a in g.articulations if a in ORNAMENTS]
