@@ -29,6 +29,7 @@ from .score import (
     NOTE_TYPES,
     ORNAMENTS,
     STEP_PITCH_CLASS,
+    TEMPO_MARKS,
     TEMPO_WORDS,
     TREMOLO_PAIR,
     TREMOLOS,
@@ -77,6 +78,7 @@ class _RawMeasure:
     backward_repeat: int = 0  # 繰り返す回数 (0 なら反復記号なし)
     ending_start: frozenset[int] | None = None
     ending_stop: bool = False
+    double_bar: bool = False  # 小節の終わりが区切りの複縦線 (反復記号のない二重線)
 
 
 def _clef_name(clef: ET.Element) -> str:
@@ -142,16 +144,28 @@ WORD_PATTERNS = (
     ("tempo_rubato", re.compile(r"\brubato")),
     ("tempo_allarg", re.compile(r"\ballarg")),
     ("tempo_string", re.compile(r"\bstring(\.|endo)")),
+    ("tempo_meno_mosso", re.compile(r"\bmeno mosso")),
+    ("tempo_piu_mosso", re.compile(r"\bpi[uù] mosso")),
     ("text_cresc", re.compile(r"\bcresc")),
     ("text_dim", re.compile(r"\bdim\b|\bdimin|\bdecresc|\bdecr\b")),
 )
+# 速度標語。長い語を先に並べ (Prestissimo を Presto と読まないように)、文字の中で最初に出てくるものを 1 つ取る
+TEMPO_MARK_PATTERN = re.compile(
+    r"\b(prestissimo|presto|larghetto|largo|allegretto|allegro|andantino|andante|adagio|lento|grave|moderato"
+    r"|vivace|vivo|maestoso|slowly|slow|moderately|moderate|fast)\b"
+)
+TEMPO_MARK_ALIASES = {"vivo": "vivace", "slowly": "slow", "moderate": "moderately"}
 NUMBER = re.compile(r"\d+(\.\d+)?")
 
 
 def _words_directions(text: str) -> list[str]:
-    """演奏指示の文字 (rit. / a tempo / cresc. など) から、速度と強弱の変化の指示を読む"""
+    """演奏指示の文字 (Allegro / rit. / a tempo / cresc. など) から、速度標語と速度・強弱の変化の指示を読む"""
     text = text.lower()
-    return [name for name, pattern in WORD_PATTERNS if pattern.search(text)]
+    names = [name for name, pattern in WORD_PATTERNS if pattern.search(text)]
+    mark = TEMPO_MARK_PATTERN.search(text)
+    if mark is not None:
+        names.append(f"mark_{TEMPO_MARK_ALIASES.get(mark.group(1), mark.group(1))}")
+    return names
 
 
 def _metronome_mark(metronome: ET.Element) -> str | None:
@@ -170,6 +184,9 @@ def _one_metronome(directions: list[tuple[Fraction, str]]) -> list[tuple[Fractio
     """同じ位置のメトロノーム記号は最後の 1 つだけ残す"""
     last = {position: name for position, name in directions if name.startswith("metronome")}
     return [(p, name) for p, name in directions if not name.startswith("metronome") or last[p] == name]
+
+
+DOUBLE_BAR_STYLES = ("light-light", "light-heavy", "heavy-light", "heavy-heavy")
 
 
 def _ending_numbers(text: str) -> frozenset[int]:
@@ -304,6 +321,13 @@ def _parse_part(
                 raw.events.append((cursor, "tempo", float(el.get("tempo"))))
             elif tag == "barline" and part_index == 0:
                 repeat = el.find("repeat")
+                # 反復記号のない二重線 (終止線の形も含む) は区切りの複縦線。小節の頭に書いたものは前の小節の終わり
+                if repeat is None and el.findtext("bar-style") in DOUBLE_BAR_STYLES:
+                    location = el.get("location", "right")
+                    if location == "right":
+                        raw.double_bar = True
+                    elif location == "left" and mi > 0:
+                        raw_measures[mi - 1].double_bar = True
                 if repeat is not None:
                     if repeat.get("direction") == "forward":
                         raw.forward_repeat = True
@@ -549,6 +573,7 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
         if raw.key is not None:
             key = raw.key
         measure = Measure(time_signature, key, tuple(clefs), raw.length)
+        measure.double_bar = raw.double_bar
         if measure.length == 0:
             measure.length = measure.nominal_length
         events = [(Fraction(0), kind, value) for _, kind, value in carried] + raw.events
@@ -617,6 +642,8 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
         measures = unfolded
     _drop_unpaired_slurs(measures)
     drop_tempo_ramps(measures)
+    if measures:
+        measures[-1].double_bar = False  # 最後は書き出しで終止線にする
     return measures
 
 
@@ -1107,6 +1134,9 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
                 _write_direction(element, value)
         if cursor < ticks(measure.length):
             _sub(_sub(element, "forward"), "duration", ticks(measure.length) - cursor)
+        if mi == len(measures) - 1 or measure.double_bar:
+            barline = _sub(element, "barline", location="right")
+            _sub(barline, "bar-style", "light-heavy" if mi == len(measures) - 1 else "light-light")
         previous = measure
 
     ET.indent(root)
@@ -1146,9 +1176,12 @@ def _write_direction(parent: ET.Element, name: str) -> None:
     if kind == "metronome":
         _write_metronome(parent, *value.rsplit("_", 1))
         return
-    direction = _sub(parent, "direction", placement="above" if kind == "tempo" else "below")
+    direction = _sub(parent, "direction", placement="above" if kind in ("tempo", "mark") else "below")
     direction_type = _sub(direction, "direction-type")
-    if kind in ("tempo", "text"):
+    if kind == "mark":
+        _sub(direction_type, "words", TEMPO_MARKS[value], **{"font-weight": "bold"})
+        staff = 1
+    elif kind in ("tempo", "text"):
         text = TEMPO_WORDS[value] if kind == "tempo" else DYNAMIC_WORDS[value]
         _sub(direction_type, "words", text, **{"font-style": "italic"})
         staff = 1

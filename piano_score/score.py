@@ -95,6 +95,29 @@ TEMPO_WORDS = {
     "rubato": "rubato",
     "allarg": "allarg.",
     "string": "string.",
+    "meno_mosso": "meno mosso",
+    "piu_mosso": "più mosso",
+}
+# 速度標語 (名前 -> 書き出す文字)。"Allegro moderato" のような組み合わせは最初の語 (Allegro) にする。
+# Vivo は Vivace、Slowly は Slow、Moderate は Moderately にまとめる
+TEMPO_MARKS = {
+    "grave": "Grave",
+    "largo": "Largo",
+    "larghetto": "Larghetto",
+    "lento": "Lento",
+    "adagio": "Adagio",
+    "andante": "Andante",
+    "andantino": "Andantino",
+    "moderato": "Moderato",
+    "allegretto": "Allegretto",
+    "allegro": "Allegro",
+    "vivace": "Vivace",
+    "presto": "Presto",
+    "prestissimo": "Prestissimo",
+    "maestoso": "Maestoso",
+    "slow": "Slow",
+    "moderately": "Moderately",
+    "fast": "Fast",
 }
 # 文字で書く強弱の変化 (松葉と同じ意味)。decresc. は dim. にまとめる
 DYNAMIC_WORDS = {"cresc": "cresc.", "dim": "dim."}
@@ -185,6 +208,8 @@ class Measure:
     length: Fraction
     ottavas: tuple[str, str] = ("none", "none")  # 小節の頭のオクターブ記号の状態 (上段, 下段)
     swing: str = "none"  # 小節の頭のスイングの状態
+    # 小節の終わりが区切りの複縦線か。曲の最後の小節は常に終止線なので持たない
+    double_bar: bool = False
     groups: list[Group] = field(default_factory=list)
     # 小節内の指示 (位置, 名前)。名前は dyn_p / wedge_crescendo / pedal_start / clef1_G2 / tempo_rit / text_cresc /
     # metronome_quarter_120 など。メトロノーム記号は 1 つの位置に 1 つだけ
