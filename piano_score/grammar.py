@@ -7,6 +7,7 @@
 - 塊は段・声部の順 (同じ声部は装飾音が先)。声部の中で前の音が鳴っている間は次の塊を始めない。音は小節からはみ出さない
 - 和音の音高は昇順。スラーの終わりは開いているスラーがあるときだけ
 - 1 小節のトークン数の上限を超えない (残りが少ないと新しい位置や塊を始めない)
+- 複縦線 (DOUBLE_BAR) は小節の終わりの直前で、後は EOM だけ (曲の最後の小節は終止線なので付けない)
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from fractions import Fraction
 import numpy as np
 import torch
 
-from .tokenizer import CROSS, EOM, EOS, GLISS, MLEN, PAD, SLUR_START, SLUR_STOP, TIE, ScoreTokenizer
+from .tokenizer import CROSS, DOUBLE_BAR, EOM, EOS, GLISS, MLEN, PAD, SLUR_START, SLUR_STOP, TIE, ScoreTokenizer
 
 # 新しい位置は BEAT [FRAC] SV DUR PITCH、新しい塊は SV DUR PITCH の分の残りが要る
 NEW_ONSET_TOKENS = 5
@@ -148,7 +149,7 @@ class ScoreGrammar:
             if not self.mlen_used:
                 mask[MLEN] = True
             self._allow_next_onset(mask, remaining)
-            mask[[EOM, EOS]] = True
+            mask[[EOM, EOS, DOUBLE_BAR]] = True
         elif stage == "mlen_beat":
             mask[v.beat] = True
         elif stage == "mlen_frac":
@@ -156,7 +157,7 @@ class ScoreGrammar:
             mask[[i for i, f in zip(v.frac, v.frac_values) if self.mlen_beat + f != self.nominal]] = True
             if 0 < self.mlen_beat != self.nominal:  # 分数なし (長さ = 拍) で先へ進む
                 self._allow_next_onset(mask, remaining)
-                mask[[EOM, EOS]] = True
+                mask[[EOM, EOS, DOUBLE_BAR]] = True
         elif stage in ("after_beat", "items"):
             if stage == "after_beat":
                 previous = self.previous_position
@@ -192,7 +193,9 @@ class ScoreGrammar:
             mask[v.pitch[v.pitch_midi > self.last_pitch]] = True
             self._allow_groups(mask, remaining)
             self._allow_next_onset(mask, remaining)
-            mask[[EOM, EOS]] = True
+            mask[[EOM, EOS, DOUBLE_BAR]] = True
+        elif stage == "after_bar":
+            mask[EOM] = True
         return mask
 
     def _allow_next_onset(self, mask: torch.Tensor, remaining: int) -> None:
@@ -221,7 +224,7 @@ class ScoreGrammar:
         self._allow_groups(mask, remaining)
         if self.items_here > 0:  # 位置には指示か塊が 1 つ以上要る
             self._allow_next_onset(mask, remaining)
-            mask[[EOM, EOS]] = True
+            mask[[EOM, EOS, DOUBLE_BAR]] = True
 
     def _allow_groups(self, mask: torch.Tensor, remaining: int) -> None:
         if remaining < NEW_GROUP_TOKENS:
@@ -250,6 +253,8 @@ class ScoreGrammar:
         if token in (EOM, EOS):
             self.finished = True
             self.song_end = token == EOS
+        elif token == DOUBLE_BAR:
+            self.stage = "after_bar"
         elif kind == "mtime":
             self.stage = "ts"
         elif kind == "ts":

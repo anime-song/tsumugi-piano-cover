@@ -1,7 +1,7 @@
 """楽譜の中間表現 (score.py) <-> 小節ごとのトークン列の変換。
 
 1 小節 (= Global の 1 パッチ) のトークン列の文法:
-    measure   := MTIME TS KEY CLEF1 CLEF2 OTTAVA* [SWING] [MLEN position] onset* (EOM | EOS)
+    measure   := MTIME TS KEY CLEF1 CLEF2 OTTAVA* [SWING] [MLEN position] onset* ([DOUBLE_BAR] EOM | EOS)
     onset     := position CLEF* OTTAVA* [SWING] DIRECTION* [METRO_UNIT METRO_BPM] group*  position は小節の中で昇順
     position  := BEAT [FRAC]                                BEAT = 4 分音符単位の整数部、FRAC = 拍の中の分数
     group     := SV [CROSS] DUR ART* SLUR_STOP* SLUR_START* (PITCH [TIE] [GLISS])+
@@ -10,8 +10,9 @@ MTIME は演奏上の小節の開始時刻。最初の小節は「最初の音�
 「前の小節の (トークンから復元した) 開始時刻から何秒後か」。復元した時刻との差を取るので、ビンの丸め誤差が積もらない。
 ヘッダ (拍子・調・音部記号) は毎小節入れる。オクターブ記号は段ごとの状態として、ヘッダでは効いている段だけ入れ、
 小節の途中では状態が変わる位置に入れる (none で終わり)。スイングの指定も同じく曲全体の状態として入れる。
-MLEN は小節の長さが拍子と違うとき (弱起など) だけ入れる。
-DIRECTION は強弱・松葉・ペダル記号と、文字の指示 (rit. / a tempo などの速度の変化、cresc. / dim.)。
+MLEN は小節の長さが拍子と違うとき (弱起など) だけ入れる。DOUBLE_BAR は小節の終わりが区切りの複縦線のとき
+(曲の最後の小節は書き出しで常に終止線にするので入れない)。
+DIRECTION は強弱・松葉・ペダル記号と、文字の指示 (Allegro などの速度標語、rit. / a tempo などの速度の変化、cresc. / dim.)。
 メトロノーム記号 (♩ = 120 など) は基準の音符 METRO_UNIT と数値 METRO_BPM の 2 トークンで、1 つの位置に 1 つだけ。
 同じ位置の中は、音部記号の変更 -> 強弱などの指示 -> 塊 (段・声部の順、同じ声部では装飾音が先) の順に並べる。
 """
@@ -36,6 +37,7 @@ from .score import (
     STEP_PITCH_CLASS,
     STEPS,
     SWINGS,
+    TEMPO_MARKS,
     TEMPO_WORDS,
     WEDGES,
     Group,
@@ -48,8 +50,8 @@ from .score import (
     spell,
 )
 
-PAD, EOM, EOS, MLEN, CROSS, TIE, GLISS, SLUR_STOP, SLUR_START = range(9)
-SPECIAL_NAMES = ("PAD", "EOM", "EOS", "MLEN", "CROSS", "TIE", "GLISS", "SLUR_STOP", "SLUR_START")
+PAD, EOM, EOS, MLEN, CROSS, TIE, GLISS, SLUR_STOP, SLUR_START, DOUBLE_BAR = range(10)
+SPECIAL_NAMES = ("PAD", "EOM", "EOS", "MLEN", "CROSS", "TIE", "GLISS", "SLUR_STOP", "SLUR_START", "DOUBLE_BAR")
 
 # 損失をトークンの種類別に見るためのグループ
 TOKEN_GROUPS = (
@@ -62,6 +64,7 @@ DIRECTIONS = (
     tuple(f"dyn_{d}" for d in DYNAMICS)
     + tuple(f"wedge_{w}" for w in WEDGES)
     + tuple(f"pedal_{p}" for p in PEDALS)
+    + tuple(f"mark_{t}" for t in TEMPO_MARKS)
     + tuple(f"tempo_{t}" for t in TEMPO_WORDS)
     + tuple(f"text_{t}" for t in DYNAMIC_WORDS)
 )
@@ -258,6 +261,8 @@ class ScoreTokenizer:
                         tokens.append(TIE)
                     if note.glissando:
                         tokens.append(GLISS)
+        if measure.double_bar and not last:
+            tokens.append(DOUBLE_BAR)
         tokens.append(EOS if last else EOM)
         return tokens
 
@@ -290,11 +295,14 @@ class ScoreTokenizer:
         groups: list[Group] = []
         group: Group | None = None
         unit: str | None = None  # 直前のメトロノーム記号の基準の音符 (次の数値と組にする)
+        double_bar = False
         for token in sequence:
             if token in (PAD, EOM, EOS):
                 break
             kind, value = self.kinds[token], self.values[token]
-            if kind == "mtime":
+            if token == DOUBLE_BAR:
+                double_bar = True
+            elif kind == "mtime":
                 mtime = value
             elif kind == "ts":
                 time_signature = value
@@ -362,6 +370,7 @@ class ScoreTokenizer:
             unit = None  # 基準の音符は直後の数値とだけ組にする
         measure = Measure(time_signature, key, (clefs[0], clefs[1]), Fraction(0), (ottavas[0], ottavas[1]), swing)
         measure.length = length if length is not None else measure.nominal_length
+        measure.double_bar = double_bar
         measure.directions = sorted(set(directions))
         # 声部の中で前の音に重なる塊と、小節からはみ出す塊は捨てる (生成が文法から外れた場合の保険)
         busy: dict[tuple[int, int], Fraction] = {}
