@@ -26,6 +26,9 @@ from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
 
+# 原曲のパッチエンコーダに一度に通すトークン数 (パッチ数 x (要約 + 行数)) の上限。学習時の中間のメモリがこれで決まる
+CHUNK_TOKENS = 16384
+
 
 @dataclass
 class SourceMemory:
@@ -99,7 +102,8 @@ class CoverModel(nn.Module):
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.decoder.set_gradient_checkpointing(enabled)
-        self.patch_encoder.gradient_checkpointing = enabled
+        # 原曲のパッチエンコーダは encode_source で塊ごとにまとめて checkpoint する
+        self.patch_encoder.gradient_checkpointing = False
         self.song_encoder.gradient_checkpointing = enabled
         self.gradient_checkpointing = enabled
 
@@ -141,24 +145,43 @@ class CoverModel(nn.Module):
         lengths = patch_rows_valid.sum(-1)
         row_width = max(1, int(lengths[needed_flat].max())) if num_needed else 1
 
-        # パッチごとの行数の差が大きいので、デコーダと同じく長さ順の塊に分けて通す
+        def encode_patches(features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor) -> tuple[Tensor, Tensor]:
+            n, length = valid.shape
+            # 行の特徴 (5 列) の埋め込みの和。embedding + sum だと [n, length, 5, D] の中間が要るので embedding_bag で直接足す
+            rows = F.embedding_bag(
+                features.reshape(-1, features.shape[-1]), self.source_embedding.weight, mode="sum", padding_idx=0
+            ).reshape(n, length, -1)
+            rows = rows + self.source_onset(onset)
+            queries = self.latent_queries.to(rows.dtype).expand(n, -1, -1)
+            key_valid = torch.cat((torch.ones_like(valid[:, :1]).expand(-1, K), valid), dim=1)
+            out = self.patch_encoder(torch.cat((queries, rows), dim=1), key_valid)
+            return out[:, :K], out[keep, K : K + min(length, row_width)]
+
+        # パッチごとの行数の差が大きいので、デコーダと同じく長さ順の塊に分けて通す。
+        # 全曲の全パッチの行 (長い曲で数十万トークン) を通すので、学習時は塊を小分けにして塊ごとに checkpoint し、
+        # 中間は backward で計算し直す (残すのは出力の要約と Local が見るパッチの行だけ)
         order = lengths.argsort()
         latent_parts, row_parts = [], []
-        for index in order.tensor_split(min(num_length_buckets, max(len(order), 1))):
-            if len(index) == 0:
+        for bucket in order.tensor_split(min(num_length_buckets, max(len(order), 1))):
+            if len(bucket) == 0:
                 continue
-            length = int(lengths[index].max())
-            rows = self.source_embedding(patch_features[index, :length]).sum(-2)
-            rows = rows + self.source_onset(local_onset[index, :length])
-            queries = self.latent_queries.to(rows.dtype).expand(len(index), -1, -1)
-            key_valid = torch.cat((torch.ones_like(patch_rows_valid[index, :1]).expand(-1, K),
-                                   patch_rows_valid[index, :length]), dim=1)  # fmt: skip
-            out = self.patch_encoder(torch.cat((queries, rows), dim=1), key_valid)
-            latent_parts.append(out[:, :K])
-            keep = needed_flat[index]
-            if keep.any():
-                width = min(length, row_width)
-                row_parts.append((lookup_flat[index[keep]], out[keep, K : K + width]))
+            length = int(lengths[bucket].max())
+            chunk = max(1, CHUNK_TOKENS // (K + length))
+            for index in bucket.split(chunk):
+                keep = needed_flat[index]
+                args = (
+                    patch_features[index, :length],
+                    local_onset[index, :length],
+                    patch_rows_valid[index, :length],
+                    keep,
+                )
+                if self.gradient_checkpointing and self.training:
+                    latents, kept_rows = checkpoint(encode_patches, *args, use_reentrant=False)
+                else:
+                    latents, kept_rows = encode_patches(*args)
+                latent_parts.append(latents)
+                if keep.any():
+                    row_parts.append((lookup_flat[index[keep]], kept_rows))
 
         if latent_parts:
             latents = torch.cat(latent_parts)[order.argsort()]
