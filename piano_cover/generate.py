@@ -1,7 +1,10 @@
 """原曲の MIDI (tsumugi で採譜したもの) からピアノカバーを生成する。
 
 python -m piano_cover.generate --checkpoint checkpoints/piano_cover/best.pt --source Dataset/original_midis_v2/merged/<id>.mid
-python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.3 --channel-cfg 1.5 --seconds 60 --wav
+python -m piano_cover.generate ... --style-midi 参考のカバー.mid --source-cfg 1.5 --style-cfg 1.5 --seconds 60 --wav
+
+演奏者の指定は、スタイル参照で学習したモデルなら --style-midi (その演奏者のピアノ曲の一部)、
+チャンネルで学習した以前のモデルなら --channel。
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
 """
@@ -18,6 +21,7 @@ import torch
 from piano_ar.config import ModelConfig, TokenizerConfig
 from piano_ar.evaluation import synthesize, write_wav
 from piano_ar.tokenizer import PianoTokenizer
+from piano_ar.train import reference_style
 
 from .config import CoverConfig
 from .data import source_tensors
@@ -33,11 +37,19 @@ def main() -> None:
     parser.add_argument("--seconds", type=float, default=None, help="生成する長さ。省略で原曲の最後まで")
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--channel", default=None, help="チャンネル ID (UC...) か channel_index の番号。省略で指定なし")
+    parser.add_argument("--style-midi", default=None, help="スタイル参照にするピアノ曲 (カバーなど) の MIDI")
+    parser.add_argument("--style-start", type=float, default=30.0, help="参照に使う位置 (秒)。曲が短ければ冒頭から")
+    parser.add_argument("--style-seconds", type=float, default=16.0, help="参照に使う長さ (秒)")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--source-cfg", type=float, default=1.0, help="> 1 で原曲に忠実にする (原曲なしとの差を強調)")
     parser.add_argument(
-        "--channel-cfg", type=float, default=1.0, help="> 1 で演奏者らしさを強める (--channel を指定したときだけ効く)"
+        "--style-cfg",
+        "--channel-cfg",
+        dest="style_cfg",
+        type=float,
+        default=1.0,
+        help="> 1 で演奏者らしさを強める (--style-midi か --channel を指定したときだけ効く)",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
@@ -62,6 +74,16 @@ def main() -> None:
         else:
             channel = json.loads(Path(checkpoint["channel_index"]).read_text(encoding="utf-8"))[args.channel]
 
+    style = None
+    if args.style_midi:
+        if not model.decoder.config.style_tokens:
+            raise SystemExit("このチェックポイントはスタイル参照で学習していません (--channel を使ってください)")
+        events, style_end = tokenizer.midi_to_events(args.style_midi)
+        patches = max(1, round(args.style_seconds / tokenizer.config.patch_seconds))
+        start = round(args.style_start * tokenizer.config.frame_rate)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            style = reference_style(model.decoder, tokenizer, events, style_end, start, patches)
+
     rows, end_frame = load_source(args.source, tokenizer.config.frame_rate)
     features = source_features(rows, end_frame, tokenizer, SourceVocab(tokenizer.config), cover_config.max_source_rows)
     source = {key: value.to(device) for key, value in source_tensors(features).items()}
@@ -79,7 +101,8 @@ def main() -> None:
             num_samples=args.num_samples,
             temperature=args.temperature,
             top_p=args.top_p,
-            cfg_scale=args.channel_cfg,
+            style=style,
+            cfg_scale=args.style_cfg,
             condition_cfg_scale=args.source_cfg,
             context_patches=round(checkpoint["args"]["window_seconds"] / patch_seconds),
             condition=condition,
@@ -89,7 +112,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for i, patches in enumerate(samples):
         events = tokenizer.patches_to_events(patches)
-        path = out_dir / f"{Path(args.source).stem}_ch{channel}_{i}.mid"
+        manner = f"style-{Path(args.style_midi).stem}" if args.style_midi else f"ch{channel}"
+        path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
         tokenizer.events_to_midi(events, path)
         if args.wav:
             write_wav(synthesize(events, tokenizer.config.frame_rate), path.with_suffix(".wav"))

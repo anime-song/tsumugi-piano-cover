@@ -156,12 +156,11 @@ def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device) -> d
 
 
 def reference_style(
-    model: PianoARModel, tokenizer: PianoTokenizer, cache: PretrainingCache, song: int, after_frame: int, patches: int
+    model: PianoARModel, tokenizer: PianoTokenizer, events: np.ndarray, end_frame: int, after_frame: int, patches: int
 ) -> torch.Tensor:
-    """検証曲の after_frame から patches パッチ (足りなければ冒頭から) をスタイル参照にする"""
-    end_frame = int(cache.end_frames[song])
+    """曲の after_frame から patches パッチ (足りなければ冒頭から) をスタイル参照にする"""
     start = after_frame if after_frame + patches * tokenizer.patch_frames <= end_frame else 0
-    window = tokenizer.tokenize_window(cache.song_events(song), end_frame, start, patches)
+    window = tokenizer.tokenize_window(events, end_frame, start, patches)
     device = next(model.parameters()).device
     tokens = torch.from_numpy(window["tokens"]).to(device)[None]
     valid = torch.from_numpy(window["patch_valid"]).to(device)[None]
@@ -206,7 +205,14 @@ def sample_evaluation(
         if model.config.style_tokens:
             # スタイル参照のモデルは、同じ検証曲の生成範囲より後ろの 16 秒をスタイルにして、冒頭からの生成と続き生成をする
             styles = [
-                reference_style(model, tokenizer, cache, song, num_patches * tokenizer.patch_frames, 8)
+                reference_style(
+                    model,
+                    tokenizer,
+                    cache.song_events(song),
+                    int(cache.end_frames[song]),
+                    num_patches * tokenizer.patch_frames,
+                    8,
+                )
                 for song in songs
             ]
             free = [model.generate(tokenizer, num_samples=1, style=style, **common)[0] for style in styles]
