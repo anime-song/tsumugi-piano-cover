@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
 
 from .config import ScoreTokenizerConfig
@@ -22,10 +23,13 @@ from .score import (
     ARTICULATIONS,
     CLEFS,
     DEFAULT_CLEFS,
+    DYNAMIC_WORDS,
     DYNAMICS,
+    METRONOME_UNITS,
     NOTE_TYPES,
     ORNAMENTS,
     STEP_PITCH_CLASS,
+    TEMPO_WORDS,
     TREMOLO_PAIR,
     TREMOLOS,
     TUPLETS,
@@ -35,6 +39,8 @@ from .score import (
     Note,
     group_order,
     key_alters,
+    metronome_bpm,
+    metronome_quarters,
     pair_slurs,
     spell,
 )
@@ -125,6 +131,45 @@ def _swing_from_metronome(metronome: ET.Element) -> str | None:
     if not any(n.find("metronome-tuplet") is not None for n in notes):
         return "none"  # ♫ = ♫ (まっすぐに戻す)
     return "16th" if notes[0].findtext("metronome-type") == "16th" else "8th"
+
+
+# 演奏指示の文字から拾う速度と強弱の変化。1 つの文字に複数あれば全部拾う ("rit. e dim." など)
+WORD_PATTERNS = (
+    ("tempo_rit", re.compile(r"\brit\b|\britard|\briten")),
+    ("tempo_rall", re.compile(r"\brall")),
+    ("tempo_accel", re.compile(r"\baccel")),
+    ("tempo_a_tempo", re.compile(r"\ba tempo\b|\btempo (i|1|primo)\b")),
+    ("tempo_rubato", re.compile(r"\brubato")),
+    ("tempo_allarg", re.compile(r"\ballarg")),
+    ("tempo_string", re.compile(r"\bstring(\.|endo)")),
+    ("text_cresc", re.compile(r"\bcresc")),
+    ("text_dim", re.compile(r"\bdim\b|\bdimin|\bdecresc|\bdecr\b")),
+)
+NUMBER = re.compile(r"\d+(\.\d+)?")
+
+
+def _words_directions(text: str) -> list[str]:
+    """演奏指示の文字 (rit. / a tempo / cresc. など) から、速度と強弱の変化の指示を読む"""
+    text = text.lower()
+    return [name for name, pattern in WORD_PATTERNS if pattern.search(text)]
+
+
+def _metronome_mark(metronome: ET.Element) -> str | None:
+    """<metronome> (♩ = 120 など) を metronome_{基準の音符}_{数値} にする。音符の等式や読めない数値は None"""
+    units = metronome.findall("beat-unit")
+    number = NUMBER.search(metronome.findtext("per-minute") or "")
+    if len(units) != 1 or number is None or float(number.group()) <= 0:
+        return None
+    unit = (units[0].text or "").strip() + "." * len(metronome.findall("beat-unit-dot"))
+    if unit not in METRONOME_UNITS:
+        return None
+    return f"metronome_{unit}_{metronome_bpm(float(number.group()))}"
+
+
+def _one_metronome(directions: list[tuple[Fraction, str]]) -> list[tuple[Fraction, str]]:
+    """同じ位置のメトロノーム記号は最後の 1 つだけ残す"""
+    last = {position: name for position, name in directions if name.startswith("metronome")}
+    return [(p, name) for p, name in directions if not name.startswith("metronome") or last[p] == name]
 
 
 def _ending_numbers(text: str) -> frozenset[int]:
@@ -235,8 +280,13 @@ def _parse_part(
                         elif child.tag in ("words", "metronome"):
                             if child.tag == "words":
                                 swing = _swing_from_words(child.text or "")
+                                for name in _words_directions(child.text or ""):
+                                    raw.events.append((position, "direction", name))
                             else:
                                 swing = _swing_from_metronome(child)
+                                mark = _metronome_mark(child) if swing is None else None
+                                if mark is not None:
+                                    raw.events.append((position, "direction", mark))
                             if swing is not None:
                                 raw.events.append((position, "swing", swing))
                         elif child.tag == "pedal":
@@ -459,14 +509,22 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
     for g in raw_groups:
         staff_counts[g.raw_voice][g.display_staves[0]] += 1
 
-    def home_staff(voice: tuple[int, str], counts: Counter) -> int:
+    def preferred_staff(voice: tuple[int, str]) -> int:
         if len(parts) == 2:
             return voice[0] + 1
-        preferred = 2 if voice[1].isdigit() and int(voice[1]) > 4 else 1
-        other = 3 - preferred
-        return other if counts[other] >= 0.9 * sum(counts.values()) else preferred
+        return 2 if voice[1].isdigit() and int(voice[1]) > 4 else 1
+
+    def home_staff(voice: tuple[int, str], counts: Counter) -> int:
+        other = 3 - preferred_staff(voice)
+        if len(parts) == 1 and counts[other] >= 0.9 * sum(counts.values()):
+            return other
+        return preferred_staff(voice)
 
     home = {voice: home_staff(voice, counts) for voice, counts in staff_counts.items()}
+    # 段を移したせいで声部が 5 つ以上になる段 (上段の声部が全部下段に書かれているなど) は、移した声部を戻す
+    for staff in (1, 2):
+        if sum(h == staff for h in home.values()) > 4:
+            home.update({v: 3 - staff for v, h in home.items() if h == staff and preferred_staff(v) != staff})
     voice_index: dict[tuple[int, str], int] = {}
     for staff in (1, 2):
         voices = sorted(
@@ -535,7 +593,7 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
             if name != state[staff]:
                 measure.directions.append((position, f"ottava{staff}_{name}" if staff else f"swing_{name}"))
                 state[staff] = name
-        measure.directions = sorted(set(measure.directions))
+        measure.directions = _one_metronome(sorted(set(measure.directions)))
         measures.append(measure)
 
     for g in raw_groups:
@@ -558,7 +616,43 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
             seen.add(i)
         measures = unfolded
     _drop_unpaired_slurs(measures)
+    drop_tempo_ramps(measures)
     return measures
+
+
+# 直前のメトロノーム記号からこの長さ (4 分音符単位) 以内で、テンポの変化がこの比 (対数) 未満のものは再生用の刻みとみなす
+TEMPO_RAMP_QUARTERS = 8
+TEMPO_RAMP_RATIO = 0.12
+
+
+def drop_tempo_ramps(measures: list[Measure]) -> None:
+    """再生用に細かく刻んだメトロノーム記号 (rit. や accel. でテンポを少しずつ変えて鳴らすためのもの) を消す。
+
+    ♩=80 rit. ♩=76 ♩=72 ... と拍ごとに置かれた刻みは楽譜としては読みにくいので、最初の記号だけ残す
+    (テンポの変化そのものは <sound> のテンポとして MTIME に残る)。消すと新しく刻みに見える組ができることがあるので、
+    変わらなくなるまで繰り返す (書き出して読み直しても同じ結果になる)。
+    """
+    while True:
+        marks = []  # (曲の頭からの位置, 小節番号, 小節の中の位置, 名前)
+        offset = Fraction(0)
+        for i, measure in enumerate(measures):
+            marks += [(offset + p, i, p, name) for p, name in measure.directions if name.startswith("metronome")]
+            offset += measure.length
+        drop = set()
+        for (at, _, _, before), (now, i, position, name) in pairwise(marks):
+            change = abs(math.log(_metronome_qpm(name) / _metronome_qpm(before)))
+            if now - at < TEMPO_RAMP_QUARTERS and change < TEMPO_RAMP_RATIO:
+                drop.add((i, position, name))
+        if not drop:
+            return
+        for i, position, name in drop:
+            measures[i].directions = [d for d in measures[i].directions if d != (position, name)]
+
+
+def _metronome_qpm(name: str) -> float:
+    """メトロノーム記号の名前 (metronome_quarter._60 など) を 4 分音符単位のテンポにする"""
+    unit, bpm = name.split("_", 1)[1].rsplit("_", 1)
+    return float(int(bpm) * metronome_quarters(unit))
 
 
 def _drop_unpaired_slurs(measures: list[Measure]) -> None:
@@ -1049,9 +1143,16 @@ def _write_ottava(parent: ET.Element, staff: int, before: str, after: str) -> No
 
 def _write_direction(parent: ET.Element, name: str) -> None:
     kind, value = name.split("_", 1)
-    direction = _sub(parent, "direction", placement="below")
+    if kind == "metronome":
+        _write_metronome(parent, *value.rsplit("_", 1))
+        return
+    direction = _sub(parent, "direction", placement="above" if kind == "tempo" else "below")
     direction_type = _sub(direction, "direction-type")
-    if kind == "dyn":
+    if kind in ("tempo", "text"):
+        text = TEMPO_WORDS[value] if kind == "tempo" else DYNAMIC_WORDS[value]
+        _sub(direction_type, "words", text, **{"font-style": "italic"})
+        staff = 1
+    elif kind == "dyn":
         _sub(_sub(direction_type, "dynamics"), value)
         staff = 1
     elif kind == "wedge":
@@ -1061,6 +1162,18 @@ def _write_direction(parent: ET.Element, name: str) -> None:
         _sub(direction_type, "pedal", type=value, line="yes")
         staff = 2
     _sub(direction, "staff", staff)
+
+
+def _write_metronome(parent: ET.Element, unit: str, bpm: str) -> None:
+    """メトロノーム記号 (♩ = 120 など)。再生用に 4 分音符単位のテンポも <sound> に書く"""
+    direction = _sub(parent, "direction", placement="above")
+    metronome = _sub(_sub(direction, "direction-type"), "metronome")
+    _sub(metronome, "beat-unit", unit.rstrip("."))
+    if unit.endswith("."):
+        _sub(metronome, "beat-unit-dot")
+    _sub(metronome, "per-minute", bpm)
+    _sub(direction, "staff", 1)
+    _sub(direction, "sound", tempo=f"{float(int(bpm) * metronome_quarters(unit)):g}")
 
 
 def _write_item(

@@ -86,6 +86,30 @@ TREMOLO_PAIR_TYPES = ("whole", "half", "quarter", "eighth", "16th")
 OTTAVAS = ("none", "8va", "15ma", "8vb", "15mb")
 # スイングの指定 (曲全体の状態)。楽譜はまっすぐな 8 分 (16 分) で書き、この指定で長短を付けて弾く
 SWINGS = ("none", "8th", "16th")
+# 文字で書く速度の変化 (名前 -> 書き出す文字)。ritard. / riten. は rit.、Tempo I は a tempo にまとめる
+TEMPO_WORDS = {
+    "rit": "rit.",
+    "rall": "rall.",
+    "accel": "accel.",
+    "a_tempo": "a tempo",
+    "rubato": "rubato",
+    "allarg": "allarg.",
+    "string": "string.",
+}
+# 文字で書く強弱の変化 (松葉と同じ意味)。decresc. は dim. にまとめる
+DYNAMIC_WORDS = {"cresc": "cresc.", "dim": "dim."}
+# メトロノーム記号の基準の音符 (. は付点) と数値。数値はメトロノームの目盛りと 5 の倍数に丸める
+METRONOME_UNITS = ("eighth", "eighth.", "quarter", "quarter.", "half", "half.")
+METRONOME_BPMS = tuple(
+    sorted(
+        set(range(10, 301, 5))
+        | set(range(40, 60, 2))
+        | set(range(60, 72, 3))
+        | set(range(72, 120, 4))
+        | set(range(120, 144, 6))
+        | set(range(144, 209, 8))
+    )
+)
 
 STEPS = "CDEFGAB"
 STEP_PITCH_CLASS = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -162,7 +186,8 @@ class Measure:
     ottavas: tuple[str, str] = ("none", "none")  # 小節の頭のオクターブ記号の状態 (上段, 下段)
     swing: str = "none"  # 小節の頭のスイングの状態
     groups: list[Group] = field(default_factory=list)
-    # 小節内の指示 (位置, 名前)。名前は dyn_p / wedge_crescendo / pedal_start / clef1_G2 など
+    # 小節内の指示 (位置, 名前)。名前は dyn_p / wedge_crescendo / pedal_start / clef1_G2 / tempo_rit / text_cresc /
+    # metronome_quarter_120 など。メトロノーム記号は 1 つの位置に 1 つだけ
     directions: list[tuple[Fraction, str]] = field(default_factory=list)
     # テンポ (位置, 4 分音符/分)。トークンには入れない (演奏時刻の見積もりと書き出し用)
     tempos: list[tuple[Fraction, float]] = field(default_factory=list)
@@ -226,6 +251,16 @@ def key_alters(key: int) -> dict[str, int]:
     if key >= 0:
         return {step: 1 for step in SHARP_ORDER[:key]}
     return {step: -1 for step in SHARP_ORDER[::-1][:-key]}
+
+
+def metronome_bpm(value: float) -> int:
+    """メトロノーム記号の数値を METRONOME_BPMS の一番近い値に丸める"""
+    return min(METRONOME_BPMS, key=lambda b: (abs(b - value), b))
+
+
+def metronome_quarters(unit: str) -> Fraction:
+    """メトロノーム記号の基準の音符の長さ (4 分音符 = 1)"""
+    return NOTE_TYPES[unit.rstrip(".")] * (Fraction(3, 2) if unit.endswith(".") else 1)
 
 
 def measure_seconds(measures: list[Measure], default_qpm: float = 120.0) -> np.ndarray:

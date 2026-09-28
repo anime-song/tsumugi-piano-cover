@@ -2,6 +2,7 @@
 
 1 小節 = Global の 1 パッチ。各小節のトークン列の先頭に MTIME (演奏上の小節の開始時刻) を入れる。
 楽譜だけの事前学習では、テンポ記号どおりの開始時刻に「曲全体のテンポの倍率」と「小節ごとの長さの揺れ」をかけて演奏の代わりにする。
+メトロノーム記号の数値も全体の倍率に合わせて変える (演奏の速さから数値を推定できるように)。
 MTIME は曲の冒頭から通して求めてから窓を切り出すので、途中から始まる窓の最初の小節も「前の小節の開始から何秒後か」になり、
 生成時に窓をずらしながら続けるときと同じ形になる (曲の冒頭の小節だけ「最初の音から小節の頭まで何秒さかのぼるか」)。
 移調は tokenizer.transposition の表で音高と調のトークンを差し替える。
@@ -147,6 +148,8 @@ class ScoreWindowDataset(Dataset):
             a = self.augment
             scale = math.exp(random.uniform(math.log(a.tempo_min), math.log(a.tempo_max)))
             seconds = vary_tempo(seconds, scale, a.tempo_jitter, random)
+            # メトロノーム記号も同じ倍率で変え、MTIME と食い違わないようにする
+            measures = [self.tokenizer.scale_metronome(m, scale) for m in measures]
             shift = random.randint(-a.transpose, a.transpose) if a.transpose > 0 else 0
             if shift:
                 measures = self._transpose(measures, shift)
