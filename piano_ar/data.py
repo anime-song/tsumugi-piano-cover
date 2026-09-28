@@ -4,6 +4,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -165,7 +166,7 @@ class PianoWindowDataset(Dataset):
             factor = random.uniform(1 - a.time_stretch, 1 + a.time_stretch) if a.time_stretch > 0 else 1.0
             velocity = random.randint(-a.velocity_shift, a.velocity_shift) if a.velocity_shift > 0 else 0
             shift = random.randint(-a.transpose, a.transpose) if a.transpose > 0 else 0
-            events, end_frame = self._apply(events, end_frame, factor, shift, velocity)
+            events, end_frame = augment_events(events, end_frame, factor, shift, velocity, self.tokenizer.config)
 
         window_frames = self.window_patches * self.tokenizer.patch_frames
         song_start = not self.train or random.random() < self.song_start_prob
@@ -193,78 +194,105 @@ class PianoWindowDataset(Dataset):
             item.update(self._reference(song, window_range, velocity))
         return item
 
-    def _apply(
-        self, events: np.ndarray, end_frame: int, factor: float, shift: int, velocity: int
-    ) -> tuple[np.ndarray, int]:
-        if factor != 1.0:
-            events, end_frame = stretch_events(events, end_frame, factor)
-        if shift:
-            events = transpose_events(events, shift, self.tokenizer.config)
-        if velocity:
-            events = shift_velocity(events, velocity)
-        return sort_events(np.asarray(events)), end_frame
-
     def _reference(self, song: int, window_range: tuple[float, float], velocity: int) -> dict[str, torch.Tensor]:
-        """スタイル参照のパッチ列。同じ曲の窓と離れた場所か、同じ演奏者の別の曲から取る。
-
-        参照には窓とは別の移調と時間伸縮をかけ、音高やテンポをそのまま写しても合わないようにする
-        (ベロシティのずらしは窓と同じにする。強弱の付け方はスタイルの一部なので)。
-        検証では毎回同じ参照になるよう、同じ曲の窓の直後から固定の長さで取る。
-        """
-        c = self.style
-        F = self.tokenizer.patch_frames
-        empty = {
-            "ref_tokens": torch.full((c.max_patches, 1), PAD, dtype=torch.long),
-            "ref_valid": torch.zeros(c.max_patches, dtype=torch.bool),
-            "style_present": torch.tensor(False),
-        }
-        # 学習時は dropout の確率で外す。1 以上なら検証でも常に外す (スタイルなしの損失を測る用)
-        if c.dropout >= 1.0 or (self.train and random.random() < c.dropout):
-            return empty
-
-        if self.train:
-            num_patches = random.randint(c.min_patches, c.max_patches)
-            factor = (
-                random.uniform(1 - self.augment.time_stretch, 1 + self.augment.time_stretch) if self.augment else 1.0
-            )
-            shift = random.randint(-self.augment.transpose, self.augment.transpose) if self.augment else 0
-        else:
-            num_patches, factor, shift = (c.min_patches + c.max_patches) // 2, 1.0, 0
-        length = num_patches * F / factor  # 元の時間での参照の長さ
-        gap = c.gap_patches * F
-
-        ref_song, ref_start = song, None
         others = self.songs_of_performer.get(int(self.cache.performers[song]), np.zeros(0, dtype=np.int64))
         others = others[others != song]
-        use_other = self.train and len(others) and random.random() >= c.same_song_prob
-        if not use_other:
-            end = float(self.cache.end_frames[song])
-            if self.train:
-                # 窓の前と後ろのうち、参照が収まる場所からランダムに選ぶ
-                candidates = [(0.0, window_range[0] - gap - length), (window_range[1] + gap, end - length)]
-                candidates = [(a, b) for a, b in candidates if b >= a]
-                if candidates:
-                    lo, hi = random.choice(candidates)
-                    ref_start = random.uniform(lo, hi)
-            elif window_range[1] + gap + length <= end:
-                ref_start = window_range[1] + gap
-            if ref_start is None and self.train and len(others):
-                use_other = True
-        if use_other:
-            ref_song = int(random.choice(others))
-            ref_start = random.uniform(0.0, max(0.0, float(self.cache.end_frames[ref_song]) - length))
-        if ref_start is None:
-            return empty
 
-        events, end_frame = self._apply(
-            self.cache.song_events(ref_song), int(self.cache.end_frames[ref_song]), factor, shift, velocity
+        def pick_other() -> tuple[np.ndarray, int]:
+            other = int(random.choice(others))
+            return self.cache.song_events(other), int(self.cache.end_frames[other])
+
+        return style_reference(
+            self.tokenizer,
+            self.style,
+            self.augment,
+            self.train,
+            self.cache.song_events(song),
+            int(self.cache.end_frames[song]),
+            window_range,
+            velocity,
+            pick_other if len(others) else None,
         )
-        window = self.tokenizer.tokenize_window(events, end_frame, int(ref_start * factor), num_patches)
-        tokens = torch.full((c.max_patches, window["tokens"].shape[1]), PAD, dtype=torch.long)
-        tokens[:num_patches] = torch.from_numpy(window["tokens"])
-        valid = torch.zeros(c.max_patches, dtype=torch.bool)
-        valid[:num_patches] = torch.from_numpy(window["patch_valid"])
-        return {"ref_tokens": tokens, "ref_valid": valid, "style_present": torch.tensor(bool(valid.any()))}
+
+
+def augment_events(
+    events: np.ndarray, end_frame: int, factor: float, shift: int, velocity: int, config: TokenizerConfig
+) -> tuple[np.ndarray, int]:
+    """時間伸縮・移調・ベロシティのずらしをかけて並べ直す"""
+    if factor != 1.0:
+        events, end_frame = stretch_events(events, end_frame, factor)
+    if shift:
+        events = transpose_events(events, shift, config)
+    if velocity:
+        events = shift_velocity(events, velocity)
+    return sort_events(np.asarray(events)), end_frame
+
+
+def style_reference(
+    tokenizer: PianoTokenizer,
+    style: StyleConfig,
+    augment: AugmentConfig | None,
+    train: bool,
+    events: np.ndarray,
+    end_frame: int,
+    window_range: tuple[float, float],
+    velocity: int,
+    pick_other: Callable[[], tuple[np.ndarray, int]] | None = None,
+) -> dict[str, torch.Tensor]:
+    """スタイル参照のパッチ列。同じ曲 (events, 伸縮前) の窓と離れた場所か、同じ演奏者の別の曲 (pick_other) から取る。
+
+    参照には窓とは別の移調と時間伸縮をかけ、音高やテンポをそのまま写しても合わないようにする
+    (ベロシティのずらしは窓と同じにする。強弱の付け方はスタイルの一部なので)。
+    window_range は伸縮前の時間での窓の範囲。検証では毎回同じ参照になるよう、同じ曲の窓の直後から固定の長さで取る。
+    """
+    c = style
+    F = tokenizer.patch_frames
+    empty = {
+        "ref_tokens": torch.full((c.max_patches, 1), PAD, dtype=torch.long),
+        "ref_valid": torch.zeros(c.max_patches, dtype=torch.bool),
+        "style_present": torch.tensor(False),
+    }
+    # 学習時は dropout の確率で外す。1 以上なら検証でも常に外す (スタイルなしの損失を測る用)
+    if c.dropout >= 1.0 or (train and random.random() < c.dropout):
+        return empty
+
+    if train:
+        num_patches = random.randint(c.min_patches, c.max_patches)
+        factor = random.uniform(1 - augment.time_stretch, 1 + augment.time_stretch) if augment else 1.0
+        shift = random.randint(-augment.transpose, augment.transpose) if augment else 0
+    else:
+        num_patches, factor, shift = (c.min_patches + c.max_patches) // 2, 1.0, 0
+    length = num_patches * F / factor  # 元の時間での参照の長さ
+    gap = c.gap_patches * F
+
+    ref_start = None
+    use_other = train and pick_other is not None and random.random() >= c.same_song_prob
+    if not use_other:
+        end = float(end_frame)
+        if train:
+            # 窓の前と後ろのうち、参照が収まる場所からランダムに選ぶ
+            candidates = [(0.0, window_range[0] - gap - length), (window_range[1] + gap, end - length)]
+            candidates = [(a, b) for a, b in candidates if b >= a]
+            if candidates:
+                lo, hi = random.choice(candidates)
+                ref_start = random.uniform(lo, hi)
+        elif window_range[1] + gap + length <= end:
+            ref_start = window_range[1] + gap
+        if ref_start is None and train and pick_other is not None:
+            use_other = True
+    if use_other:
+        events, end_frame = pick_other()
+        ref_start = random.uniform(0.0, max(0.0, float(end_frame) - length))
+    if ref_start is None:
+        return empty
+
+    events, end_frame = augment_events(events, end_frame, factor, shift, velocity, tokenizer.config)
+    window = tokenizer.tokenize_window(events, end_frame, int(ref_start * factor), num_patches)
+    tokens = torch.full((c.max_patches, window["tokens"].shape[1]), PAD, dtype=torch.long)
+    tokens[:num_patches] = torch.from_numpy(window["tokens"])
+    valid = torch.zeros(c.max_patches, dtype=torch.bool)
+    valid[:num_patches] = torch.from_numpy(window["patch_valid"])
+    return {"ref_tokens": tokens, "ref_valid": valid, "style_present": torch.tensor(bool(valid.any()))}
 
 
 def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
