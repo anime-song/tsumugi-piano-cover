@@ -2,7 +2,7 @@
 
 1 小節 (= Global の 1 パッチ) のトークン列の文法:
     measure   := MTIME TS KEY CLEF1 CLEF2 OTTAVA* [SWING] [MLEN position] onset* (EOM | EOS)
-    onset     := position CLEF* OTTAVA* [SWING] DIRECTION* group*  position は小節の中で昇順
+    onset     := position CLEF* OTTAVA* [SWING] DIRECTION* [METRO_UNIT METRO_BPM] group*  position は小節の中で昇順
     position  := BEAT [FRAC]                                BEAT = 4 分音符単位の整数部、FRAC = 拍の中の分数
     group     := SV [CROSS] DUR ART* SLUR_STOP* SLUR_START* (PITCH [TIE] [GLISS])+
                                                            同じ位置・同じ声部の和音。音高は昇順
@@ -11,6 +11,8 @@ MTIME は演奏上の小節の開始時刻。最初の小節は「最初の音�
 ヘッダ (拍子・調・音部記号) は毎小節入れる。オクターブ記号は段ごとの状態として、ヘッダでは効いている段だけ入れ、
 小節の途中では状態が変わる位置に入れる (none で終わり)。スイングの指定も同じく曲全体の状態として入れる。
 MLEN は小節の長さが拍子と違うとき (弱起など) だけ入れる。
+DIRECTION は強弱・松葉・ペダル記号と、文字の指示 (rit. / a tempo などの速度の変化、cresc. / dim.)。
+メトロノーム記号 (♩ = 120 など) は基準の音符 METRO_UNIT と数値 METRO_BPM の 2 トークンで、1 つの位置に 1 つだけ。
 同じ位置の中は、音部記号の変更 -> 強弱などの指示 -> 塊 (段・声部の順、同じ声部では装飾音が先) の順に並べる。
 """
 
@@ -25,12 +27,16 @@ from .musicxml import ScoreError
 from .score import (
     ARTICULATIONS,
     CLEFS,
+    DYNAMIC_WORDS,
     DYNAMICS,
+    METRONOME_BPMS,
+    METRONOME_UNITS,
     OTTAVAS,
     PEDALS,
     STEP_PITCH_CLASS,
     STEPS,
     SWINGS,
+    TEMPO_WORDS,
     WEDGES,
     Group,
     Measure,
@@ -53,7 +59,11 @@ TOKEN_GROUPS = (
 TIME_SIGNATURE_BEATS = range(1, 25)
 TIME_SIGNATURE_BEAT_TYPES = (1, 2, 4, 8, 16, 32)
 DIRECTIONS = (
-    tuple(f"dyn_{d}" for d in DYNAMICS) + tuple(f"wedge_{w}" for w in WEDGES) + tuple(f"pedal_{p}" for p in PEDALS)
+    tuple(f"dyn_{d}" for d in DYNAMICS)
+    + tuple(f"wedge_{w}" for w in WEDGES)
+    + tuple(f"pedal_{p}" for p in PEDALS)
+    + tuple(f"tempo_{t}" for t in TEMPO_WORDS)
+    + tuple(f"text_{t}" for t in DYNAMIC_WORDS)
 )
 
 
@@ -79,6 +89,8 @@ class ScoreTokenizer:
         entries += [("beat", b, "position") for b in range(c.max_measure_quarters + 1)]
         entries += [("frac", f, "position") for f in self.fractions]
         entries += [("direction", d, "direction") for d in DIRECTIONS]
+        entries += [("metro_unit", u, "direction") for u in METRONOME_UNITS]
+        entries += [("metro_bpm", b, "direction") for b in METRONOME_BPMS]
         entries += [("sv", (s, v), "voice") for s in (1, 2) for v in range(1, 5)]
         entries += [("dur", d, "duration") for d in self.durations]
         entries += [("art", a, "articulation") for a in ARTICULATIONS]
@@ -141,6 +153,18 @@ class ScoreTokenizer:
     # ------------------------------------------------------------------
     # 移調 (学習時のデータの水増し)
     # ------------------------------------------------------------------
+    def scale_metronome(self, tokens: np.ndarray, factor: float) -> np.ndarray:
+        """演奏の時間を factor 倍にしたとき (factor > 1 で遅くなる) に合うよう、メトロノーム記号の数値を差し替える"""
+        first = self.ids[("metro_bpm", METRONOME_BPMS[0])]
+        bpms = np.asarray(METRONOME_BPMS, dtype=np.float64)
+        hit = (tokens >= first) & (tokens < first + len(bpms))
+        if not hit.any():
+            return tokens
+        scaled = bpms[tokens[hit] - first] / factor
+        out = tokens.copy()
+        out[hit] = first + np.abs(bpms[None, :] - scaled[:, None]).argmin(axis=1)
+        return out
+
     def transposition(self, semitones: int, keys: set[int]) -> np.ndarray | None:
         """semitones だけ移調したときの、各トークンの移調後の番号 [vocab_size]。
 
@@ -196,6 +220,7 @@ class ScoreTokenizer:
         if measure.length != measure.nominal_length:
             tokens += [MLEN, *self.position_tokens(measure.length)]
         directions: dict[Fraction, list[int]] = {}
+        metronomes: dict[Fraction, list[int]] = {}
         for position, name in measure.directions:
             if name.startswith("clef"):
                 token = self.token("clef", (int(name[4]), name.split("_", 1)[1]))
@@ -203,9 +228,16 @@ class ScoreTokenizer:
                 token = self.token("ottava", (int(name[6]), name.split("_", 1)[1]))
             elif name.startswith("swing"):
                 token = self.token("swing", name.split("_", 1)[1])
+            elif name.startswith("metronome"):
+                # 基準の音符 -> 数値 (番号もこの順なので、下で並べ替えても崩れない)。同じ位置に 2 つあれば後の方
+                unit, bpm = name.split("_", 1)[1].rsplit("_", 1)
+                metronomes[position] = [self.token("metro_unit", unit), self.token("metro_bpm", int(bpm))]
+                continue
             else:
                 token = self.token("direction", name)
             directions.setdefault(position, []).append(token)
+        for position, pair in metronomes.items():
+            directions.setdefault(position, []).extend(pair)
         groups: dict[Fraction, list[Group]] = {}
         for g in measure.groups:
             groups.setdefault(g.onset, []).append(g)
@@ -257,6 +289,7 @@ class ScoreTokenizer:
         directions: list[tuple[Fraction, str]] = []
         groups: list[Group] = []
         group: Group | None = None
+        unit: str | None = None  # 直前のメトロノーム記号の基準の音符 (次の数値と組にする)
         for token in sequence:
             if token in (PAD, EOM, EOS):
                 break
@@ -300,6 +333,12 @@ class ScoreTokenizer:
                     position += value
             elif kind == "direction" and position is not None:
                 directions.append((position, value))
+            elif kind == "metro_unit" and position is not None:
+                unit = value
+                continue
+            elif kind == "metro_bpm" and position is not None and unit is not None:
+                directions = [(p, d) for p, d in directions if p != position or not d.startswith("metronome")]
+                directions.append((position, f"metronome_{unit}_{value}"))
             elif kind == "sv" and position is not None:
                 group = Group(position, value[0], value[1], None, [])  # type: ignore[arg-type]
                 groups.append(group)
@@ -320,6 +359,7 @@ class ScoreTokenizer:
                 group.notes[-1].tie = True
             elif token == GLISS and group is not None and group.notes:
                 group.notes[-1].glissando = True
+            unit = None  # 基準の音符は直後の数値とだけ組にする
         measure = Measure(time_signature, key, (clefs[0], clefs[1]), Fraction(0), (ottavas[0], ottavas[1]), swing)
         measure.length = length if length is not None else measure.nominal_length
         measure.directions = sorted(set(directions))

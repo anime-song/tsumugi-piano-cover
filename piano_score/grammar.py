@@ -3,6 +3,7 @@
 文法の並びに加えて、次のことも守らせる。これで生成したトークン列は、そのまま読める楽譜として書き出せる。
 - 位置は小節の中で増え続け、小節の長さ (拍子か MLEN) を超えない。位置には指示か塊が 1 つ以上ある
 - 同じ位置の指示 (音部記号・オクターブ記号・スイング・強弱など) は番号の昇順で 1 つずつ、塊より前。状態を変えない指示は出さない
+- メトロノーム記号は基準の音符の直後に数値。1 つの位置に 1 つだけ (番号の昇順なので自然にそうなる)
 - 塊は段・声部の順 (同じ声部は装飾音が先)。声部の中で前の音が鳴っている間は次の塊を始めない。音は小節からはみ出さない
 - 和音の音高は昇順。スラーの終わりは開いているスラーがあるときだけ
 - 1 小節のトークン数の上限を超えない (残りが少ないと新しい位置や塊を始めない)
@@ -49,7 +50,10 @@ class _Vocab:
         self.pitch = ids("pitch")
         self.pitch_midi = np.array([tok.values[i][0] for i in self.pitch])
         # 位置ごとの指示 (番号の昇順に並べる)。音部記号 < オクターブ記号 < スイング < 強弱など
-        self.item = np.sort(np.concatenate([ids("clef"), ids("ottava"), ids("swing"), ids("direction")]))
+        self.item = np.sort(
+            np.concatenate([ids("clef"), ids("ottava"), ids("swing"), ids("direction"), ids("metro_unit")])
+        )
+        self.metro_bpm = ids("metro_bpm")
         # ヘッダに置けるのは効いているオクターブ記号とスイングだけ (none は置かない)
         self.header_extra = np.array(
             [i for i in np.concatenate([ids("ottava"), ids("swing")]) if _state_of(tok, int(i))[1] != "none"]
@@ -165,6 +169,8 @@ class ScoreGrammar:
                 if previous is not None and self.beat <= previous:
                     return mask  # 前の位置と同じ拍なので分数が要る
             self._allow_items(mask, remaining)
+        elif stage == "after_unit":
+            mask[v.metro_bpm] = True
         elif stage in ("after_sv", "after_cross"):
             if stage == "after_sv":
                 mask[CROSS] = True
@@ -207,7 +213,7 @@ class ScoreGrammar:
         v = self.v
         for token in v.item[v.item > self.last_item]:
             name, value = _state_of(self.tok, int(token))
-            if name == "direction":
+            if name == "direction" or (name == "metro_unit" and remaining >= 2):  # メトロノーム記号は数値の分も要る
                 mask[token] = True
             # 状態 (音部記号・オクターブ記号・スイング) は変えるときだけ、1 つの位置で 1 回。小節の頭の状態はヘッダに置く
             elif self.states.get(name) != value and name not in self.set_here and self.position > 0:
@@ -285,6 +291,13 @@ class ScoreGrammar:
             if self.stage != "header":
                 self.items_here += 1
                 self.stage = "items"
+        elif kind == "metro_unit":
+            self.last_item = token
+            self.items_here += 1
+            self.stage = "after_unit"
+        elif kind == "metro_bpm":
+            self.last_item = token
+            self.stage = "items"
         elif kind == "sv":
             self.sv = token
             self.last_sv = token  # 以降の塊はこの段・声部より後
