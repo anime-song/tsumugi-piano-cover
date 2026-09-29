@@ -26,6 +26,8 @@
 
 DTW の経路をそのまま使うとガタつく (4 秒の平滑化との差が上位 5% で 0.14 秒) ので、
 --smooth-seconds の移動平均をかける。カバーのリズムは伸縮せず、この対応は cross-attention の位置にだけ使う。
+移動平均の端は、端を中心に点対称に折り返して埋める (直線の傾きを保つ)。端の値で埋めると曲の冒頭と終わりの
+2 秒ほどで傾きが寝て、冒頭 5 秒の 2 秒ごとのテンポ比が 0.9-1.1 から外れる割合が 37% になっていた (折り返すと 26%)。
 """
 
 from __future__ import annotations
@@ -83,7 +85,7 @@ def cover_alignment(
     mapped = (np.interp(seconds, target, source) + source_offset) * frame_rate
     width = max(1, int(round(smooth * frame_rate / ALIGN_STEP)))
     if width > 1 and len(mapped) > 1:
-        padded = np.pad(mapped, (width // 2, width - 1 - width // 2), mode="edge")
+        padded = np.pad(mapped, (width // 2, width - 1 - width // 2), mode="reflect", reflect_type="odd")
         mapped = np.convolve(padded, np.ones(width) / width, mode="valid")
     return mapped.astype(np.float32)
 
