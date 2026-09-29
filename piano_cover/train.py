@@ -10,6 +10,7 @@
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
 --drift-prob の割合で窓の前半のカバーの時刻を原曲からずらし、後半で原曲に戻らせる (DriftConfig、exposure bias 対策)。
 検証の val/loss_resync はずらした直後の 2 パッチだけの損失で、ずれた状態から原曲に戻れるかを測る。
+生成評価では、生成したものが原曲の時刻とメロディにどれだけ合っているか (piano_cover.metrics) も測る。
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from piano_ar.train import limit_gpu_memory, lr_at, to_device
 
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
+from .metrics import sync_metrics
 from .model import CoverModel, SourceCondition
 from .source import SourceVocab, source_features
 
@@ -96,7 +98,8 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--sample-every", type=int, default=2000, help="0 で生成評価をしない")
     parser.add_argument("--sample-count", type=int, default=2)
-    parser.add_argument("--sample-seconds", type=float, default=30.0)
+    parser.add_argument("--sample-seconds", type=float, default=60.0)
+    parser.add_argument("--sample-source-cfg", type=float, default=1.75)
     parser.add_argument("--sample-temperature", type=float, default=1.0)
     parser.add_argument("--sample-top-p", type=float, default=0.95)
     for field in fields(CoverConfig):
@@ -197,9 +200,11 @@ def sample_evaluation(
                 top_p=args.sample_top_p,
                 context_patches=round(args.window_seconds / c.patch_seconds),
                 condition=condition,
+                condition_cfg_scale=args.sample_source_cfg,
             )[0]
         events = tokenizer.patches_to_events(patches)
-        stats.append(sample_stats(events, c.frame_rate))
+        sync = sync_metrics(events, cache.source_rows(source), c.frame_rate)
+        stats.append({**sample_stats(events, c.frame_rate), **sync})
         # wandb に動画 ID が残らないよう、キャッシュ内の番号で名前を付ける
         name = f"cover{i}_source{source}"
         path = sample_dir / f"step{step:07d}_{name}.mid"
@@ -219,7 +224,8 @@ def sample_evaluation(
                 )
     model.train()
 
-    mean_stats = {key: float(np.mean([s.get(key, 0.0) for s in stats])) for key in stats[0]} if stats else {}
+    keys = sorted({key for s in stats for key in s})
+    mean_stats = {key: float(np.mean([s[key] for s in stats if key in s])) for key in keys}
     logs.update({f"sample_stats/{k}": v for k, v in mean_stats.items()})
     print(
         f"[sample] step {step} {time.time() - started:.0f}s "
