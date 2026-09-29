@@ -374,6 +374,7 @@ class PianoARModel(nn.Module):
         prompts: list[list[list[int]]] | None = None,
         condition: GenerationConditionSource | None = None,
         condition_cfg_scale: float = 1.0,
+        time_bias: Tensor | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -381,6 +382,8 @@ class PianoARModel(nn.Module):
         cfg_scale > 1 ならチャンネル指定なしとの差を強調する classifier-free guidance を使う。
         prompts[i] (パッチごとのトークン列) を渡すと、サンプル i の先頭のパッチはそのトークンで埋めて続きを生成する。
         condition (原曲など) を渡すと cross-attention で条件を入れる。
+        time_bias [num_patches, patch_frames] を渡すと、パッチ内の各 onset の TIME トークンの logit にその値を足す
+        (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -448,7 +451,10 @@ class PianoARModel(nn.Module):
                 logits = self.local_forward(sequence, context, local_cross)[:, -1].float()
                 logits = guide(logits)
                 allowed = torch.stack([g.allowed() for g in grammars]).to(device)
-                next_token = _sample(logits.masked_fill(~allowed, float("-inf")), temperature, top_p)
+                logits = logits.masked_fill(~allowed, float("-inf"))
+                if time_bias is not None:
+                    logits = _bias_time(logits, time_bias[p].to(logits), tokenizer)
+                next_token = _sample(logits, temperature, top_p)
                 step = sequence.shape[1]
                 for i, prompt in enumerate(forced):
                     if prompt is not None and not grammars[i].finished:
@@ -466,6 +472,17 @@ class PianoARModel(nn.Module):
                 done[i] = g.song_end
             summaries.append(self.summarize_patches(sequence))
         return patches
+
+
+def _bias_time(logits: Tensor, bias: Tensor, tokenizer: PianoTokenizer) -> Tensor:
+    """TIME トークンの logit [N, patch_frames] に bias を足す。TIME 全体の確率は元に戻し、TIME の中の配分だけを変える。
+    TIME の確率ごと上げると「同じ onset に音を足す」が選ばれにくくなって和音が薄くなる (1 onset あたり 1.75 音 -> 1.04 音)"""
+    time = logits[:, tokenizer.time_offset : tokenizer.pitch_offset]
+    shifted = time + bias
+    before, after = time.logsumexp(-1, keepdim=True), shifted.logsumexp(-1, keepdim=True)
+    # TIME を出せない位置 (すべて -inf) はそのまま
+    shifted = torch.where(torch.isfinite(before), shifted - after + before, time)
+    return torch.cat((logits[:, : tokenizer.time_offset], shifted, logits[:, tokenizer.pitch_offset :]), dim=1)
 
 
 def _sample(logits: Tensor, temperature: float, top_p: float) -> Tensor:
