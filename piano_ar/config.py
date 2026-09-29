@@ -39,6 +39,9 @@ class ModelConfig:
     dropout: float = 0.1
     # 0 は「チャンネル指定なし」。事前学習で条件を落として学習するので無条件生成にも使える
     num_channels: int = 1
+    # パッチごとの強さ (平均ベロシティ) と音の多さを、曲の中で標準化して何段階の条件にするか (0 で使わない)。
+    # 以前のチェックポイントにはないので既定は 0 (新しく学習するときは piano_ar.train の既定値で入れる)
+    dynamics_bins: int = 0
 
     @classmethod
     def from_dict(cls, values: dict) -> ModelConfig:

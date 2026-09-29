@@ -240,6 +240,9 @@ class PianoARModel(nn.Module):
         self.bos = nn.Embedding(2, dim)
         self.pedal_embedding = nn.Embedding(2, dim)
         self.channel_embedding = nn.Embedding(config.num_channels, dim)
+        # パッチごとの強さと音の多さ (0 は指定なし)。強さの番号 0..bins と、音の多さの番号 + (bins + 1) を同じ表で引く
+        if config.dynamics_bins:
+            self.dynamics_embedding = nn.Embedding(2 * (config.dynamics_bins + 1), dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
@@ -249,6 +252,9 @@ class PianoARModel(nn.Module):
         self.head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
+        if config.dynamics_bins:
+            # 0 で始めて、足す前 (以前のチェックポイント) と同じ出力から学習する
+            nn.init.zeros_(self.dynamics_embedding.weight)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -276,10 +282,15 @@ class PianoARModel(nn.Module):
         pedal_state: Tensor,
         channel: Tensor,
         cross: CrossHook | None = None,
+        dynamics: Tensor | None = None,
     ) -> Tensor:
-        """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す"""
+        """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す。
+        dynamics [B, P, 2] はパッチ p の強さと音の多さの番号 (0 は指定なし)"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
+        if dynamics is not None and self.config.dynamics_bins:
+            offset = torch.tensor([0, self.config.dynamics_bins + 1], device=dynamics.device)
+            inputs = inputs + self.dynamics_embedding(dynamics + offset).sum(-2)
         return self.global_transformer(inputs, cross=cross)
 
     def local_forward(
@@ -364,6 +375,7 @@ class PianoARModel(nn.Module):
             batch["pedal_state"],
             batch["channel"],
             cross=condition.global_cross() if condition is not None else None,
+            dynamics=batch.get("dynamics"),
         )[patch_loss]
 
         loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
@@ -408,6 +420,7 @@ class PianoARModel(nn.Module):
         condition_cfg_scale: float = 1.0,
         time_bias: Tensor | None = None,
         end_after: int = 0,
+        dynamics: Tensor | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -418,6 +431,7 @@ class PianoARModel(nn.Module):
         time_bias [num_patches, patch_frames] を渡すと、パッチ内の各 onset の TIME トークンの logit にその値を足す
         (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
+        dynamics [num_patches, 2] はパッチごとの強さと音の多さの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -470,7 +484,10 @@ class PianoARModel(nn.Module):
             pedal = pedal.repeat(rows // num_samples, 1)
             song_start_tensor = torch.full((rows,), song_start, dtype=torch.long, device=device)
             global_cross = bound.global_cross(first, p) if bound is not None else None
-            context = self.global_forward(stacked, song_start_tensor, pedal, channels, global_cross)[:, -1]
+            window_dynamics = dynamics[first : p + 1][None].expand(rows, -1, -1) if dynamics is not None else None
+            context = self.global_forward(
+                stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics
+            )[:, -1]
 
             grammars = [PatchGrammar(tokenizer, pedal_states[i]) for i in range(num_samples)]
             for i in range(num_samples):
