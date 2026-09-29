@@ -3,6 +3,7 @@
     python -m piano_cover.train --wandb-project piano-cover
 
 --pretrained の重みでデコーダを初期化し、新しく足した部分は --lr、デコーダは --lr x --decoder-lr-scale で学習する。
+--freeze-decoder ならデコーダは固定して、新しく足した部分だけを学習する (Flamingo と同じ)。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
 スタイル参照で事前学習したデコーダなら、演奏者はチャンネルの代わりにスタイル参照 (同じカバーの別の場所や、
@@ -49,6 +50,12 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=20_000, help="optimizer の更新回数")
     parser.add_argument("--lr", type=float, default=3e-4, help="新しく足した部分の学習率")
     parser.add_argument("--decoder-lr-scale", type=float, default=0.3, help="事前学習済みのデコーダの学習率の倍率")
+    parser.add_argument(
+        "--freeze-decoder",
+        action="store_true",
+        help="事前学習済みのデコーダを固定する。カバーのデータへの過学習と、ピアノの生成の力の崩れを防ぐ。"
+        "デコーダの勾配と optimizer の状態が要らない分、メモリも減る",
+    )
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -92,6 +99,8 @@ def make_optimizer(model: CoverModel, args: argparse.Namespace) -> torch.optim.O
     new = {id(p) for p in model.new_parameters()}
     groups: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {}
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         decay = param.dim() >= 2 and "norm" not in name
         groups.setdefault((id(param) in new, decay), []).append(param)
     return torch.optim.AdamW(
@@ -303,6 +312,8 @@ def main() -> None:
 
     model = CoverModel(model_config, cover_config, tokenizer, vocab.size).to(device)
     model.set_gradient_checkpointing(not args.no_grad_checkpoint)
+    if args.freeze_decoder:
+        model.decoder.requires_grad_(False)
     optimizer = make_optimizer(model, args)
     step = 0
     best_val_loss = float("inf")
@@ -325,7 +336,11 @@ def main() -> None:
             )
         model.compile_blocks()
     new_count = sum(p.numel() for p in model.new_parameters())
-    print(f"パラメータ数 {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M (新規 {new_count / 1e6:.1f}M)")
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(
+        f"パラメータ数 {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M (新規 {new_count / 1e6:.1f}M"
+        f" / 学習する {sum(p.numel() for p in trainable) / 1e6:.1f}M)"
+    )
 
     wandb_run = None
     if args.wandb_project:
@@ -380,7 +395,7 @@ def main() -> None:
             running_tokens += tokens
             for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS]):
                 running[key] = running.get(key, 0.0) + float(output[key].detach()) * tokens
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
