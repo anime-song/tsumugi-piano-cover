@@ -88,6 +88,8 @@ def main() -> None:
         "cfg_scale": args.channel_cfg,
         "condition_cfg_scale": args.source_cfg,
         "context_patches": round(checkpoint["args"]["window_seconds"] / patch_seconds),
+        # 途中で EOS を出して止まらないよう、曲の終わりは原曲の最後の 2 パッチでだけ許す
+        "end_after": features["features"].shape[0] - 2,
     }
     if args.onset_bias:
         bias = onset_time_bias(
