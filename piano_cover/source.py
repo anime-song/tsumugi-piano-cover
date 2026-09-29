@@ -203,6 +203,33 @@ def onset_time_bias(
     return bias.reshape(num_patches, patch_frames).astype(np.float32)
 
 
+def trim_lead(rows: np.ndarray) -> tuple[np.ndarray, int]:
+    """原曲の最初の音より前 (無音や拍だけの部分) を詰め、詰めたフレーム数と一緒に返す。
+
+    学習ではカバーの先頭は原曲の最初の音のあと (中央値 0.55 秒後) に写るので、曲の始まりで原曲がまだ鳴っていない
+    状態を見たことがない。原曲の頭から生成すると、最初の音までの数秒 (中央値 1 秒、4 曲に 1 曲は 2.4 秒以上) は
+    原曲が無音のまま曲の始まりを生成することになり、冒頭が崩れたり EOS を出して止まったりする。
+    生成は最初の音から始め、出力を詰めたフレーム数だけ後ろにずらして原曲の時刻に戻す。
+    コードとキーは始まりの時点の値が分かるよう、最初の音より前の最後のものを 0 に置く。拍は捨てる。
+    """
+    notes = rows[rows[:, ROW_TYPE] == TYPE_NOTE]
+    if len(notes) == 0:
+        return rows, 0
+    lead = int(notes[:, ROW_ONSET].min())
+    rows = rows.astype(np.int64)
+    before = rows[:, ROW_ONSET] < lead
+    keep = ~before
+    for row_type in (TYPE_CHORD, TYPE_KEY):
+        earlier = np.flatnonzero(before & (rows[:, ROW_TYPE] == row_type))
+        if len(earlier):
+            last = earlier[np.argmax(rows[earlier, ROW_ONSET])]
+            rows[last, ROW_ONSET] = lead
+            keep[last] = True
+    rows = rows[keep]
+    rows[:, ROW_ONSET] -= lead
+    return sort_rows(rows).astype(np.int32), lead
+
+
 def sort_rows(rows: np.ndarray) -> np.ndarray:
     return rows[np.lexsort((rows[:, ROW_A], rows[:, ROW_TYPE], rows[:, ROW_ONSET]))]
 

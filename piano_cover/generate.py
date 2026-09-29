@@ -4,6 +4,7 @@ python -m piano_cover.generate --checkpoint checkpoints/piano_cover/best.pt --so
 python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.75 --onset-bias 4 --seconds 60 --wav
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
+生成は原曲の最初の音から始め (trim_lead)、出力はそのぶん後ろにずらして原曲の時刻に戻す。
 --onset-bias を付けると、出力の onset を原曲の onset (全楽器の音と拍) に寄せる (onset_time_bias)。
 """
 
@@ -23,7 +24,7 @@ from piano_ar.tokenizer import PianoTokenizer
 from .config import CoverConfig
 from .data import source_tensors
 from .model import CoverModel, SourceCondition
-from .source import SourceVocab, load_source, onset_time_bias, source_features
+from .source import SourceVocab, load_source, onset_time_bias, source_features, trim_lead
 
 
 def main() -> None:
@@ -73,6 +74,8 @@ def main() -> None:
             channel = json.loads(Path(checkpoint["channel_index"]).read_text(encoding="utf-8"))[args.channel]
 
     rows, end_frame = load_source(args.source, tokenizer.config.frame_rate)
+    rows, lead = trim_lead(rows)
+    end_frame -= lead
     features = source_features(rows, end_frame, tokenizer, SourceVocab(tokenizer.config), cover_config.max_source_rows)
     source = {key: value.to(device) for key, value in source_tensors(features).items()}
     patch_seconds = tokenizer.config.patch_seconds
@@ -108,6 +111,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for i, patches in enumerate(samples):
         events = tokenizer.patches_to_events(patches)
+        events[:, 0] += lead  # 原曲の時刻に戻す
         manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
         tokenizer.events_to_midi(events, path)
