@@ -22,6 +22,8 @@ from .tokenizer import PAD, TOKEN_GROUPS, PatchGrammar, PianoTokenizer
 
 # Transformer のブロックの後に挟む処理 (ブロック番号, x) -> x。カバーモデルの cross-attention に使う
 CrossHook = Callable[[int, Tensor], Tensor]
+# Local の最後の出力 (h, logits) -> logits。カバーモデルで原曲の onset の位置を TIME の予測に足すのに使う
+OutputHook = Callable[[Tensor, Tensor], Tensor]
 
 
 class Condition(Protocol):
@@ -33,6 +35,8 @@ class Condition(Protocol):
         """index は有効なパッチを並べたときの番号、prefix はそのパッチの Local の入力トークン [N, T]"""
         ...
 
+    def local_output(self, index: Tensor, prefix: Tensor) -> OutputHook | None: ...
+
 
 class GenerationCondition(Protocol):
     def global_cross(self, first: int, last: int) -> CrossHook:
@@ -40,6 +44,8 @@ class GenerationCondition(Protocol):
         ...
 
     def local_cross(self, patch: int, prefix: Tensor) -> CrossHook: ...
+
+    def local_output(self, patch: int, prefix: Tensor) -> OutputHook | None: ...
 
 
 class GenerationConditionSource(Protocol):
@@ -276,11 +282,15 @@ class PianoARModel(nn.Module):
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
         return self.global_transformer(inputs, cross=cross)
 
-    def local_forward(self, prefix: Tensor, context: Tensor, cross: CrossHook | None = None) -> Tensor:
+    def local_forward(
+        self, prefix: Tensor, context: Tensor, cross: CrossHook | None = None, output: OutputHook | None = None
+    ) -> Tensor:
         """prefix [N, T] の続きを予測する logits [N, T+1, V] を返す"""
         bos = self.local_bos.to(self.token_embedding.weight.dtype).expand(prefix.shape[0], 1, -1)
         x = torch.cat((bos, self.token_embedding(prefix)), dim=1) + self.local_context(context)[:, None]
-        return self.head(self.local_transformer(x, cross=cross))
+        h = self.local_transformer(x, cross=cross)
+        logits = self.head(h)
+        return output(h, logits) if output is not None else logits
 
     # ------------------------------------------------------------------
     # 学習
@@ -341,8 +351,11 @@ class PianoARModel(nn.Module):
         counts = torch.zeros(len(self.group_names), device=tokens.device)
         for index, length in buckets:
             target = flat[index, :length]
-            cross = condition.local_cross(index, target[:, :-1]) if condition is not None else None
-            logits = self.local_forward(target[:, :-1], context[index], cross)
+            cross = output = None
+            if condition is not None:
+                cross = condition.local_cross(index, target[:, :-1])
+                output = condition.local_output(index, target[:, :-1])
+            logits = self.local_forward(target[:, :-1], context[index], cross, output)
             token_loss = F.cross_entropy(
                 logits.float().reshape(-1, self.vocab_size), target.reshape(-1), ignore_index=PAD, reduction="none"
             )
@@ -448,7 +461,8 @@ class PianoARModel(nn.Module):
             sequence = torch.zeros(rows, 0, dtype=torch.long, device=device)
             while not all(g.finished for g in grammars):
                 local_cross = bound.local_cross(p, sequence) if bound is not None else None
-                logits = self.local_forward(sequence, context, local_cross)[:, -1].float()
+                local_output = bound.local_output(p, sequence) if bound is not None else None
+                logits = self.local_forward(sequence, context, local_cross, local_output)[:, -1].float()
                 logits = guide(logits)
                 allowed = torch.stack([g.allowed() for g in grammars]).to(device)
                 logits = logits.masked_fill(~allowed, float("-inf"))

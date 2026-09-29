@@ -5,6 +5,8 @@
     Global: 数ブロックごとに、対応する時刻 ± global_cross_window パッチの原曲のメモリへ cross-attention
     Local : 数ブロックごとに、対応するパッチ ± local_cross_radius パッチの原曲の各行へ cross-attention
 
+    onset_head_dim > 0 なら OnsetHead: Local の TIME の予測に、候補の各時刻の近くにある原曲の onset を直接足す
+
 「対応する時刻」は、学習時はアラインメント (カバー -> 原曲)、生成時は原曲の時間軸の上に生成するので恒等写像。
 cross-attention の RoPE の位置は、クエリに対応する原曲の時刻、キーに原曲の時刻を使うので、時刻の差で見る場所が決まる。
 曲全体の構造 (サビの繰り返しなど) は SongEncoder が各パッチのメモリに埋め込むので、デコーダは近くだけ見ればよい。
@@ -21,10 +23,11 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from piano_ar.config import ModelConfig
-from piano_ar.model import Block, CrossBlock, CrossHook, PianoARModel, Transformer
+from piano_ar.model import Block, CrossBlock, CrossHook, OutputHook, PianoARModel, Transformer
 from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
+from .source import DRUM_ID, ONSET_GROUPS, TYPE_BEAT, TYPE_CHORD, TYPE_NOTE, SourceVocab, onset_group_tables
 
 # 原曲のパッチエンコーダに一度に通すトークン数 (パッチ数 x (要約 + 行数)) の上限。学習時の中間のメモリがこれで決まる
 CHUNK_TOKENS = 16384
@@ -40,6 +43,7 @@ class SourceMemory:
     rows: Tensor  # [U, R, D] Local が見るパッチ (needed) の各行のベクトル
     row_onset: Tensor  # [U, R] 行の絶対フレーム
     row_valid: Tensor  # [U, R]
+    row_group: Tensor  # [U, R] onset の種類 (OnsetHead 用。使わないときや onset でない行は -1)
     lookup: Tensor  # [B, S] rows の何番目か (Local が見ないパッチは -1)
 
 
@@ -51,6 +55,72 @@ def query_onsets(prefix: Tensor, tokenizer: PianoTokenizer) -> Tensor:
     current = values.cummax(dim=1).values if prefix.shape[1] else values
     # 生成の最初 (prefix が空) でも BOS の位置の 1 列は必要なので、prefix[:, :1] ではなく明示的に作る
     return torch.cat((prefix.new_zeros(prefix.shape[0], 1), current), dim=1).float()
+
+
+class OnsetHead(nn.Module):
+    """学習できる onset-bias。Local の TIME (次の onset) の予測に、候補の各時刻の近くにある原曲の onset を直接足す。
+
+    cross-attention は原曲のどこを見るかは合っているが、読み取った中身に「今からあと何フレーム先の音か」が入らないので、
+    次の onset は事前学習のデコーダの自分のリズムで決まり、生成でテンポが少しずつずれていく。
+    ここでは候補の時刻 t (パッチ内のフレーム) ごとに、原曲の対応する時刻の近くにある onset の量を種類 (ONSET_GROUPS) と
+    幅 (WIDTHS) ごとに数えた特徴を作り、Local の出力 h との内積を TIME の logit に足す。どの種類の onset に
+    どれだけ寄せるかは h (いまの文脈) で決まる。TIME 全体の確率は元に戻し、TIME の中の配分だけを変える
+    (和音の音数などは変えない)。query を 0 で初期化するので、学習の始めは足す前と同じ出力になる。
+    """
+
+    WIDTHS = (2.0, 6.0)  # フレーム
+
+    def __init__(self, dim: int, hidden: int, tokenizer: PianoTokenizer) -> None:
+        super().__init__()
+        self.patch_frames = tokenizer.patch_frames
+        self.time_slice = slice(tokenizer.time_offset, tokenizer.pitch_offset)
+        self.offset = SourceVocab(tokenizer.config).offset
+        instrument, drum, row_type = onset_group_tables()
+        self.register_buffer("instrument_group", torch.from_numpy(instrument), persistent=False)
+        self.register_buffer("drum_group", torch.from_numpy(drum), persistent=False)
+        self.register_buffer("type_group", torch.from_numpy(row_type), persistent=False)
+        self.candidate = nn.Sequential(
+            nn.Linear(len(ONSET_GROUPS) * len(self.WIDTHS), hidden), nn.SiLU(), nn.Linear(hidden, hidden)
+        )
+        self.query = nn.Linear(dim, hidden, bias=False)
+
+    def row_groups(self, features: Tensor) -> Tensor:
+        """原曲の行の特徴 [..., 5] (埋め込み表の番号) -> onset の種類 [...] (-1 は onset として使わない行)"""
+        o = self.offset
+        kind = features[..., 0] - o["type"]  # パディングは -1
+        instrument = (features[..., 4] - o["instrument"]).clamp(0, len(self.instrument_group) - 1)
+        pitch = (features[..., 1] - o["pitch"]).clamp(0, 127)
+        note = torch.where(instrument == DRUM_ID, self.drum_group[pitch], self.instrument_group[instrument])
+        downbeat = features[..., 1] - o["downbeat"] == 1
+        beat = torch.where(downbeat, ONSET_GROUPS.index("downbeat"), ONSET_GROUPS.index("beat"))
+        group = self.type_group[kind.clamp(0, len(self.type_group) - 1)]
+        group = torch.where(kind == TYPE_NOTE, note, group)
+        group = torch.where(kind == TYPE_BEAT, beat, group)
+        return torch.where(kind >= 0, group, -1)
+
+    @torch.no_grad()
+    def features(self, onset: Tensor, group: Tensor, valid: Tensor, start: Tensor, end: Tensor) -> Tensor:
+        """候補の onset (パッチ内の各フレーム) の近くにある原曲の onset の量 [N, F, 種類 x 幅]。
+        onset / group / valid [N, M] は Local が見る原曲の行、start / end [N] はパッチに対応する原曲の区間 (フレーム)"""
+        F_ = self.patch_frames
+        t = torch.arange(F_, device=onset.device, dtype=torch.float32)
+        source_time = start.float()[:, None] + (end - start).float()[:, None] * t / F_  # [N, F]
+        distance = onset.float()[:, None, :] - source_time[:, :, None]  # [N, F, M]
+        use = valid & (group >= 0)
+        one_hot = F.one_hot(group.clamp(min=0), len(ONSET_GROUPS)).float() * use[..., None]  # [N, M, G]
+        parts = [torch.exp(-0.5 * (distance / width) ** 2) @ one_hot for width in self.WIDTHS]
+        return torch.log1p(torch.cat(parts, dim=-1))
+
+    def forward(self, h: Tensor, logits: Tensor, features: Tensor) -> Tensor:
+        """h [N, T, D], logits [N, T, V], features [N, F, *] -> TIME の中の配分を変えた logits"""
+        with torch.autocast(h.device.type, enabled=False):
+            bias = torch.einsum("ntk,nfk->ntf", self.query(h.float()), self.candidate(features))
+            logits = logits.float()
+            s = self.time_slice
+            time = logits[..., s]
+            shifted = time + bias
+            time = shifted - shifted.logsumexp(-1, keepdim=True) + time.logsumexp(-1, keepdim=True)
+            return torch.cat((logits[..., : s.start], time, logits[..., s.stop :]), dim=-1)
 
 
 class CoverModel(nn.Module):
@@ -92,6 +162,9 @@ class CoverModel(nn.Module):
 
         self.global_cross = nn.ModuleList(make_cross() for _ in self.global_cross_blocks)
         self.local_cross = nn.ModuleList(make_cross() for _ in self.local_cross_blocks)
+        self.onset_head = (
+            OnsetHead(model_config.dim, cover_config.onset_head_dim, tokenizer) if cover_config.onset_head_dim else None
+        )
         self.gradient_checkpointing = False
 
         for module in (self.source_embedding, self.source_onset, self.latent_slot, self.patch_encoder,
@@ -99,6 +172,9 @@ class CoverModel(nn.Module):
             module.apply(PianoARModel._init_weights)
         with torch.no_grad():
             self.source_embedding.weight[0].zero_()
+        if self.onset_head is not None:
+            self.onset_head.apply(PianoARModel._init_weights)
+            nn.init.zeros_(self.onset_head.query.weight)
 
     def new_parameters(self) -> list[nn.Parameter]:
         """事前学習にない (新しく足した) パラメータ"""
@@ -206,13 +282,18 @@ class CoverModel(nn.Module):
             rows[target, : values.shape[1]] = values.to(rows.dtype)
         row_onset = torch.zeros(max(num_needed, 1), row_width, device=device)
         valid_rows = torch.zeros(max(num_needed, 1), row_width, dtype=torch.bool, device=device)
+        row_group = torch.full((max(num_needed, 1), row_width), -1, dtype=torch.long, device=device)
         if num_needed:
             needed_rows = needed_flat.nonzero().squeeze(1)
             row_onset[lookup_flat[needed_rows]] = onset[needed_rows, :row_width].float()
             valid_rows[lookup_flat[needed_rows]] = patch_rows_valid[needed_rows, :row_width]
+            if self.onset_head is not None:
+                row_group[lookup_flat[needed_rows]] = self.onset_head.row_groups(
+                    patch_features[needed_rows, :row_width]
+                )
         lookup = torch.full((B, S), -1, dtype=torch.long, device=device)
         lookup[patch_valid] = lookup_flat
-        return SourceMemory(song, song_pos, song_valid, rows, row_onset, valid_rows, lookup)
+        return SourceMemory(song, song_pos, song_valid, rows, row_onset, valid_rows, row_group, lookup)
 
     def local_neighbors(self, centers: Tensor, lookup_rows: Tensor) -> Tensor:
         """原曲のパッチ centers [N] の ± local_cross_radius を lookup_rows [N, S] で rows の番号にする (範囲外は -1)"""
@@ -232,6 +313,15 @@ class CoverModel(nn.Module):
         valid = (memory.row_valid[safe] & (index >= 0)[..., None]).reshape(n, -1)
         pos = memory.row_onset[safe].reshape(n, -1) - start[:, None]
         return rows, pos, valid
+
+    def local_onsets(self, memory: SourceMemory, index: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """index [N, 2r+1] の rows の (原曲の絶対フレーム, onset の種類, 有効) [N, M] (OnsetHead 用)"""
+        n = index.shape[0]
+        safe = index.clamp(min=0)
+        onset = memory.row_onset[safe].reshape(n, -1)
+        group = memory.row_group[safe].reshape(n, -1)
+        valid = (memory.row_valid[safe] & (index >= 0)[..., None]).reshape(n, -1)
+        return onset, group, valid
 
     # ------------------------------------------------------------------
     # 学習
@@ -305,6 +395,15 @@ class _TrainingCondition:
 
         return hook
 
+    def local_output(self, index: Tensor, prefix: Tensor) -> OutputHook | None:
+        head = self.model.onset_head
+        if head is None:
+            return None
+        align = self.local_align[index]
+        onset, group, valid = self.model.local_onsets(self.memory, self.local_index[index])
+        features = head.features(onset, group, valid, align[:, 0], align[:, 1])
+        return lambda h, logits: head(h, logits, features)
+
 
 # ----------------------------------------------------------------------
 # 生成
@@ -364,3 +463,17 @@ class _BoundSourceCondition:
             return model.local_cross[model.local_cross_blocks.index(i)](x, q_pos, rows, k_pos, mask)
 
         return hook
+
+    def local_output(self, patch: int, prefix: Tensor) -> OutputHook | None:
+        model, memory = self.model, self.memory
+        head = model.onset_head
+        if head is None:
+            return None
+        device = memory.song.device
+        F_ = model.patch_frames
+        index = model.local_neighbors(torch.tensor([patch], device=device), memory.lookup)
+        onset, group, valid = (t.expand(self.rows, -1) for t in model.local_onsets(memory, index))
+        start = torch.full((self.rows,), patch * F_, dtype=torch.float32, device=device)
+        # CFG の「原曲なし」の行は onset を見せない (特徴が 0 なら TIME の中で一定の値になり、配分は変わらない)
+        features = head.features(onset, group, valid & self.conditioned[:, None], start, start + F_)
+        return lambda h, logits: head(h, logits, features)

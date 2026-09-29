@@ -153,6 +153,34 @@ def load_source(path: str | Path, frame_rate: int) -> tuple[np.ndarray, int]:
     return sort_rows(array).astype(np.int32), end_frame
 
 
+# 学習できる onset-bias (CoverModel の OnsetHead) で原曲の onset を分ける種類
+ONSET_GROUPS = ("melody", "keys", "guitar", "bass", "other", "kick", "snare", "drums", "beat", "downbeat", "chord")
+_INSTRUMENT_ONSET_GROUP = {
+    "melody": "melody", "vocal_harmony": "melody",
+    "piano": "keys", "electric_piano": "keys", "organ": "keys", "plucked_keyboard": "keys",
+    "chromatic_percussion": "keys", "accordion_family": "keys",
+    "acoustic_guitar": "guitar", "distorted_guitar": "guitar", "electric_guitar_clean": "guitar",
+    "electric_guitar_muted": "guitar", "guitar_harmonics": "guitar",
+    "acoustic_bass": "bass", "electric_bass": "bass", "slap_bass": "bass", "synth_bass": "bass",
+}  # fmt: skip
+_KICK, _SNARE = (35, 36), (37, 38, 39, 40)
+
+
+def onset_group_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """行から onset の種類 (ONSET_GROUPS の番号、-1 は使わない) を引く表。
+
+    返り値は (楽器 -> 種類, ドラムの打楽器番号 -> 種類, 種類の番号 -> 種類)。
+    行の種類が NOTE なら楽器 (ドラムは打楽器番号) で、BEAT は小節の頭かどうか、CHORD はコードの変わり目で分ける"""
+    group = {name: i for i, name in enumerate(ONSET_GROUPS)}
+    instrument = np.array([group[_INSTRUMENT_ONSET_GROUP.get(name, "other")] for name in INSTRUMENTS], dtype=np.int64)
+    drum = np.full(128, group["drums"], dtype=np.int64)
+    drum[list(_KICK)] = group["kick"]
+    drum[list(_SNARE)] = group["snare"]
+    row_type = np.full(NUM_TYPES, -1, dtype=np.int64)
+    row_type[TYPE_CHORD] = group["chord"]
+    return instrument, drum, row_type
+
+
 def onset_time_bias(
     rows: np.ndarray, num_patches: int, patch_frames: int, strength: float, width_frames: float
 ) -> np.ndarray:
