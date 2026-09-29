@@ -7,6 +7,10 @@ from dataclasses import dataclass
 class CoverConfig:
     """カバーモデルで足す部分 (原曲エンコーダと cross-attention)。デコーダは ModelConfig のまま"""
 
+    # 原曲エンコーダと cross-attention の中の幅。0 ならデコーダと同じ。デコーダを大きくしても足す部分を
+    # 大きくしすぎない (カバーのデータは 150 時間ほどなので過学習しやすい) よう、細くできるようにする。
+    # ヘッドの次元はデコーダと同じにして、ヘッド数を幅に合わせて減らす
+    source_dim: int = 0
     # 原曲の 1 パッチ (デコーダと同じ 2 秒) の行を K 本の要約にまとめる双方向 Transformer
     source_patch_layers: int = 2
     source_latents: int = 4
