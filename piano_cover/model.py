@@ -13,7 +13,7 @@ cross-attention の RoPE の位置は、クエリに対応する原曲の時刻�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -65,16 +65,19 @@ class CoverModel(nn.Module):
         self.config = cover_config
         self.tokenizer = tokenizer
         self.patch_frames = tokenizer.patch_frames
-        dim = model_config.dim
         self.decoder = PianoARModel(model_config, tokenizer)
 
+        # 原曲エンコーダと cross-attention の中は source_dim の幅 (ヘッドの次元はデコーダと同じ)
+        dim = cover_config.source_dim or model_config.dim
+        heads = dim // (model_config.dim // model_config.heads)
+        source_config = replace(model_config, dim=dim, heads=heads)
         K = cover_config.source_latents
         self.source_embedding = nn.Embedding(source_vocab_size, dim, padding_idx=0)
         self.source_onset = nn.Embedding(tokenizer.patch_frames, dim)
         self.latent_queries = nn.Parameter(torch.randn(K, dim) * 0.02)
         self.latent_slot = nn.Embedding(K, dim)
-        self.patch_encoder = Transformer(model_config, cover_config.source_patch_layers, causal=False)
-        self.song_encoder = Transformer(model_config, cover_config.source_song_layers, causal=False)
+        self.patch_encoder = Transformer(source_config, cover_config.source_patch_layers, causal=False)
+        self.song_encoder = Transformer(source_config, cover_config.source_song_layers, causal=False)
 
         def cross_layers(num_blocks: int, every: int) -> list[int]:
             return [i for i in range(num_blocks) if (i + 1) % every == 0]
@@ -83,7 +86,9 @@ class CoverModel(nn.Module):
         self.local_cross_blocks = cross_layers(model_config.local_layers, cover_config.local_cross_every)
 
         def make_cross() -> CrossBlock:
-            return CrossBlock(dim, model_config.heads, model_config.mlp_ratio, model_config.dropout)
+            return CrossBlock(
+                model_config.dim, heads, model_config.mlp_ratio, model_config.dropout, memory_dim=dim, inner_dim=dim
+            )
 
         self.global_cross = nn.ModuleList(make_cross() for _ in self.global_cross_blocks)
         self.local_cross = nn.ModuleList(make_cross() for _ in self.local_cross_blocks)

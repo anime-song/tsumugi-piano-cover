@@ -153,24 +153,39 @@ class Transformer(nn.Module):
 
 class CrossBlock(nn.Module):
     """ゲート付きの cross-attention + MLP (Flamingo 型)。キーには常に見られる学習済みの「空」のキーを 1 つ足す
-    (原曲がない窓や、範囲内に何もないときの行き先)"""
+    (原曲がない窓や、範囲内に何もないときの行き先)。
 
-    def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
+    memory_dim はキー側 (原曲エンコーダなど) の幅、inner_dim は attention と MLP の中間の幅 (省略でどちらも dim)。
+    dim より細くすると、残差の幅はデコーダのまま、足す部分のパラメータを減らせる。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        memory_dim: int | None = None,
+        inner_dim: int | None = None,
+    ) -> None:
         super().__init__()
+        memory_dim = memory_dim or dim
+        inner_dim = inner_dim or dim
         self.heads = heads
         self.dropout = dropout
-        head_dim = dim // heads
+        self.inner_dim = inner_dim
+        head_dim = inner_dim // heads
         self.norm = RMSNorm(dim)
-        self.memory_norm = RMSNorm(dim)
-        self.q = nn.Linear(dim, dim, bias=False)
-        self.kv = nn.Linear(dim, dim * 2, bias=False)
+        self.memory_norm = RMSNorm(memory_dim)
+        self.q = nn.Linear(dim, inner_dim, bias=False)
+        self.kv = nn.Linear(memory_dim, inner_dim * 2, bias=False)
         self.q_norm = RMSNorm(head_dim)
         self.k_norm = RMSNorm(head_dim)
         self.null_k = nn.Parameter(torch.randn(heads, head_dim) * 0.02)
         self.null_v = nn.Parameter(torch.zeros(heads, head_dim))
-        self.out = nn.Linear(dim, dim, bias=False)
+        self.out = nn.Linear(inner_dim, dim, bias=False)
         self.mlp_norm = RMSNorm(dim)
-        hidden = int(dim * mlp_ratio * 2 / 3 + 63) // 64 * 64
+        hidden = int(inner_dim * mlp_ratio * 2 / 3 + 63) // 64 * 64
         self.gate_up = nn.Linear(dim, hidden * 2, bias=False)
         self.down = nn.Linear(hidden, dim, bias=False)
         self.attn_gate = nn.Parameter(torch.zeros(1))
@@ -178,9 +193,9 @@ class CrossBlock(nn.Module):
         self.residual_dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
-        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, D], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
-        batch, length, dim = x.shape
-        head_dim = dim // self.heads
+        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
+        batch, length, _ = x.shape
+        head_dim = self.inner_dim // self.heads
         q = self.q(self.norm(x)).view(batch, length, self.heads, head_dim).transpose(1, 2)
         k, v = self.kv(self.memory_norm(memory)).view(batch, -1, 2, self.heads, head_dim).permute(2, 0, 3, 1, 4)
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
@@ -191,7 +206,7 @@ class CrossBlock(nn.Module):
         k, v = torch.cat((null_k, k), dim=2), torch.cat((null_v, v), dim=2)
         mask = F.pad(mask, (1, 0), value=True)[:, None]
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
-        attn = self.out(attn.transpose(1, 2).reshape(batch, length, dim))
+        attn = self.out(attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
         x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(attn)
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + torch.tanh(self.mlp_gate).to(x.dtype) * self.residual_dropout(self.down(F.silu(gate) * up))
