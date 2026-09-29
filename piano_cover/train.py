@@ -73,12 +73,13 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--song-start-prob", type=float, default=0.1)
+    # 曲の頭から始まる窓の割合。生成の冒頭は文脈がなくアラインメントも悪いので、多めに学習する
+    parser.add_argument("--song-start-prob", type=float, default=0.3)
     parser.add_argument("--channel-dropout", type=float, default=0.15)
     parser.add_argument("--source-dropout", type=float, default=0.1, help="原曲を外す確率 (CFG 用)")
     parser.add_argument("--structure-dropout", type=float, default=0.2, help="拍・コード・キーをそれぞれ外す確率")
     parser.add_argument(
-        "--drift-prob", type=float, default=0.0, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
+        "--drift-prob", type=float, default=0.5, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
     )
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -255,7 +256,7 @@ def main() -> None:
     cover_config = CoverConfig(**{f.name: getattr(args, f.name) for f in fields(CoverConfig)})
     if args.init_cover:
         pretrained = torch.load(args.init_cover, map_location="cpu", weights_only=False, mmap=True)
-        cover_config = replace(CoverConfig(**pretrained["cover_config"]), onset_head_dim=args.onset_head_dim)
+        cover_config = replace(CoverConfig.from_dict(pretrained["cover_config"]), onset_head_dim=args.onset_head_dim)
     else:
         pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):

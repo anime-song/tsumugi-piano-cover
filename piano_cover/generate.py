@@ -59,7 +59,7 @@ def main() -> None:
     # CPU で必要な分だけ読んで (mmap) モデルの重みだけを GPU に移す
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True)
     tokenizer = PianoTokenizer(TokenizerConfig(**checkpoint["tokenizer_config"]))
-    cover_config = CoverConfig(**checkpoint["cover_config"])
+    cover_config = CoverConfig.from_dict(checkpoint["cover_config"])
     model = CoverModel(
         ModelConfig.from_dict(checkpoint["model_config"]), cover_config, tokenizer, checkpoint["source_vocab_size"]
     ).to(device)
