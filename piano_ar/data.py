@@ -4,7 +4,6 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import torch
@@ -34,21 +33,6 @@ class AugmentConfig:
     time_stretch: float = 0.1
     # 全体のベロシティのずらし幅 (±)
     velocity_shift: int = 10
-
-
-@dataclass(frozen=True)
-class StyleConfig:
-    """スタイル参照の取り方"""
-
-    # 参照の長さ (パッチ数)。学習時はこの範囲からランダムに選ぶ
-    min_patches: int = 4
-    max_patches: int = 16
-    # 同じ曲から取る確率。残りは同じ演奏者の別の曲 (演奏者が分からない・1 曲しかないときは同じ曲)
-    same_song_prob: float = 0.7
-    # 同じ曲から取るとき、学習する窓からこれだけ離す (同じフレーズを写さないように)
-    gap_patches: int = 2
-    # スタイルを外す確率 (CFG 用)
-    dropout: float = 0.15
 
 
 class PretrainingCache:
@@ -135,7 +119,6 @@ class PianoWindowDataset(Dataset):
         augment: AugmentConfig | None = None,
         song_start_prob: float = 0.1,
         channel_dropout: float = 0.15,
-        style: StyleConfig | None = None,
     ) -> None:
         self.cache = cache
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
@@ -145,13 +128,6 @@ class PianoWindowDataset(Dataset):
         self.song_start_prob = song_start_prob
         self.channel_dropout = channel_dropout if self.train else 0.0
         self.songs = np.flatnonzero(~cache.is_val if self.train else cache.is_val)
-        # style を渡すとチャンネルの代わりにスタイル参照で条件付けする (チャンネルは常に 0)
-        self.style = style
-        self.songs_of_performer: dict[int, np.ndarray] = {}
-        if style is not None:
-            performers = cache.performers[self.songs]
-            for performer in np.unique(performers[performers >= 0]):
-                self.songs_of_performer[int(performer)] = self.songs[performers == performer]
 
     def __len__(self) -> int:
         return len(self.songs)
@@ -160,7 +136,6 @@ class PianoWindowDataset(Dataset):
         song = int(self.songs[index])
         events = self.cache.song_events(song)
         end_frame = int(self.cache.end_frames[song])
-        factor, velocity = 1.0, 0
         if self.augment is not None:
             a = self.augment
             factor = random.uniform(1 - a.time_stretch, 1 + a.time_stretch) if a.time_stretch > 0 else 1.0
@@ -179,41 +154,15 @@ class PianoWindowDataset(Dataset):
         window = self.tokenizer.tokenize_window(events, end_frame, start, self.window_patches)
 
         channel = int(self.cache.channels[song])
-        if self.style is not None or random.random() < self.channel_dropout:
+        if random.random() < self.channel_dropout:
             channel = 0
-        item = {
+        return {
             "tokens": torch.from_numpy(window["tokens"]),
             "patch_valid": torch.from_numpy(window["patch_valid"]),
             "pedal_state": torch.from_numpy(window["pedal_state"]),
             "channel": torch.tensor(channel),
             "song_start": torch.tensor(int(song_start)),
         }
-        if self.style is not None:
-            # 窓の範囲を元の (伸縮前の) 時間に戻して、参照が窓と重ならないようにする
-            window_range = (start / factor, (start + window_frames) / factor)
-            item.update(self._reference(song, window_range, velocity))
-        return item
-
-    def _reference(self, song: int, window_range: tuple[float, float], velocity: int) -> dict[str, torch.Tensor]:
-        others = self.songs_of_performer.get(int(self.cache.performers[song]), np.zeros(0, dtype=np.int64))
-        others = others[others != song]
-
-        def pick_other() -> tuple[np.ndarray, int]:
-            other = int(random.choice(others))
-            return self.cache.song_events(other), int(self.cache.end_frames[other])
-
-        return style_reference(
-            self.tokenizer,
-            self.style,
-            self.augment,
-            self.train,
-            self.cache.song_events(song),
-            int(self.cache.end_frames[song]),
-            window_range,
-            velocity,
-            pick_other if len(others) else None,
-        )
-
 
 def augment_events(
     events: np.ndarray, end_frame: int, factor: float, shift: int, velocity: int, config: TokenizerConfig
@@ -228,87 +177,11 @@ def augment_events(
     return sort_events(np.asarray(events)), end_frame
 
 
-def style_reference(
-    tokenizer: PianoTokenizer,
-    style: StyleConfig,
-    augment: AugmentConfig | None,
-    train: bool,
-    events: np.ndarray,
-    end_frame: int,
-    window_range: tuple[float, float],
-    velocity: int,
-    pick_other: Callable[[], tuple[np.ndarray, int]] | None = None,
-) -> dict[str, torch.Tensor]:
-    """スタイル参照のパッチ列。同じ曲 (events, 伸縮前) の窓と離れた場所か、同じ演奏者の別の曲 (pick_other) から取る。
-
-    参照には窓とは別の移調と時間伸縮をかけ、音高やテンポをそのまま写しても合わないようにする
-    (ベロシティのずらしは窓と同じにする。強弱の付け方はスタイルの一部なので)。
-    window_range は伸縮前の時間での窓の範囲。検証では毎回同じ参照になるよう、同じ曲の窓の直後から固定の長さで取る。
-    """
-    c = style
-    F = tokenizer.patch_frames
-    empty = {
-        "ref_tokens": torch.full((c.max_patches, 1), PAD, dtype=torch.long),
-        "ref_valid": torch.zeros(c.max_patches, dtype=torch.bool),
-        "style_present": torch.tensor(False),
-    }
-    # 学習時は dropout の確率で外す。1 以上なら検証でも常に外す (スタイルなしの損失を測る用)
-    if c.dropout >= 1.0 or (train and random.random() < c.dropout):
-        return empty
-
-    if train:
-        num_patches = random.randint(c.min_patches, c.max_patches)
-        factor = random.uniform(1 - augment.time_stretch, 1 + augment.time_stretch) if augment else 1.0
-        shift = random.randint(-augment.transpose, augment.transpose) if augment else 0
-    else:
-        num_patches, factor, shift = (c.min_patches + c.max_patches) // 2, 1.0, 0
-    length = num_patches * F / factor  # 元の時間での参照の長さ
-    gap = c.gap_patches * F
-
-    ref_start = None
-    use_other = train and pick_other is not None and random.random() >= c.same_song_prob
-    if not use_other:
-        end = float(end_frame)
-        if train:
-            # 窓の前と後ろのうち、参照が収まる場所からランダムに選ぶ
-            candidates = [(0.0, window_range[0] - gap - length), (window_range[1] + gap, end - length)]
-            candidates = [(a, b) for a, b in candidates if b >= a]
-            if candidates:
-                lo, hi = random.choice(candidates)
-                ref_start = random.uniform(lo, hi)
-        elif window_range[1] + gap + length <= end:
-            ref_start = window_range[1] + gap
-        if ref_start is None and train and pick_other is not None:
-            use_other = True
-    if use_other:
-        events, end_frame = pick_other()
-        ref_start = random.uniform(0.0, max(0.0, float(end_frame) - length))
-    if ref_start is None:
-        return empty
-
-    events, end_frame = augment_events(events, end_frame, factor, shift, velocity, tokenizer.config)
-    window = tokenizer.tokenize_window(events, end_frame, int(ref_start * factor), num_patches)
-    tokens = torch.full((c.max_patches, window["tokens"].shape[1]), PAD, dtype=torch.long)
-    tokens[:num_patches] = torch.from_numpy(window["tokens"])
-    valid = torch.zeros(c.max_patches, dtype=torch.bool)
-    valid[:num_patches] = torch.from_numpy(window["patch_valid"])
-    return {"ref_tokens": tokens, "ref_valid": valid, "style_present": torch.tensor(bool(valid.any()))}
-
-
 def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    if "ref_tokens" in batch[0]:
-        # 参照のトークン長は曲ごとに違うので、一番長いものに揃えてから積む
-        width = max(item["ref_tokens"].shape[1] for item in batch)
-        for item in batch:
-            pad = width - item["ref_tokens"].shape[1]
-            if pad:
-                item["ref_tokens"] = torch.nn.functional.pad(item["ref_tokens"], (0, pad), value=PAD)
     out = {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
     # パッチ内トークン長はバッチ内の最長に詰める (大半のパッチは上限よりずっと短い)
-    for key in ("tokens", "ref_tokens"):
-        if key in out:
-            used = int((out[key] != PAD).sum(-1).max())
-            out[key] = out[key][..., : max(used, 1)]
+    used = int((out["tokens"] != PAD).sum(-1).max())
+    out["tokens"] = out["tokens"][..., : max(used, 1)]
     return out
 
 

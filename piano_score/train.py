@@ -83,9 +83,9 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
-    # モデルの大きさ (ModelConfig の各項目を --dim などで上書きできる)。楽譜ではチャンネルとスタイル参照は使わない
+    # モデルの大きさ (ModelConfig の各項目を --dim などで上書きできる)。楽譜ではチャンネルは使わない
     for field in fields(ModelConfig):
-        if field.name not in ("num_channels", "style_tokens"):
+        if field.name != "num_channels":
             parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(field.default), default=field.default)
     return parser.parse_args()
 
@@ -202,11 +202,7 @@ def main() -> None:
     cache = ScoreCache(args.cache_dir)
     tokenizer = ScoreTokenizer(cache.tokenizer_config)
     model_config = ModelConfig(
-        **{
-            f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name not in ("num_channels", "style_tokens")
-        },
-        num_channels=1,
-        style_tokens=0,
+        **{f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name != "num_channels"}, num_channels=1
     )
     train_set = ScoreWindowDataset(
         cache,
