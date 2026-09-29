@@ -54,7 +54,8 @@ def main() -> None:
             channel = json.loads(Path(checkpoint["channel_index"]).read_text(encoding="utf-8"))[args.channel]
 
     patch_seconds = tokenizer.config.patch_seconds
-    context_seconds = args.context_seconds or checkpoint["args"]["window_seconds"]
+    saved = checkpoint["args"]
+    context_seconds = args.context_seconds or saved["window_seconds"] + saved.get("memory_seconds", 0.0)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         samples = model.generate(
             tokenizer,

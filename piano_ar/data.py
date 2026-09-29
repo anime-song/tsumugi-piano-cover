@@ -108,6 +108,8 @@ class PianoWindowDataset(Dataset):
 
     学習用 (split="train") は index を曲番号として受け取り、窓の位置はランダム。曲の選び方は
     make_sampler の重みで決める。検証用は曲の冒頭の窓に固定して、毎回同じ入力で損失を測る。
+    memory_patches を渡すと、窓の前に最大その数のパッチを記憶 (文脈) として付ける (window_locate)。
+    検証の val_start_patch は、損失を取る窓を曲の何パッチ目から始めるか (記憶が効くかを測るときに曲の途中にする)。
     """
 
     def __init__(
@@ -119,10 +121,14 @@ class PianoWindowDataset(Dataset):
         augment: AugmentConfig | None = None,
         song_start_prob: float = 0.1,
         channel_dropout: float = 0.15,
+        memory_patches: int = 0,
+        val_start_patch: int = 0,
     ) -> None:
         self.cache = cache
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
         self.window_patches = window_patches
+        self.memory_patches = memory_patches
+        self.val_start_patch = val_start_patch
         self.train = split == "train"
         self.augment = augment if self.train else None
         self.song_start_prob = song_start_prob
@@ -143,15 +149,16 @@ class PianoWindowDataset(Dataset):
             shift = random.randint(-a.transpose, a.transpose) if a.transpose > 0 else 0
             events, end_frame = augment_events(events, end_frame, factor, shift, velocity, self.tokenizer.config)
 
-        window_frames = self.window_patches * self.tokenizer.patch_frames
-        song_start = not self.train or random.random() < self.song_start_prob
-        if song_start:
-            start = 0
-        else:
-            # 曲の終わり (EOS) も学習できるよう、窓の後半が曲の外にはみ出す位置まで選ぶ
-            start = random.randint(0, max(0, end_frame - window_frames // 2))
-            song_start = start == 0
-        window = self.tokenizer.tokenize_window(events, end_frame, start, self.window_patches)
+        window, patch_loss, start = window_locate(
+            self.tokenizer,
+            events,
+            end_frame,
+            self.window_patches,
+            self.memory_patches,
+            train=self.train,
+            song_start_prob=self.song_start_prob,
+            val_start_patch=self.val_start_patch,
+        )
 
         channel = int(self.cache.channels[song])
         if random.random() < self.channel_dropout:
@@ -161,8 +168,46 @@ class PianoWindowDataset(Dataset):
             "patch_valid": torch.from_numpy(window["patch_valid"]),
             "pedal_state": torch.from_numpy(window["pedal_state"]),
             "channel": torch.tensor(channel),
-            "song_start": torch.tensor(int(song_start)),
+            "song_start": torch.tensor(int(start == 0)),
+            "patch_loss": torch.from_numpy(patch_loss),
         }
+
+
+def window_locate(
+    tokenizer: PianoTokenizer,
+    events: np.ndarray,
+    end_frame: int,
+    window_patches: int,
+    memory_patches: int,
+    *,
+    train: bool,
+    song_start_prob: float,
+    val_start_patch: int = 0,
+) -> tuple[dict[str, np.ndarray], np.ndarray, int]:
+    """損失を取る窓 (window_patches) の位置を決め、その前に最大 memory_patches の記憶を付けてトークン化する。
+
+    返り値は (tokenize_window の出力 [memory_patches + window_patches], 損失を取るパッチ, 窓 (記憶の頭) の始まりのフレーム)。
+    記憶は曲の頭より前には延ばせないので、窓が曲の冒頭に近いときは記憶が短くなり、そのぶん窓の後ろが余る
+    (余りは patch_valid を False にして計算しない)。memory_patches = 0 なら以前と同じ固定長の窓。
+    """
+    F = tokenizer.patch_frames
+    if train:
+        if random.random() < song_start_prob:
+            first = 0
+        else:
+            # 曲の終わり (EOS) も学習できるよう、窓の後半が曲の外にはみ出す位置まで選ぶ
+            first = random.randint(0, max(0, end_frame - window_patches * F // 2))
+    else:
+        num_patches = -(-end_frame // F)
+        first = min(val_start_patch, max(0, num_patches - window_patches)) * F
+    start = max(0, first - memory_patches * F)
+    offset = (first - start) // F  # 窓の前の記憶のパッチ数 (パッチの境目は start にそろえる)
+    window = tokenizer.tokenize_window(events, end_frame, start, memory_patches + window_patches)
+    patch_loss = np.zeros(memory_patches + window_patches, dtype=bool)
+    patch_loss[offset : offset + window_patches] = True
+    window["patch_valid"][offset + window_patches :] = False
+    return window, patch_loss & window["patch_valid"], start
+
 
 def augment_events(
     events: np.ndarray, end_frame: int, factor: float, shift: int, velocity: int, config: TokenizerConfig

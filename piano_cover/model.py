@@ -339,6 +339,9 @@ class CoverModel(nn.Module):
         r = self.config.local_cross_radius
         neighbors = centers[:, None] + torch.arange(-r, r + 1, device=centers.device)
         inside = (neighbors >= 0) & (neighbors < S) & has_source[song_of][:, None]
+        if "patch_loss" in batch:
+            # Local を通すのは損失を取るパッチだけ (記憶のパッチは要約を Global に入れるだけ) なので、その分の行だけ作る
+            inside &= batch["patch_loss"][valid][:, None]
         needed = torch.zeros_like(batch["src_patch_valid"])
         needed[song_of[:, None].expand_as(neighbors)[inside], neighbors[inside]] = True
         needed &= batch["src_patch_valid"]

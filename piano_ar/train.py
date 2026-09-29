@@ -3,6 +3,12 @@
     python -m piano_ar.train --cache-dir data/piano_ar/pretraining --out-dir checkpoints/piano_ar --wandb-project piano-ar
 
 途中から再開する場合は --resume checkpoints/piano_ar/latest.pt (wandb も同じ run に続けて記録する)。
+--init-from は学習済みの重みから新しく学習を始める (optimizer と学習率の予定は新しくする)。チャンネル数が増えたキャッシュでも、
+既存のチャンネルの埋め込みはそのまま使い、増えた分だけ新しく作る (channel_index は追記だけなので番号は変わらない)。
+
+--memory-seconds の長さの記憶を窓の前に付ける。記憶のパッチは要約を勾配なしで作って Global に入れるだけなので、
+曲全体を文脈にしても学習の重さはほとんど変わらない (PianoARModel.forward)。検証では曲の途中 (記憶の長さの位置) から
+始まる窓で、記憶ありとなしの損失を比べる (val_long / val_long_nomem)。
 検証の損失がそれまでで最も低くなったら out-dir/best.pt にも保存する。
 --sample-every ごとに曲を生成して out-dir/samples に MIDI で保存し、wandb には音声とピアノロールを送る。
 """
@@ -13,7 +19,7 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +38,13 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default="data/piano_ar/pretraining")
     parser.add_argument("--out-dir", default="checkpoints/piano_ar")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--window-seconds", type=float, default=64.0)
+    parser.add_argument(
+        "--init-from", default=None, help="学習済みのチェックポイントの重みから始める (モデルの大きさもそれに合わせる)"
+    )
+    parser.add_argument("--window-seconds", type=float, default=64.0, help="損失を取る窓の長さ")
+    parser.add_argument(
+        "--memory-seconds", type=float, default=192.0, help="窓の前に付ける記憶 (文脈) の長さ。窓と合わせて曲全体を見る"
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--steps", type=int, default=50_000, help="optimizer の更新回数")
@@ -114,6 +126,23 @@ def make_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.op
     )
 
 
+def context_patches(args: dict | argparse.Namespace, patch_seconds: float) -> int:
+    """生成で見る文脈のパッチ数 (学習の窓 + 記憶)。記憶のない以前のチェックポイントは窓だけ"""
+    values = args if isinstance(args, dict) else vars(args)
+    return round((values["window_seconds"] + values.get("memory_seconds", 0.0)) / patch_seconds)
+
+
+def expand_channels(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """チェックポイントのチャンネルの埋め込みが model より少なければ、既存の分をそのまま使い、増えた分は model の初期値にする"""
+    key = "channel_embedding.weight"
+    old, new = state[key], model.state_dict()[key]
+    if old.shape[0] < new.shape[0]:
+        state = dict(state)
+        state[key] = torch.cat([old.to(new.dtype), new[old.shape[0] :].to(old.device)])
+        print(f"チャンネルの埋め込みを {old.shape[0]} -> {new.shape[0]} に増やした")
+    return state
+
+
 def limit_gpu_memory(fraction_of_free: float) -> None:
     """VRAM の使用量に上限を設ける。
 
@@ -179,7 +208,7 @@ def sample_evaluation(
         "num_patches": num_patches,
         "temperature": args.sample_temperature,
         "top_p": args.sample_top_p,
-        "context_patches": round(args.window_seconds / c.patch_seconds),
+        "context_patches": context_patches(args, c.patch_seconds),
     }
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
         free = model.generate(tokenizer, num_samples=args.sample_count, **common)
@@ -256,10 +285,15 @@ def main() -> None:
     cache = PretrainingCache(args.cache_dir)
     tokenizer = PianoTokenizer(cache.tokenizer_config)
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
+    memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
     model_config = ModelConfig(
         **{f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name != "num_channels"},
         num_channels=cache.meta["num_channels"],
     )
+    init = None
+    if args.init_from and not args.resume:
+        init = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        model_config = replace(ModelConfig.from_dict(init["model_config"]), num_channels=cache.meta["num_channels"])
     source_weights = {
         name: float(value) for name, value in (item.split("=") for item in args.source_weights.split(",") if item)
     }
@@ -271,8 +305,20 @@ def main() -> None:
         augment=None if args.no_augment else AugmentConfig(),
         song_start_prob=args.song_start_prob,
         channel_dropout=args.channel_dropout,
+        memory_patches=memory_patches,
     )
-    val_set = PianoWindowDataset(cache, split="val", window_patches=window_patches)
+    val_set = PianoWindowDataset(cache, split="val", window_patches=window_patches, memory_patches=memory_patches)
+    # 曲の途中から始まる窓で、記憶ありとなしを比べる (記憶がどれだけ効いているか)
+    long_sets = (
+        {
+            name: PianoWindowDataset(
+                cache, split="val", window_patches=window_patches, memory_patches=memory, val_start_patch=memory_patches
+            )
+            for name, memory in (("long", memory_patches), ("long_nomem", 0))
+        }
+        if memory_patches
+        else {}
+    )
     micro_steps = args.steps * args.grad_accum
     train_loader = DataLoader(
         train_set,
@@ -287,8 +333,13 @@ def main() -> None:
         drop_last=True,
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
+    long_loaders = {
+        name: DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate)
+        for name, ds in long_sets.items()
+    }
     print(
-        f"学習 {len(train_set)} 曲 / 検証 {len(val_set)} 曲 / 窓 {window_patches} パッチ / 語彙 {tokenizer.vocab_size}"
+        f"学習 {len(train_set)} 曲 / 検証 {len(val_set)} 曲 / 窓 {window_patches} パッチ + 記憶 {memory_patches} パッチ"
+        f" / 語彙 {tokenizer.vocab_size}"
     )
 
     model = PianoARModel(model_config, tokenizer).to(device)
@@ -304,6 +355,10 @@ def main() -> None:
         step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
         print(f"{args.resume} の step {step} から再開 (これまでの最良の検証損失 {best_val_loss:.4f})")
+    elif init is not None:
+        model.load_state_dict(expand_channels(init["model"], model))
+        print(f"{args.init_from} (step {init['step']}) の重みから始める")
+        del init
     if args.compile:
         # inductor は内部のテンプレートを既定の文字コードで読むため、日本語版 Windows (cp932) では失敗する
         if not sys.flags.utf8_mode:
@@ -390,12 +445,18 @@ def main() -> None:
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
+            long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
             print(
                 f"[val] step {step} loss {val['loss']:.4f} "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+                + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
             )
             if wandb_run:
-                wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=step)
+                logs = {f"val/{k}": v for k, v in val.items()}
+                logs.update({f"val/loss_{name}": v for name, v in long.items()})
+                if long:
+                    logs["val/memory_gain"] = long["long_nomem"] - long["long"]
+                wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]
                 save(out_dir / "best.pt")

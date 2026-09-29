@@ -30,7 +30,7 @@ from piano_ar.config import ModelConfig
 from piano_ar.data import AugmentConfig, PianoWindowDataset, PretrainingCache
 from piano_ar.evaluation import piano_roll_image, sample_stats, synthesize
 from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
-from piano_ar.train import limit_gpu_memory, lr_at, to_device
+from piano_ar.train import context_patches, limit_gpu_memory, lr_at, to_device
 
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
@@ -56,7 +56,10 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
-    parser.add_argument("--window-seconds", type=float, default=64.0)
+    parser.add_argument("--window-seconds", type=float, default=64.0, help="損失を取る窓の長さ")
+    parser.add_argument(
+        "--memory-seconds", type=float, default=192.0, help="窓の前に付ける記憶 (文脈) の長さ (piano_ar.train と同じ)"
+    )
     # 大きいデコーダ (v3, 384M) では VRAM 9.3GB に収まるのは batch 4 x 累積 4 まで (累積中は勾配も残るため)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
@@ -201,7 +204,7 @@ def sample_evaluation(
                 channel=int(cache.channels[cover]),
                 temperature=args.sample_temperature,
                 top_p=args.sample_top_p,
-                context_patches=round(args.window_seconds / c.patch_seconds),
+                context_patches=context_patches(args, c.patch_seconds),
                 condition=condition,
                 condition_cfg_scale=args.sample_source_cfg,
                 end_after=features["features"].shape[0] - 2,
@@ -263,6 +266,7 @@ def main() -> None:
         raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
     model_config = ModelConfig.from_dict(pretrained["model_config"])
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
+    memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
 
     pretraining = None
     if args.pretrain_mix > 0:
@@ -273,8 +277,9 @@ def main() -> None:
             augment=None if args.no_augment else AugmentConfig(),
             song_start_prob=args.song_start_prob,
             channel_dropout=args.channel_dropout,
+            memory_patches=memory_patches,
         )
-    common = {"window_patches": window_patches, "cover_config": cover_config}
+    common = {"window_patches": window_patches, "cover_config": cover_config, "memory_patches": memory_patches}
     train_set = CoverWindowDataset(
         cache,
         split="train",
@@ -292,6 +297,23 @@ def main() -> None:
     val_resync = CoverWindowDataset(
         cache, split="val", source_dropout=0.0, drift=DriftConfig(prob=1.0, loss_patches=2), **common
     )
+    # 曲の途中から始まる窓で、記憶ありとなしを比べる (記憶がどれだけ効いているか)
+    long_sets = (
+        {
+            name: CoverWindowDataset(
+                cache,
+                split="val",
+                source_dropout=0.0,
+                window_patches=window_patches,
+                cover_config=cover_config,
+                memory_patches=memory,
+                val_start_patch=memory_patches,
+            )
+            for name, memory in (("long", memory_patches), ("long_nomem", 0))
+        }
+        if memory_patches
+        else {}
+    )
     micro_steps = args.steps * args.grad_accum
     loader_options = {"num_workers": args.num_workers, "collate_fn": collate_cover}
     train_loader = DataLoader(
@@ -306,6 +328,9 @@ def main() -> None:
     val_loader = DataLoader(val_set, batch_size=args.batch_size, **loader_options)
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
     val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options)
+    long_loaders = {
+        name: DataLoader(ds, batch_size=args.batch_size, **loader_options) for name, ds in long_sets.items()
+    }
     print(
         f"学習 カバー {len(train_set.covers)} 本 (+ 事前学習 {len(pretraining) if pretraining else 0} 曲を"
         f" {args.pretrain_mix:.0%}) / 検証 {len(val_set)} 本 / 窓 {window_patches} パッチ"
@@ -437,10 +462,12 @@ def main() -> None:
             val = evaluate(model, val_loader, device)
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
             resync = evaluate(model, val_resync_loader, device)
+            long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
             print(
                 f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}) "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
                 + f" | ずれから戻る loss {resync['loss']:.4f} time {resync['loss_time']:.3f}"
+                + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
             )
             if wandb_run:
                 logs = {f"val/{k}": v for k, v in val.items()}
@@ -448,6 +475,9 @@ def main() -> None:
                     {"val/loss_nosource": val_nosource_loss, "val/source_gain": val_nosource_loss - val["loss"]}
                 )
                 logs.update({f"val_resync/{k}": v for k, v in resync.items()})
+                logs.update({f"val/loss_{name}": v for name, v in long.items()})
+                if long:
+                    logs["val/memory_gain"] = long["long_nomem"] - long["long"]
                 wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]

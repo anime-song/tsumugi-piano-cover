@@ -20,6 +20,7 @@ import torch
 from piano_ar.config import ModelConfig, TokenizerConfig
 from piano_ar.evaluation import synthesize, write_wav
 from piano_ar.tokenizer import PianoTokenizer
+from piano_ar.train import context_patches
 
 from .config import CoverConfig
 from .data import source_tensors
@@ -90,7 +91,7 @@ def main() -> None:
         "top_p": args.top_p,
         "cfg_scale": args.channel_cfg,
         "condition_cfg_scale": args.source_cfg,
-        "context_patches": round(checkpoint["args"]["window_seconds"] / patch_seconds),
+        "context_patches": context_patches(checkpoint["args"], patch_seconds),
         # 途中で EOS を出して止まらないよう、曲の終わりは原曲の最後の 2 パッチでだけ許す
         "end_after": features["features"].shape[0] - 2,
     }
