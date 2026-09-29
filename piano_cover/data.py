@@ -14,12 +14,10 @@ from piano_ar.config import TokenizerConfig
 from piano_ar.data import (
     AugmentConfig,
     PianoWindowDataset,
-    StyleConfig,
     collate,
     sampling_weights,
     shift_velocity,
     stretch_events,
-    style_reference,
     transpose_events,
 )
 from piano_ar.tokenizer import PianoTokenizer
@@ -110,8 +108,6 @@ class CoverWindowDataset(Dataset):
     source_dropout の確率で原曲を外し (CFG 用)、structure_dropout の確率で拍・コード・キーをそれぞれ外す
     (推定値なので、なくても動くようにする)。
     pretraining を渡すと、index が カバーの数 以上のときは事前学習の曲を原曲なしで返す (忘却を防ぐため混ぜる)。
-    style を渡すとチャンネルの代わりにスタイル参照で条件付けする。参照は同じカバーの窓から離れた場所か、
-    同じチャンネルの別のカバー・事前学習の曲 (学習時のみ) から取る。
     """
 
     def __init__(
@@ -127,7 +123,6 @@ class CoverWindowDataset(Dataset):
         source_dropout: float = 0.1,
         structure_dropout: float = 0.2,
         pretraining: PianoWindowDataset | None = None,
-        style: StyleConfig | None = None,
     ) -> None:
         self.cache = cache
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
@@ -142,19 +137,6 @@ class CoverWindowDataset(Dataset):
         self.structure_dropout = structure_dropout if self.train else 0.0
         self.covers = np.flatnonzero(cache.split == SPLITS[split])
         self.pretraining = pretraining
-        self.style = style
-        # 同じチャンネルの別の曲 (カバーの番号、事前学習の曲の番号)。0 はチャンネル不明
-        self.covers_of_channel: dict[int, np.ndarray] = {}
-        self.pretraining_of_channel: dict[int, np.ndarray] = {}
-        if style is not None:
-            channels = cache.channels[self.covers]
-            for channel in np.unique(channels[channels > 0]):
-                self.covers_of_channel[int(channel)] = self.covers[channels == channel]
-            if pretraining is not None and self.train:
-                songs = pretraining.songs
-                channels = pretraining.cache.channels[songs]
-                for channel in np.unique(channels[channels > 0]):
-                    self.pretraining_of_channel[int(channel)] = songs[channels == channel]
 
     def __len__(self) -> int:
         return len(self.covers) + (len(self.pretraining) if self.pretraining is not None else 0)
@@ -169,13 +151,13 @@ class CoverWindowDataset(Dataset):
 
         cover = int(self.covers[index])
         source = int(self.cache.source_index[cover])
-        raw_events = events = self.cache.cover_events(cover)
-        raw_end = end_frame = int(self.cache.end_frames[cover])
+        events = self.cache.cover_events(cover)
+        end_frame = int(self.cache.end_frames[cover])
         align = self.cache.cover_align(cover)
         rows = self.cache.source_rows(source)
         source_end = int(self.cache.source_end_frames[source])
 
-        factor, velocity = 1.0, 0
+        factor = 1.0
         if self.augment is not None:
             a = self.augment
             if a.time_stretch > 0:
@@ -188,8 +170,7 @@ class CoverWindowDataset(Dataset):
                 events = transpose_events(events, shift, self.tokenizer.config)
                 rows = transpose_rows(rows, shift)
             if a.velocity_shift > 0:
-                velocity = random.randint(-a.velocity_shift, a.velocity_shift)
-                events = shift_velocity(events, velocity)
+                events = shift_velocity(events, random.randint(-a.velocity_shift, a.velocity_shift))
 
         F = self.tokenizer.patch_frames
         window_frames = self.window_patches * F
@@ -217,9 +198,9 @@ class CoverWindowDataset(Dataset):
             source_items = empty_source()
 
         channel = int(self.cache.channels[cover])
-        if self.style is not None or random.random() < self.channel_dropout:
+        if random.random() < self.channel_dropout:
             channel = 0
-        item = {
+        return {
             "tokens": torch.from_numpy(window["tokens"]),
             "patch_valid": torch.from_numpy(window["patch_valid"]),
             "pedal_state": torch.from_numpy(window["pedal_state"]),
@@ -229,38 +210,6 @@ class CoverWindowDataset(Dataset):
             "has_source": torch.tensor(has_source),
             **source_items,
         }
-        if self.style is not None:
-            window_range = (start / factor, (start + window_frames) / factor)
-            item.update(self._reference(cover, raw_events, raw_end, window_range, velocity))
-        return item
-
-    def _reference(
-        self, cover: int, events: np.ndarray, end_frame: int, window_range: tuple[float, float], velocity: int
-    ) -> dict[str, torch.Tensor]:
-        channel = int(self.cache.channels[cover])
-        covers = self.covers_of_channel.get(channel, np.zeros(0, dtype=np.int64))
-        covers = covers[covers != cover]
-        songs = self.pretraining_of_channel.get(channel, np.zeros(0, dtype=np.int64))
-
-        def pick_other() -> tuple[np.ndarray, int]:
-            # カバーと事前学習の曲をまとめて 1 曲選ぶ
-            k = random.randrange(len(covers) + len(songs))
-            if k < len(covers):
-                return self.cache.cover_events(int(covers[k])), int(self.cache.end_frames[covers[k]])
-            song = int(songs[k - len(covers)])
-            return self.pretraining.cache.song_events(song), int(self.pretraining.cache.end_frames[song])
-
-        return style_reference(
-            self.tokenizer,
-            self.style,
-            self.augment,
-            self.train,
-            events,
-            end_frame,
-            window_range,
-            velocity,
-            pick_other if len(covers) + len(songs) else None,
-        )
 
 
 SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid")

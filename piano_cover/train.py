@@ -6,8 +6,6 @@
 --freeze-decoder ならデコーダは固定して、新しく足した部分だけを学習する (Flamingo と同じ)。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
-スタイル参照で事前学習したデコーダなら、演奏者はチャンネルの代わりにスタイル参照 (同じカバーの別の場所や、
-同じチャンネルの別の曲) で条件付けし、スタイルなしとの差 (val/style_gain) も測る。
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import numpy as np
@@ -24,10 +22,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from piano_ar.config import ModelConfig
-from piano_ar.data import AugmentConfig, PianoWindowDataset, PretrainingCache, StyleConfig
+from piano_ar.data import AugmentConfig, PianoWindowDataset, PretrainingCache
 from piano_ar.evaluation import piano_roll_image, sample_stats, synthesize
 from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
-from piano_ar.train import limit_gpu_memory, lr_at, reference_style, to_device
+from piano_ar.train import limit_gpu_memory, lr_at, to_device
 
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, collate_cover, make_cover_sampler, source_tensors
@@ -38,15 +36,15 @@ from .source import SourceVocab, source_features
 def build_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cache-dir", default="data/piano_cover")
-    parser.add_argument("--pretrained", default="checkpoints/piano_ar_v3/best.pt")
+    parser.add_argument("--pretrained", default="checkpoints/piano_ar/best.pt")
     parser.add_argument("--out-dir", default="checkpoints/piano_cover")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining_v2")
+    parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
     parser.add_argument("--window-seconds", type=float, default=64.0)
-    # 384M (新規 142M) で VRAM 9.3GB に収まるのは batch 4 まで (勾配累積中は勾配も残るため)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    # 大きいデコーダ (v3, 384M) では VRAM 9.3GB に収まるのは batch 4 x 累積 4 まで (累積中は勾配も残るため)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--steps", type=int, default=20_000, help="optimizer の更新回数")
     parser.add_argument("--lr", type=float, default=3e-4, help="新しく足した部分の学習率")
     parser.add_argument("--decoder-lr-scale", type=float, default=0.3, help="事前学習済みのデコーダの学習率の倍率")
@@ -65,11 +63,6 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--source-dropout", type=float, default=0.1, help="原曲を外す確率 (CFG 用)")
     parser.add_argument("--structure-dropout", type=float, default=0.2, help="拍・コード・キーをそれぞれ外す確率")
     parser.add_argument("--no-augment", action="store_true")
-    # スタイル参照 (事前学習のデコーダが style_tokens > 0 のときだけ使う)
-    parser.add_argument("--style-min-seconds", type=float, default=8.0, help="参照の長さの下限")
-    parser.add_argument("--style-max-seconds", type=float, default=32.0, help="参照の長さの上限")
-    parser.add_argument("--style-same-song-prob", type=float, default=0.7, help="参照を同じカバーから取る確率")
-    parser.add_argument("--style-dropout", type=float, default=0.15, help="スタイルを外す確率 (CFG 用)")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=1000)
@@ -91,7 +84,11 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--sample-temperature", type=float, default=1.0)
     parser.add_argument("--sample-top-p", type=float, default=0.95)
     for field in fields(CoverConfig):
-        parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(field.default), default=field.default)
+        name = f"--{field.name.replace('_', '-')}"
+        if isinstance(field.default, bool):
+            parser.add_argument(name, action="store_true")
+        else:
+            parser.add_argument(name, type=type(field.default), default=field.default)
     return parser.parse_args()
 
 
@@ -176,24 +173,10 @@ def sample_evaluation(
         source_items = {key: value.to(device) for key, value in source_tensors(features).items()}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             condition = SourceCondition(model, source_items)
-            # スタイル参照のモデルは、同じカバーの生成範囲より後ろの 16 秒をスタイルにする
-            style = (
-                reference_style(
-                    model.decoder,
-                    tokenizer,
-                    cache.cover_events(cover),
-                    int(cache.end_frames[cover]),
-                    num_patches * tokenizer.patch_frames,
-                    8,
-                )
-                if model.decoder.config.style_tokens
-                else None
-            )
             patches = model.decoder.generate(
                 tokenizer,
                 num_patches=num_patches,
-                channel=0 if style is not None else int(cache.channels[cover]),
-                style=style,
+                channel=int(cache.channels[cover]),
                 temperature=args.sample_temperature,
                 top_p=args.sample_top_p,
                 context_patches=round(args.window_seconds / c.patch_seconds),
@@ -248,17 +231,8 @@ def main() -> None:
     pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):
         raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
-    model_config = ModelConfig(**pretrained["model_config"])
+    model_config = ModelConfig.from_dict(pretrained["model_config"])
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
-    style_config = None
-    if model_config.style_tokens:
-        patch_seconds = cache.tokenizer_config.patch_seconds
-        style_config = StyleConfig(
-            min_patches=max(1, round(args.style_min_seconds / patch_seconds)),
-            max_patches=max(1, round(args.style_max_seconds / patch_seconds)),
-            same_song_prob=args.style_same_song_prob,
-            dropout=args.style_dropout,
-        )
 
     pretraining = None
     if args.pretrain_mix > 0:
@@ -269,7 +243,6 @@ def main() -> None:
             augment=None if args.no_augment else AugmentConfig(),
             song_start_prob=args.song_start_prob,
             channel_dropout=args.channel_dropout,
-            style=style_config,
         )
     common = {"window_patches": window_patches, "cover_config": cover_config}
     train_set = CoverWindowDataset(
@@ -281,16 +254,10 @@ def main() -> None:
         source_dropout=args.source_dropout,
         structure_dropout=args.structure_dropout,
         pretraining=pretraining,
-        style=style_config,
         **common,
     )
-    val_set = CoverWindowDataset(cache, split="val", source_dropout=0.0, style=style_config, **common)
-    val_nosource = CoverWindowDataset(cache, split="val", source_dropout=1.0, style=style_config, **common)
-    val_nostyle = (
-        CoverWindowDataset(cache, split="val", source_dropout=0.0, style=replace(style_config, dropout=1.0), **common)
-        if style_config
-        else None
-    )
+    val_set = CoverWindowDataset(cache, split="val", source_dropout=0.0, **common)
+    val_nosource = CoverWindowDataset(cache, split="val", source_dropout=1.0, **common)
     micro_steps = args.steps * args.grad_accum
     loader_options = {"num_workers": args.num_workers, "collate_fn": collate_cover}
     train_loader = DataLoader(
@@ -304,7 +271,6 @@ def main() -> None:
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, **loader_options)
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
-    val_nostyle_loader = DataLoader(val_nostyle, batch_size=args.batch_size, **loader_options) if val_nostyle else None
     print(
         f"学習 カバー {len(train_set.covers)} 本 (+ 事前学習 {len(pretraining) if pretraining else 0} 曲を"
         f" {args.pretrain_mix:.0%}) / 検証 {len(val_set)} 本 / 窓 {window_patches} パッチ"
@@ -424,10 +390,8 @@ def main() -> None:
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
-            val_nostyle_loss = evaluate(model, val_nostyle_loader, device)["loss"] if val_nostyle_loader else None
-            nostyle_text = f" (スタイルなし {val_nostyle_loss:.4f})" if val_nostyle_loss is not None else ""
             print(
-                f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}){nostyle_text} "
+                f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}) "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
             )
             if wandb_run:
@@ -435,10 +399,6 @@ def main() -> None:
                 logs.update(
                     {"val/loss_nosource": val_nosource_loss, "val/source_gain": val_nosource_loss - val["loss"]}
                 )
-                if val_nostyle_loss is not None:
-                    logs.update(
-                        {"val/loss_nostyle": val_nostyle_loss, "val/style_gain": val_nostyle_loss - val["loss"]}
-                    )
                 wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]

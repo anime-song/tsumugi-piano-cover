@@ -113,7 +113,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[PianoARMode
     config = dict(checkpoint["tokenizer_config"])
     config["fraction_denominators"] = tuple(config["fraction_denominators"])
     tokenizer = ScoreTokenizer(ScoreTokenizerConfig(**config))
-    model = PianoARModel(ModelConfig(**checkpoint["model_config"]), tokenizer).to(device).eval()
+    model = PianoARModel(ModelConfig.from_dict(checkpoint["model_config"]), tokenizer).to(device).eval()
     model.load_state_dict(checkpoint["model"])
     return model, tokenizer, checkpoint
 
