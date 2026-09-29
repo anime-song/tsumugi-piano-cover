@@ -20,6 +20,7 @@ from piano_ar.data import (
     shift_velocity,
     stretch_events,
     transpose_events,
+    window_locate,
 )
 from piano_ar.tokenizer import ONSET, PianoTokenizer, sort_events
 
@@ -139,6 +140,7 @@ class CoverWindowDataset(Dataset):
     pretraining を渡すと、index が カバーの数 以上のときは事前学習の曲を原曲なしで返す (忘却を防ぐため混ぜる)。
     drift を渡すと、窓の前半のカバーの時刻をずらして後半で原曲に戻らせる (DriftConfig)。検証では窓ごとに決まった乱数で
     ずらすので、毎回同じ窓になる。
+    memory_patches と val_start_patch は PianoWindowDataset と同じ (窓の前の記憶。pretraining も同じ長さにそろえる)。
     """
 
     def __init__(
@@ -155,6 +157,8 @@ class CoverWindowDataset(Dataset):
         structure_dropout: float = 0.2,
         pretraining: PianoWindowDataset | None = None,
         drift: DriftConfig | None = None,
+        memory_patches: int = 0,
+        val_start_patch: int = 0,
     ) -> None:
         self.cache = cache
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
@@ -170,6 +174,8 @@ class CoverWindowDataset(Dataset):
         self.covers = np.flatnonzero(cache.split == SPLITS[split])
         self.pretraining = pretraining
         self.drift = drift
+        self.memory_patches = memory_patches
+        self.val_start_patch = val_start_patch
 
     def __len__(self) -> int:
         return len(self.covers) + (len(self.pretraining) if self.pretraining is not None else 0)
@@ -177,9 +183,8 @@ class CoverWindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if index >= len(self.covers):
             item = self.pretraining[index - len(self.covers)]
-            item["align"] = torch.zeros(self.window_patches, 2)
+            item["align"] = torch.zeros(len(item["tokens"]), 2)
             item["has_source"] = torch.tensor(False)
-            item["patch_loss"] = torch.ones(self.window_patches, dtype=torch.bool)
             item.update(empty_source())
             return item
 
@@ -207,18 +212,22 @@ class CoverWindowDataset(Dataset):
                 events = shift_velocity(events, random.randint(-a.velocity_shift, a.velocity_shift))
 
         F = self.tokenizer.patch_frames
-        window_frames = self.window_patches * F
-        song_start = not self.train or random.random() < self.song_start_prob
-        if song_start:
-            start = 0
-        else:
-            start = random.randint(0, max(0, end_frame - window_frames // 2))
-            song_start = start == 0
-        window = self.tokenizer.tokenize_window(events, end_frame, start, self.window_patches)
-        patch_loss = self._drift(window, events, end_frame, start, index)
+        window, patch_loss, start = window_locate(
+            self.tokenizer,
+            events,
+            end_frame,
+            self.window_patches,
+            self.memory_patches,
+            train=self.train,
+            song_start_prob=self.song_start_prob,
+            val_start_patch=self.val_start_patch,
+        )
+        song_start = start == 0
+        total = len(patch_loss)
+        patch_loss = self._drift(window, patch_loss, events, end_frame, start, index)
 
         # 窓の各パッチの始まりと終わりが、原曲のどのフレームに当たるか (伸縮したら両方の時刻を factor 倍する)
-        bounds = start + np.arange(self.window_patches + 1) * F
+        bounds = start + np.arange(total + 1) * F
         mapped = factor * np.interp(bounds / factor / self.cache.align_step, np.arange(len(align)), align)
         align_window = np.stack([mapped[:-1], mapped[1:]], axis=1).astype(np.float32)
 
@@ -248,18 +257,26 @@ class CoverWindowDataset(Dataset):
         }
 
     def _drift(
-        self, window: dict[str, np.ndarray], events: np.ndarray, end_frame: int, start: int, index: int
+        self,
+        window: dict[str, np.ndarray],
+        patch_loss: np.ndarray,
+        events: np.ndarray,
+        end_frame: int,
+        start: int,
+        index: int,
     ) -> np.ndarray:
-        """DriftConfig の確率で窓の前半をずらしたトークンに差し替え、損失を取るパッチを返す"""
-        patch_loss = np.ones(self.window_patches, dtype=bool)
+        """DriftConfig の確率で、損失を取る窓の前半 (とその前の記憶) をずらしたトークンに差し替え、損失を取るパッチを返す"""
         d = self.drift
         rng = random if self.train else random.Random(index)
-        num_valid = int(window["patch_valid"].sum())
-        if d is None or num_valid < 4 or rng.random() >= d.prob:
+        loss_patches = np.flatnonzero(patch_loss)
+        if d is None or len(loss_patches) < 4 or rng.random() >= d.prob:
             return patch_loss
+        patch_loss = patch_loss.copy()
         F = self.tokenizer.patch_frames
         fr = self.tokenizer.config.frame_rate
-        split = rng.randint(2, max(2, num_valid // 2))  # 戻るパッチ (損失を多く残すよう窓の前半から選ぶ)
+        first = int(loss_patches[0])
+        # 戻るパッチ (損失を多く残すよう窓の前半から選ぶ)
+        split = first + rng.randint(2, max(2, len(loss_patches) // 2))
         shift = rng.uniform(d.min_shift, d.max_shift) * rng.choice((-1, 1)) * fr
         ramp = rng.uniform(d.min_ramp, d.max_ramp) * fr
         drifted = drift_events(events, start + split * F, shift, ramp)

@@ -320,7 +320,9 @@ class PianoARModel(nn.Module):
     ) -> dict[str, Tensor]:
         """学習時の損失。
 
-        batch["patch_loss"] [B, P] があれば、False のパッチは入力 (文脈) にだけ使い、損失に入れない。
+        batch["patch_loss"] [B, P] があれば、False のパッチは文脈 (記憶) としてだけ使い、損失に入れない。
+        記憶のパッチは要約を勾配なしで作って Global に入れるだけで、Local は通さない。窓の前に長い記憶を付けても
+        (曲全体の文脈)、計算の重い要約の backward と Local は損失を取るパッチの分しか増えない (Transformer-XL と同じ考え方)。
 
         パッチごとのトークン長は中央値 70 前後に対して最長は 200 を超えるので、全パッチを最長に揃えると
         計算とメモリの大半がパディングに使われる。パッチを長さ順に num_length_buckets 個の塊に分け、
@@ -328,27 +330,41 @@ class PianoARModel(nn.Module):
         """
         tokens = batch["tokens"]
         valid = batch["patch_valid"]
-        flat = tokens[valid]  # [N, L] 有効なパッチだけ
-        patch_loss = batch["patch_loss"][valid] if "patch_loss" in batch else torch.ones_like(valid[valid])
-        lengths = (flat != PAD).sum(-1)
-        order = lengths.argsort()
-        buckets = [
-            (index, int(lengths[index].max()))
-            for index in order.tensor_split(min(num_length_buckets, len(order)))
-            if len(index)
-        ]
+        patch_loss = batch["patch_loss"] & valid if "patch_loss" in batch else valid
+        memory = valid & ~patch_loss
+        # condition には、有効なパッチを並べたときの番号で渡す (学習するパッチはその一部)
+        trained = patch_loss[valid].nonzero().squeeze(1)
+        flat = tokens[patch_loss]  # [N, L] 損失を取るパッチだけ
 
-        summarized = torch.cat([self.summarize_patches(flat[index, :length]) for index, length in buckets])
-        summarized = summarized[order.argsort()]
+        def length_buckets(patches: Tensor) -> list[tuple[Tensor, int]]:
+            lengths = (patches != PAD).sum(-1)
+            order = lengths.argsort()
+            return [
+                (index, int(lengths[index].max()))
+                for index in order.tensor_split(min(num_length_buckets, len(order)))
+                if len(index)
+            ]
+
+        def summarize(patches: Tensor, buckets: list[tuple[Tensor, int]]) -> Tensor:
+            order = torch.cat([index for index, _ in buckets])
+            summarized = torch.cat([self.summarize_patches(patches[index, :length]) for index, length in buckets])
+            return summarized[order.argsort()]
+
+        buckets = length_buckets(flat)
+        summarized = summarize(flat, buckets)
         summaries = summarized.new_zeros(*valid.shape, self.config.dim)
-        summaries[valid] = summarized
+        if memory.any():
+            with torch.no_grad():
+                patches = tokens[memory]
+                summaries[memory] = summarize(patches, length_buckets(patches)).to(summaries.dtype)
+        summaries[patch_loss] = summarized
         context = self.global_forward(
             summaries,
             batch["song_start"],
             batch["pedal_state"],
             batch["channel"],
             cross=condition.global_cross() if condition is not None else None,
-        )[valid]
+        )[patch_loss]
 
         loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
         counts = torch.zeros(len(self.group_names), device=tokens.device)
@@ -356,15 +372,14 @@ class PianoARModel(nn.Module):
             target = flat[index, :length]
             cross = output = None
             if condition is not None:
-                cross = condition.local_cross(index, target[:, :-1])
-                output = condition.local_output(index, target[:, :-1])
+                cross = condition.local_cross(trained[index], target[:, :-1])
+                output = condition.local_output(trained[index], target[:, :-1])
             logits = self.local_forward(target[:, :-1], context[index], cross, output)
             token_loss = F.cross_entropy(
                 logits.float().reshape(-1, self.vocab_size), target.reshape(-1), ignore_index=PAD, reduction="none"
             )
             group = self.token_group[target.reshape(-1)]
-            # PAD と、損失に入れないパッチは除く
-            keep = (group >= 0) & patch_loss[index][:, None].expand_as(target).reshape(-1)
+            keep = group >= 0  # PAD は除く
             loss_sum = loss_sum.index_add(0, group[keep], token_loss[keep])
             counts = counts.index_add(0, group[keep], torch.ones_like(token_loss[keep]))
 
