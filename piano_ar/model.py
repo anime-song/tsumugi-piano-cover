@@ -320,6 +320,8 @@ class PianoARModel(nn.Module):
     ) -> dict[str, Tensor]:
         """学習時の損失。
 
+        batch["patch_loss"] [B, P] があれば、False のパッチは入力 (文脈) にだけ使い、損失に入れない。
+
         パッチごとのトークン長は中央値 70 前後に対して最長は 200 を超えるので、全パッチを最長に揃えると
         計算とメモリの大半がパディングに使われる。パッチを長さ順に num_length_buckets 個の塊に分け、
         塊ごとにその中の最長まで切り詰めて PatchSummarizer と Local Decoder を通す。
@@ -327,6 +329,7 @@ class PianoARModel(nn.Module):
         tokens = batch["tokens"]
         valid = batch["patch_valid"]
         flat = tokens[valid]  # [N, L] 有効なパッチだけ
+        patch_loss = batch["patch_loss"][valid] if "patch_loss" in batch else torch.ones_like(valid[valid])
         lengths = (flat != PAD).sum(-1)
         order = lengths.argsort()
         buckets = [
@@ -360,7 +363,8 @@ class PianoARModel(nn.Module):
                 logits.float().reshape(-1, self.vocab_size), target.reshape(-1), ignore_index=PAD, reduction="none"
             )
             group = self.token_group[target.reshape(-1)]
-            keep = group >= 0  # PAD は除く
+            # PAD と、損失に入れないパッチは除く
+            keep = (group >= 0) & patch_loss[index][:, None].expand_as(target).reshape(-1)
             loss_sum = loss_sum.index_add(0, group[keep], token_loss[keep])
             counts = counts.index_add(0, group[keep], torch.ones_like(token_loss[keep]))
 
