@@ -6,6 +6,7 @@
     Local : 数ブロックごとに、対応するパッチ ± local_cross_radius パッチの原曲の各行へ cross-attention
 
     onset_head_dim > 0 なら OnsetHead: Local の TIME の予測に、候補の各時刻の近くにある原曲の onset を直接足す
+    planner_dim > 0 なら Planner: SongEncoder の出力から、パッチごとの強弱と音の多さの曲線を予測する (生成でデコーダの条件にする)
 
 「対応する時刻」は、学習時はアラインメント (カバー -> 原曲)、生成時は原曲の時間軸の上に生成するので恒等写像。
 cross-attention の RoPE の位置は、クエリに対応する原曲の時刻、キーに原曲の時刻を使うので、時刻の差で見る場所が決まる。
@@ -15,6 +16,7 @@ cross-attention の RoPE の位置は、クエリに対応する原曲の時刻�
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -23,6 +25,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from piano_ar.config import ModelConfig
+from piano_ar.data import quantize_dynamics
 from piano_ar.model import Block, CrossBlock, CrossHook, OutputHook, PianoARModel, Transformer
 from piano_ar.tokenizer import PianoTokenizer
 
@@ -123,6 +126,35 @@ class OnsetHead(nn.Module):
             return torch.cat((logits[..., : s.start], time, logits[..., s.stop :]), dim=-1)
 
 
+class Planner(nn.Module):
+    """原曲の全体から、パッチごとの強弱 (平均ベロシティ) と音の多さの曲線 (カバーの中で標準化した値) を予測する。
+
+    デコーダは左から順に生成するので、サビの手前でいったん引いてから盛り上げる、のような先を見越した強弱が苦手。
+    SongEncoder は曲全体を双方向に見ているので、その出力から曲線を先に決めて、デコーダの条件 (dynamics) にする。
+    入力はパッチごとの SongEncoder の出力 (K 本をつないだもの)・演奏者 (デコーダのチャンネルの埋め込み)・曲の中の位置。
+    """
+
+    def __init__(self, song_dim: int, channel_dim: int, config: ModelConfig, layers: int) -> None:
+        super().__init__()
+        self.song = nn.Sequential(nn.LayerNorm(song_dim), nn.Linear(song_dim, config.dim))
+        self.channel = nn.Linear(channel_dim, config.dim)
+        self.position = nn.Linear(8, config.dim)
+        self.transformer = Transformer(config, layers, causal=False)
+        self.head = nn.Linear(config.dim, 2)
+
+    def forward(self, song: Tensor, channel: Tensor, valid: Tensor) -> Tensor:
+        """song [B, S, song_dim], channel [B, channel_dim], valid [B, S] -> [B, S, 2]"""
+        S = song.shape[1]
+        index = torch.arange(S, device=song.device).float()
+        relative = index[None] / valid.sum(1, keepdim=True).clamp_min(1)  # 曲の中の位置 (0-1)
+        angle = math.pi * relative[..., None] * torch.tensor([1.0, 2.0, 4.0, 8.0], device=song.device)
+        position = torch.cat((angle.sin(), angle.cos()), dim=-1).to(song.dtype)
+        x = self.song(song) + self.channel(channel)[:, None] + self.position(position)
+        # 原曲のない行 (事前学習の曲) は全部を見せて NaN を防ぐ。損失は正解のある所だけで取る
+        key_valid = valid | ~valid.any(dim=1, keepdim=True)
+        return self.head(self.transformer(x, key_valid)).float()
+
+
 class CoverModel(nn.Module):
     def __init__(
         self,
@@ -165,6 +197,12 @@ class CoverModel(nn.Module):
         self.onset_head = (
             OnsetHead(model_config.dim, cover_config.onset_head_dim, tokenizer) if cover_config.onset_head_dim else None
         )
+        self.planner = None
+        if cover_config.planner_dim:
+            head_dim = model_config.dim // model_config.heads
+            planner_dim = cover_config.planner_dim
+            planner_config = replace(model_config, dim=planner_dim, heads=planner_dim // head_dim)
+            self.planner = Planner(K * dim, model_config.dim, planner_config, cover_config.planner_layers)
         self.gradient_checkpointing = False
 
         for module in (self.source_embedding, self.source_onset, self.latent_slot, self.patch_encoder,
@@ -175,6 +213,8 @@ class CoverModel(nn.Module):
         if self.onset_head is not None:
             self.onset_head.apply(PianoARModel._init_weights)
             nn.init.zeros_(self.onset_head.query.weight)
+        if self.planner is not None:
+            self.planner.apply(PianoARModel._init_weights)
 
     def new_parameters(self) -> list[nn.Parameter]:
         """事前学習にない (新しく足した) パラメータ"""
@@ -348,7 +388,39 @@ class CoverModel(nn.Module):
 
         memory = self.encode_source(batch, needed, num_length_buckets)
         condition = _TrainingCondition(self, memory, batch, centers, song_of)
-        return self.decoder(batch, num_length_buckets, condition)
+        output = self.decoder(batch, num_length_buckets, condition)
+        if self.planner is not None and "plan_target" in batch:
+            target = batch["plan_target"]
+            known = ~target.isnan() & has_source[:, None, None]
+            predicted = self.plan(memory, batch["channel"])
+            error = (predicted - target.nan_to_num()) ** 2
+            output["loss_plan"] = (error * known).sum() / known.sum().clamp_min(1)
+        return output
+
+    @torch.no_grad()
+    def planned_dynamics(
+        self, memory: SourceMemory, channel: int, num_patches: int, loudness: float = 1.0, density: float = 1.0
+    ) -> Tensor | None:
+        """生成用: Planner の曲線に倍率をかけて、デコーダの強弱の条件の番号 [num_patches, 2] にする。
+        倍率を上げるほど強弱 (音の多さ) の山と谷が大きくなる。0 ならその条件は指定なし。使えないモデルなら None"""
+        bins = self.decoder.config.dynamics_bins
+        if self.planner is None or not bins:
+            return None
+        curve = self.plan(memory, torch.tensor([channel], device=memory.song.device))[0, :num_patches]
+        curve = curve * torch.tensor([loudness, density], device=curve.device)
+        index = torch.from_numpy(quantize_dynamics(curve.cpu().numpy(), bins)).to(curve.device)
+        for column, scale in enumerate((loudness, density)):
+            if scale == 0:
+                index[:, column] = 0
+        return index
+
+    def plan(self, memory: SourceMemory, channel: Tensor) -> Tensor:
+        """パッチごとの強弱と音の多さの曲線 [B, S, 2] (カバーの中で標準化した値) を予測する"""
+        B = memory.song.shape[0]
+        K = self.config.source_latents
+        song = memory.song.reshape(B, -1, K * memory.song.shape[-1])
+        valid = memory.song_valid.reshape(B, -1, K)[..., 0]
+        return self.planner(song, self.decoder.channel_embedding(channel), valid)
 
 
 class _TrainingCondition:

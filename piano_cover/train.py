@@ -11,6 +11,8 @@
 --drift-prob の割合で窓の前半のカバーの時刻を原曲からずらし、後半で原曲に戻らせる (DriftConfig、exposure bias 対策)。
 検証の val/loss_resync はずらした直後の 2 パッチだけの損失で、ずれた状態から原曲に戻れるかを測る。
 生成評価では、生成したものが原曲の時刻とメロディにどれだけ合っているか (piano_cover.metrics) も測る。
+--dynamics-bins でデコーダにパッチごとの強弱と音の多さの条件を入れ、Planner (原曲から曲線を予測する) も一緒に
+学習する (損失 loss_plan を --plan-weight 倍して足す)。生成評価では Planner の曲線を条件にする。
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from piano_ar.config import ModelConfig
 from piano_ar.data import AugmentConfig, PianoWindowDataset, PretrainingCache
 from piano_ar.evaluation import piano_roll_image, sample_stats, synthesize
 from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
-from piano_ar.train import context_patches, limit_gpu_memory, lr_at, to_device
+from piano_ar.train import adapt_state, context_patches, limit_gpu_memory, lr_at, to_device
 
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
@@ -84,6 +86,11 @@ def build_args() -> argparse.Namespace:
     parser.add_argument(
         "--drift-prob", type=float, default=0.5, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
     )
+    parser.add_argument(
+        "--dynamics-bins", type=int, default=24, help="デコーダの強弱と音の多さの条件の段階の数 (0 で使わない)"
+    )
+    parser.add_argument("--dynamics-dropout", type=float, default=0.2, help="強弱と音の多さの条件を落とす確率")
+    parser.add_argument("--plan-weight", type=float, default=1.0, help="Planner の損失の重み")
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
@@ -147,8 +154,9 @@ def evaluate(model: CoverModel, loader: DataLoader, device: torch.device) -> dic
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = model(to_device(batch, device))
         tokens = int(output["tokens"])
-        for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS]):
-            sums[key] = sums.get(key, 0.0) + float(output[key]) * tokens
+        for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS], "loss_plan"):
+            if key in output:
+                sums[key] = sums.get(key, 0.0) + float(output[key]) * tokens
         count += tokens
     model.train()
     return {key: value / max(count, 1) for key, value in sums.items()}
@@ -198,6 +206,7 @@ def sample_evaluation(
         source_items = {key: value.to(device) for key, value in source_tensors(features).items()}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             condition = SourceCondition(model, source_items)
+            dynamics = model.planned_dynamics(condition.memory, int(cache.channels[cover]), num_patches)
             patches = model.decoder.generate(
                 tokenizer,
                 num_patches=num_patches,
@@ -208,6 +217,7 @@ def sample_evaluation(
                 condition=condition,
                 condition_cfg_scale=args.sample_source_cfg,
                 end_after=features["features"].shape[0] - 2,
+                dynamics=dynamics,
             )[0]
         events = tokenizer.patches_to_events(patches)
         sync = sync_metrics(events, rows, c.frame_rate)
@@ -259,12 +269,17 @@ def main() -> None:
     cover_config = CoverConfig(**{f.name: getattr(args, f.name) for f in fields(CoverConfig)})
     if args.init_cover:
         pretrained = torch.load(args.init_cover, map_location="cpu", weights_only=False, mmap=True)
-        cover_config = replace(CoverConfig.from_dict(pretrained["cover_config"]), onset_head_dim=args.onset_head_dim)
+        cover_config = replace(
+            CoverConfig.from_dict(pretrained["cover_config"]),
+            onset_head_dim=args.onset_head_dim,
+            planner_dim=args.planner_dim,
+            planner_layers=args.planner_layers,
+        )
     else:
         pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):
         raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
-    model_config = ModelConfig.from_dict(pretrained["model_config"])
+    model_config = replace(ModelConfig.from_dict(pretrained["model_config"]), dynamics_bins=args.dynamics_bins)
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
     memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
 
@@ -278,8 +293,15 @@ def main() -> None:
             song_start_prob=args.song_start_prob,
             channel_dropout=args.channel_dropout,
             memory_patches=memory_patches,
+            dynamics_bins=args.dynamics_bins,
+            dynamics_dropout=args.dynamics_dropout,
         )
-    common = {"window_patches": window_patches, "cover_config": cover_config, "memory_patches": memory_patches}
+    common = {
+        "window_patches": window_patches,
+        "cover_config": cover_config,
+        "memory_patches": memory_patches,
+        "dynamics_bins": args.dynamics_bins,
+    }
     train_set = CoverWindowDataset(
         cache,
         split="train",
@@ -290,6 +312,7 @@ def main() -> None:
         structure_dropout=args.structure_dropout,
         pretraining=pretraining,
         drift=DriftConfig(prob=args.drift_prob) if args.drift_prob > 0 else None,
+        dynamics_dropout=args.dynamics_dropout,
         **common,
     )
     val_set = CoverWindowDataset(cache, split="val", source_dropout=0.0, **common)
@@ -308,6 +331,7 @@ def main() -> None:
                 cover_config=cover_config,
                 memory_patches=memory,
                 val_start_patch=memory_patches,
+                dynamics_bins=args.dynamics_bins,
             )
             for name, memory in (("long", memory_patches), ("long_nomem", 0))
         }
@@ -363,7 +387,7 @@ def main() -> None:
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
         print(f"{args.resume} の step {step} から再開 (これまでの最良の検証損失 {best_val_loss:.4f})")
     elif not args.init_cover:
-        model.decoder.load_state_dict(pretrained["model"])
+        model.decoder.load_state_dict(adapt_state(pretrained["model"], model.decoder))
         print(f"{args.pretrained} (step {pretrained['step']}) でデコーダを初期化")
     if args.compile:
         # inductor は内部のテンプレートを既定の文字コードで読むため、日本語版 Windows (cp932) では失敗する
@@ -427,11 +451,13 @@ def main() -> None:
                 batch = next(loader_iter)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 output = model(to_device(batch, device), args.length_buckets)
-            (output["loss"] / args.grad_accum).backward()
+            loss = output["loss"] + args.plan_weight * output.get("loss_plan", 0.0)
+            (loss / args.grad_accum).backward()
             tokens = int(output["tokens"])
             running_tokens += tokens
-            for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS]):
-                running[key] = running.get(key, 0.0) + float(output[key].detach()) * tokens
+            for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS], "loss_plan"):
+                if key in output:
+                    running[key] = running.get(key, 0.0) + float(output[key].detach()) * tokens
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -450,6 +476,7 @@ def main() -> None:
             print(
                 f"step {step} loss {logs['train/loss']:.4f} "
                 + " ".join(f"{g} {logs[f'train/loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+                + (f" plan {logs['train/loss_plan']:.3f}" if "train/loss_plan" in logs else "")
                 + f" gate {logs['train/cross_gate_mean']:.3f} lr {logs['train/lr']:.2e}"
                 + f" mem {logs.get('train/max_memory_gb', 0):.1f}GB"
                 + f" {logs['train/tokens_per_sec']:.0f} tok/s"
@@ -466,6 +493,7 @@ def main() -> None:
             print(
                 f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}) "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+                + (f" plan {val['loss_plan']:.3f}" if "loss_plan" in val else "")
                 + f" | ずれから戻る loss {resync['loss']:.4f} time {resync['loss_time']:.3f}"
                 + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
             )

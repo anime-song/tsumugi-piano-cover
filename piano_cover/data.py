@@ -13,9 +13,11 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 
 from piano_ar.config import TokenizerConfig
 from piano_ar.data import (
+    DYNAMICS_MIN_NOTES,
     AugmentConfig,
     PianoWindowDataset,
     collate,
+    dynamics_item,
     sampling_weights,
     shift_velocity,
     stretch_events,
@@ -119,7 +121,37 @@ def empty_source() -> dict[str, torch.Tensor]:
         "src_onset": torch.zeros(1, 1, dtype=torch.int32),
         "src_valid": torch.zeros(1, 1, dtype=torch.bool),
         "src_patch_valid": torch.zeros(1, dtype=torch.bool),
+        "plan_target": torch.full((1, 2), float("nan")),
     }
+
+
+def plan_target(
+    events: np.ndarray, align: np.ndarray, align_step: int, factor: float, num_patches: int, patch_frames: int
+) -> np.ndarray:
+    """原曲のパッチごとの、カバーの強さ (平均ベロシティ) と音の多さ (音の数の log) を、カバーの中で標準化したもの [S, 2]。
+
+    Planner (原曲から強弱の曲線を予測する) の正解。カバーの音をアラインメントで原曲の時刻に写して数える。
+    カバーが弾いていない所と、強さを測れない所 (音が少ない) は NaN。
+    """
+    out = np.full((num_patches, 2), np.nan, dtype=np.float32)
+    notes = events[events[:, 1] == 2]
+    if len(notes) < 10:
+        return out
+    mapped = factor * np.interp(notes[:, 0] / factor / align_step, np.arange(len(align)), align)
+    patch = np.clip((mapped // patch_frames).astype(np.int64), 0, num_patches - 1)
+    count = np.bincount(patch, minlength=num_patches)
+    mean = np.bincount(patch, weights=notes[:, 4].astype(np.float64), minlength=num_patches) / np.maximum(count, 1)
+    # カバーが弾いている範囲 (端のパッチは半端なので除く)
+    lo, hi = int(factor * align[0] // patch_frames) + 1, int(factor * align[-1] // patch_frames)
+    inside = np.zeros(num_patches, dtype=bool)
+    inside[max(lo, 0) : max(hi, 0)] = True
+    loud = inside & (count >= DYNAMICS_MIN_NOTES)
+    if loud.sum() >= 5 and mean[loud].std() > 0:
+        out[loud, 0] = (mean[loud] - mean[loud].mean()) / mean[loud].std()
+    density = np.log1p(count[inside])
+    if inside.sum() >= 5 and density.std() > 0:
+        out[inside, 1] = (density - density.mean()) / density.std()
+    return out
 
 
 def source_tensors(features: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
@@ -141,6 +173,8 @@ class CoverWindowDataset(Dataset):
     drift を渡すと、窓の前半のカバーの時刻をずらして後半で原曲に戻らせる (DriftConfig)。検証では窓ごとに決まった乱数で
     ずらすので、毎回同じ窓になる。
     memory_patches と val_start_patch は PianoWindowDataset と同じ (窓の前の記憶。pretraining も同じ長さにそろえる)。
+    dynamics_bins > 0 なら、窓のパッチごとの強弱と音の多さの条件 (piano_ar.data.dynamics_item) と、
+    Planner の正解 (原曲のパッチごとの曲線、plan_target) も返す。
     """
 
     def __init__(
@@ -159,8 +193,12 @@ class CoverWindowDataset(Dataset):
         drift: DriftConfig | None = None,
         memory_patches: int = 0,
         val_start_patch: int = 0,
+        dynamics_bins: int = 0,
+        dynamics_dropout: float = 0.2,
     ) -> None:
         self.cache = cache
+        self.dynamics_bins = dynamics_bins
+        self.dynamics_dropout = dynamics_dropout if split == "train" else 0.0
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
         self.vocab = SourceVocab(cache.tokenizer_config)
         self.window_patches = window_patches
@@ -238,6 +276,9 @@ class CoverWindowDataset(Dataset):
                     rows = rows[rows[:, ROW_TYPE] != row_type]
             features = source_features(rows, source_end, self.tokenizer, self.vocab, self.cover_config.max_source_rows)
             source_items = source_tensors(features)
+            if self.dynamics_bins:
+                target = plan_target(events, align, self.cache.align_step, factor, len(features["features"]), F)
+                source_items["plan_target"] = torch.from_numpy(target)
         else:
             source_items = empty_source()
 
@@ -253,6 +294,7 @@ class CoverWindowDataset(Dataset):
             "align": torch.from_numpy(align_window),
             "has_source": torch.tensor(has_source),
             "patch_loss": torch.from_numpy(patch_loss),
+            **dynamics_item(events, end_frame, start, total, F, self.dynamics_bins, self.dynamics_dropout),
             **source_items,
         }
 
@@ -289,7 +331,7 @@ class CoverWindowDataset(Dataset):
         return patch_loss
 
 
-SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid")
+SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid", "plan_target")
 
 
 def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -308,6 +350,12 @@ def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
         valid[i, :s, :r] = item["src_valid"]
         patch_valid[i, :s] = item["src_patch_valid"]
     out.update(src_features=features, src_onset=onset, src_valid=valid, src_patch_valid=patch_valid)
+    if any("plan_target" in item for item in batch):
+        target = torch.full((len(batch), num_patches, 2), float("nan"))
+        for i, item in enumerate(batch):
+            if "plan_target" in item:
+                target[i, : len(item["plan_target"])] = item["plan_target"]
+        out["plan_target"] = target
     return out
 
 
