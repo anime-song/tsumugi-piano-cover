@@ -36,7 +36,7 @@ from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
 from .metrics import sync_metrics
 from .model import CoverModel, SourceCondition
-from .source import SourceVocab, source_features
+from .source import SourceVocab, source_features, trim_lead
 
 
 def build_args() -> argparse.Namespace:
@@ -182,9 +182,11 @@ def sample_evaluation(
     device = next(model.parameters()).device
     for i, cover in enumerate(covers):
         source = int(cache.source_index[cover])
+        # 生成と同じく原曲の最初の音から始める (出力は原曲の最初の音が 0 の時刻)
+        rows, lead = trim_lead(cache.source_rows(source))
         features = source_features(
-            cache.source_rows(source),
-            int(cache.source_end_frames[source]),
+            rows,
+            int(cache.source_end_frames[source]) - lead,
             tokenizer,
             val_set.vocab,
             model.config.max_source_rows,
@@ -204,7 +206,7 @@ def sample_evaluation(
                 end_after=features["features"].shape[0] - 2,
             )[0]
         events = tokenizer.patches_to_events(patches)
-        sync = sync_metrics(events, cache.source_rows(source), c.frame_rate)
+        sync = sync_metrics(events, rows, c.frame_rate)
         stats.append({**sample_stats(events, c.frame_rate), **sync})
         # wandb に動画 ID が残らないよう、キャッシュ内の番号で名前を付ける
         name = f"cover{i}_source{source}"
