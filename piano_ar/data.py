@@ -109,6 +109,8 @@ class PianoWindowDataset(Dataset):
     学習用 (split="train") は index を曲番号として受け取り、窓の位置はランダム。曲の選び方は
     make_sampler の重みで決める。検証用は曲の冒頭の窓に固定して、毎回同じ入力で損失を測る。
     memory_patches を渡すと、窓の前に最大その数のパッチを記憶 (文脈) として付ける (window_locate)。
+    dynamics_bins > 0 なら、パッチごとの強弱と音の多さの条件 (patch_dynamics) も返す。dynamics_dropout の確率で
+    まるごと外し、残したときもそれぞれを dynamics_dropout / 2 の確率で外す (条件なしでも生成できるように)。
     検証の val_start_patch は、損失を取る窓を曲の何パッチ目から始めるか (記憶が効くかを測るときに曲の途中にする)。
     """
 
@@ -123,9 +125,13 @@ class PianoWindowDataset(Dataset):
         channel_dropout: float = 0.15,
         memory_patches: int = 0,
         val_start_patch: int = 0,
+        dynamics_bins: int = 0,
+        dynamics_dropout: float = 0.2,
     ) -> None:
         self.cache = cache
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
+        self.dynamics_bins = dynamics_bins
+        self.dynamics_dropout = dynamics_dropout if split == "train" else 0.0
         self.window_patches = window_patches
         self.memory_patches = memory_patches
         self.val_start_patch = val_start_patch
@@ -170,7 +176,76 @@ class PianoWindowDataset(Dataset):
             "channel": torch.tensor(channel),
             "song_start": torch.tensor(int(start == 0)),
             "patch_loss": torch.from_numpy(patch_loss),
+            **dynamics_item(
+                events,
+                end_frame,
+                start,
+                len(patch_loss),
+                self.tokenizer.patch_frames,
+                self.dynamics_bins,
+                self.dynamics_dropout,
+            ),
         }
+
+
+# 強弱の条件: 標準化した値を ±DYNAMICS_RANGE で切って dynamics_bins 段階にする (0 は「指定なし」)
+DYNAMICS_RANGE = 3.0
+# 強さを測るのに要る、パッチの中の音の数
+DYNAMICS_MIN_NOTES = 3
+
+
+def quantize_dynamics(z: np.ndarray, bins: int) -> np.ndarray:
+    """標準化した値 [..., 2] を 1..bins の番号にする。NaN (測れない) は 0"""
+    clipped = np.clip(z, -DYNAMICS_RANGE, DYNAMICS_RANGE - 1e-6)
+    index = np.floor((clipped + DYNAMICS_RANGE) / (2 * DYNAMICS_RANGE) * bins)
+    return np.where(np.isnan(z), 0, index + 1).astype(np.int64)
+
+
+def patch_dynamics(events: np.ndarray, end_frame: int, start: int, num_patches: int, patch_frames: int) -> np.ndarray:
+    """窓の各パッチの強さ (平均ベロシティ) と音の多さ (音の数の log) を、曲全体の 2 秒ごとの値で標準化して返す [P, 2]。
+
+    曲の中での相対的な強弱なので、演奏者や採譜による音量の絶対値の違いは入らない (学習データの YouTube の採譜は
+    強弱の幅が MAESTRO の 6 割ほどしかない)。生成では、この曲線を予測して (piano_cover の Planner)、幅を広げて渡せる。
+    音が少なくて強さを測れないパッチは NaN。
+    """
+    out = np.full((num_patches, 2), np.nan)
+    notes = events[events[:, KIND] == KIND_NOTE]
+    if len(notes) < 10:
+        return out
+    onset, velocity = notes[:, ONSET].astype(np.int64), notes[:, VELOCITY].astype(np.float64)
+    total = max(1, -(-end_frame // patch_frames))
+    index = np.clip(onset // patch_frames, 0, total - 1)
+    count = np.bincount(index, minlength=total)
+    mean = np.bincount(index, weights=velocity, minlength=total) / np.maximum(count, 1)
+    loud = mean[count >= DYNAMICS_MIN_NOTES]
+    density = np.log1p(count)
+    relative = onset - start
+    inside = (relative >= 0) & (relative < num_patches * patch_frames)
+    window = relative[inside] // patch_frames
+    wcount = np.bincount(window, minlength=num_patches)
+    wmean = np.bincount(window, weights=velocity[inside], minlength=num_patches) / np.maximum(wcount, 1)
+    if len(loud) >= 2 and loud.std() > 0:
+        out[:, 0] = np.where(wcount >= DYNAMICS_MIN_NOTES, (wmean - loud.mean()) / loud.std(), np.nan)
+    if density.std() > 0:
+        out[:, 1] = (np.log1p(wcount) - density.mean()) / density.std()
+    return out
+
+
+def dynamics_item(
+    events: np.ndarray, end_frame: int, start: int, num_patches: int, patch_frames: int, bins: int, dropout: float
+) -> dict[str, torch.Tensor]:
+    """データセットの 1 件に入れる強弱の条件 {"dynamics": [P, 2] の番号}。bins = 0 なら何も入れない"""
+    if not bins:
+        return {}
+    index = quantize_dynamics(patch_dynamics(events, end_frame, start, num_patches, patch_frames), bins)
+    if dropout > 0:
+        if random.random() < dropout:
+            index[:] = 0
+        else:
+            for column in range(2):
+                if random.random() < dropout / 2:
+                    index[:, column] = 0
+    return {"dynamics": torch.from_numpy(index)}
 
 
 def window_locate(

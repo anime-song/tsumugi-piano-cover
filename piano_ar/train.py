@@ -9,6 +9,9 @@
 --memory-seconds の長さの記憶を窓の前に付ける。記憶のパッチは要約を勾配なしで作って Global に入れるだけなので、
 曲全体を文脈にしても学習の重さはほとんど変わらない (PianoARModel.forward)。検証では曲の途中 (記憶の長さの位置) から
 始まる窓で、記憶ありとなしの損失を比べる (val_long / val_long_nomem)。
+
+--dynamics-bins の段階で、パッチごとの強さと音の多さ (曲の中で標準化したもの) を条件に入れる (patch_dynamics)。
+--dynamics-dropout の確率で外して学習するので、条件なしでも生成できる。
 検証の損失がそれまでで最も低くなったら out-dir/best.pt にも保存する。
 --sample-every ごとに曲を生成して out-dir/samples に MIDI で保存し、wandb には音声とピアノロールを送る。
 """
@@ -55,6 +58,7 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--song-start-prob", type=float, default=0.1, help="窓を曲の冒頭から切り出す確率")
     parser.add_argument("--channel-dropout", type=float, default=0.15, help="チャンネル条件を落とす確率")
+    parser.add_argument("--dynamics-dropout", type=float, default=0.2, help="強弱と音の多さの条件を落とす確率")
     parser.add_argument(
         "--channel-alpha",
         type=float,
@@ -103,6 +107,8 @@ def build_args() -> argparse.Namespace:
     for field in fields(ModelConfig):
         if field.name != "num_channels":
             parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(field.default), default=field.default)
+    # ModelConfig の既定値 0 は以前のチェックポイントを読むためのもの。新しく学習するときは強弱の条件を入れる
+    parser.set_defaults(dynamics_bins=24)
     return parser.parse_args()
 
 
@@ -132,14 +138,24 @@ def context_patches(args: dict | argparse.Namespace, patch_seconds: float) -> in
     return round((values["window_seconds"] + values.get("memory_seconds", 0.0)) / patch_seconds)
 
 
-def expand_channels(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """チェックポイントのチャンネルの埋め込みが model より少なければ、既存の分をそのまま使い、増えた分は model の初期値にする"""
+def adapt_state(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """以前のチェックポイントの重みを、今の model に読めるようにする。
+
+    チャンネルの埋め込みが model より少なければ、既存の分をそのまま使い、増えた分は model の初期値にする
+    (channel_index は追記だけなので番号は変わらない)。あとから足した部分 (強弱の条件など) がなければ model の初期値
+    (0 で始まるので、足す前と同じ出力) を使う。
+    """
+    state = dict(state)
+    current = model.state_dict()
     key = "channel_embedding.weight"
-    old, new = state[key], model.state_dict()[key]
+    old, new = state[key], current[key]
     if old.shape[0] < new.shape[0]:
-        state = dict(state)
         state[key] = torch.cat([old.to(new.dtype), new[old.shape[0] :].to(old.device)])
         print(f"チャンネルの埋め込みを {old.shape[0]} -> {new.shape[0]} に増やした")
+    for key in current.keys() - state.keys():
+        if key.startswith("dynamics_embedding"):
+            state[key] = current[key]
+            print(f"{key} はチェックポイントにないので新しく作る")
     return state
 
 
@@ -293,7 +309,11 @@ def main() -> None:
     init = None
     if args.init_from and not args.resume:
         init = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        model_config = replace(ModelConfig.from_dict(init["model_config"]), num_channels=cache.meta["num_channels"])
+        model_config = replace(
+            ModelConfig.from_dict(init["model_config"]),
+            num_channels=cache.meta["num_channels"],
+            dynamics_bins=args.dynamics_bins,
+        )
     source_weights = {
         name: float(value) for name, value in (item.split("=") for item in args.source_weights.split(",") if item)
     }
@@ -306,13 +326,23 @@ def main() -> None:
         song_start_prob=args.song_start_prob,
         channel_dropout=args.channel_dropout,
         memory_patches=memory_patches,
+        dynamics_bins=model_config.dynamics_bins,
+        dynamics_dropout=args.dynamics_dropout,
     )
-    val_set = PianoWindowDataset(cache, split="val", window_patches=window_patches, memory_patches=memory_patches)
+    dynamics = {"dynamics_bins": model_config.dynamics_bins}
+    val_set = PianoWindowDataset(
+        cache, split="val", window_patches=window_patches, memory_patches=memory_patches, **dynamics
+    )
     # 曲の途中から始まる窓で、記憶ありとなしを比べる (記憶がどれだけ効いているか)
     long_sets = (
         {
             name: PianoWindowDataset(
-                cache, split="val", window_patches=window_patches, memory_patches=memory, val_start_patch=memory_patches
+                cache,
+                split="val",
+                window_patches=window_patches,
+                memory_patches=memory,
+                val_start_patch=memory_patches,
+                **dynamics,
             )
             for name, memory in (("long", memory_patches), ("long_nomem", 0))
         }
@@ -356,7 +386,7 @@ def main() -> None:
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
         print(f"{args.resume} の step {step} から再開 (これまでの最良の検証損失 {best_val_loss:.4f})")
     elif init is not None:
-        model.load_state_dict(expand_channels(init["model"], model))
+        model.load_state_dict(adapt_state(init["model"], model))
         print(f"{args.init_from} (step {init['step']}) の重みから始める")
         del init
     if args.compile:
