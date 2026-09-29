@@ -153,6 +153,28 @@ def load_source(path: str | Path, frame_rate: int) -> tuple[np.ndarray, int]:
     return sort_rows(array).astype(np.int32), end_frame
 
 
+def onset_time_bias(
+    rows: np.ndarray, num_patches: int, patch_frames: int, strength: float, width_frames: float
+) -> np.ndarray:
+    """原曲の onset (全楽器の音と拍) に近いほど大きい値 [num_patches, patch_frames]。
+
+    生成で TIME の logit に足して (PianoARModel.generate の time_bias)、出力の onset を原曲の onset に寄せる。
+    strength * exp(-d^2 / (2 width^2))、d は一番近い原曲の onset までのフレーム数。
+    カバーモデルは原曲のどこを見るかは合っているが、次の onset は自分のリズムで決めていて、
+    テンポが少しずつずれては 8 分音符 1 つ分で戻る。毎回その場で原曲の onset に合わせ直すことで、ずれが溜まらなくなる。
+    """
+    frames = np.arange(num_patches * patch_frames)
+    onsets = np.unique(rows[(rows[:, ROW_TYPE] == TYPE_NOTE) | (rows[:, ROW_TYPE] == TYPE_BEAT), ROW_ONSET])
+    if len(onsets) == 0:
+        return np.zeros((num_patches, patch_frames), dtype=np.float32)
+    index = np.searchsorted(onsets, frames)
+    after = onsets[np.minimum(index, len(onsets) - 1)]
+    before = onsets[np.maximum(index - 1, 0)]
+    distance = np.minimum(np.abs(after - frames), np.abs(frames - before))
+    bias = strength * np.exp(-0.5 * (distance / width_frames) ** 2)
+    return bias.reshape(num_patches, patch_frames).astype(np.float32)
+
+
 def sort_rows(rows: np.ndarray) -> np.ndarray:
     return rows[np.lexsort((rows[:, ROW_A], rows[:, ROW_TYPE], rows[:, ROW_ONSET]))]
 

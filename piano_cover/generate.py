@@ -1,9 +1,10 @@
 """原曲の MIDI (tsumugi で採譜したもの) からピアノカバーを生成する。
 
 python -m piano_cover.generate --checkpoint checkpoints/piano_cover/best.pt --source Dataset/original_midis_v2/merged/<id>.mid
-python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.5 --channel-cfg 1.5 --seconds 60 --wav
+python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.75 --onset-bias 4 --seconds 60 --wav
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
+--onset-bias を付けると、出力の onset を原曲の onset (全楽器の音と拍) に寄せる (onset_time_bias)。
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from piano_ar.tokenizer import PianoTokenizer
 from .config import CoverConfig
 from .data import source_tensors
 from .model import CoverModel, SourceCondition
-from .source import SourceVocab, load_source, source_features
+from .source import SourceVocab, load_source, onset_time_bias, source_features
 
 
 def main() -> None:
@@ -39,6 +40,13 @@ def main() -> None:
     parser.add_argument(
         "--channel-cfg", type=float, default=1.0, help="> 1 で演奏者らしさを強める (--channel を指定したときだけ効く)"
     )
+    parser.add_argument(
+        "--onset-bias",
+        type=float,
+        default=0.0,
+        help="原曲の onset に出力の onset を寄せる強さ (TIME の logit に足す最大値)。0 で使わない。4 前後がよい",
+    )
+    parser.add_argument("--onset-bias-width", type=float, default=0.02, help="寄せる範囲 (秒)")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
     args = parser.parse_args()
@@ -81,6 +89,15 @@ def main() -> None:
         "condition_cfg_scale": args.source_cfg,
         "context_patches": round(checkpoint["args"]["window_seconds"] / patch_seconds),
     }
+    if args.onset_bias:
+        bias = onset_time_bias(
+            rows,
+            num_patches,
+            tokenizer.patch_frames,
+            args.onset_bias,
+            args.onset_bias_width * tokenizer.config.frame_rate,
+        )
+        common["time_bias"] = torch.from_numpy(bias).to(device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         condition = SourceCondition(model, source)
         samples = model.decoder.generate(tokenizer, num_samples=args.num_samples, condition=condition, **common)
@@ -89,7 +106,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for i, patches in enumerate(samples):
         events = tokenizer.patches_to_events(patches)
-        manner = f"ch{channel}"
+        manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
         tokenizer.events_to_midi(events, path)
         if args.wav:
