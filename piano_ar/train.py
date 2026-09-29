@@ -349,6 +349,11 @@ def main() -> None:
         if memory_patches
         else {}
     )
+    if model_config.dynamics_bins:
+        # 強弱の条件を外した検証 (条件がどれだけ効いているか)
+        long_sets["nodyn"] = PianoWindowDataset(
+            cache, split="val", window_patches=window_patches, memory_patches=memory_patches
+        )
     micro_steps = args.steps * args.grad_accum
     train_loader = DataLoader(
         train_set,
@@ -475,17 +480,24 @@ def main() -> None:
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
-            long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
+            extra = {name: evaluate(model, loader, device) for name, loader in long_loaders.items()}
+            long = {name: result["loss"] for name, result in extra.items()}
             print(
                 f"[val] step {step} loss {val['loss']:.4f} "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
-                + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
+                + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if "long" in long else "")
+                + (f" | 強弱の条件なし {long['nodyn']:.4f}" if "nodyn" in long else "")
             )
             if wandb_run:
                 logs = {f"val/{k}": v for k, v in val.items()}
                 logs.update({f"val/loss_{name}": v for name, v in long.items()})
-                if long:
+                if "long" in long:
                     logs["val/memory_gain"] = long["long_nomem"] - long["long"]
+                if "nodyn" in extra:
+                    # 条件で主に変わるのはベロシティと音の数 (パッチの終わり・TIME) なので、それぞれの差も見る
+                    logs["val/dynamics_gain"] = long["nodyn"] - val["loss"]
+                    for g in ("velocity", "time", "end"):
+                        logs[f"val/dynamics_gain_{g}"] = extra["nodyn"][f"loss_{g}"] - val[f"loss_{g}"]
                 wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]

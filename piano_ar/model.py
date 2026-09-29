@@ -322,6 +322,8 @@ class PianoARModel(nn.Module):
         # 既定の上限 (8) を超えると以降は compile されずに通常実行になるので、余裕を持たせる
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.cache_size_limit = 64
+        # グラフが増えたときに、checkpoint の再計算が forward と別のグラフを選ばないよう、見る順番を固定する
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
         for module in self.modules():
             if isinstance(module, (Block, CrossBlock)):
                 module.compile(dynamic=True)
@@ -365,7 +367,9 @@ class PianoARModel(nn.Module):
         summarized = summarize(flat, buckets)
         summaries = summarized.new_zeros(*valid.shape, self.config.dim)
         if memory.any():
-            with torch.no_grad():
+            # 記憶は compile しない通常の実行で通す。勾配なしの呼び出しで compile のグラフが増えると、gradient checkpointing の
+            # 再計算が forward と別のグラフを選んで失敗する (pytorch/pytorch#166926)
+            with torch.no_grad(), torch.compiler.set_stance("force_eager"):
                 patches = tokens[memory]
                 summaries[memory] = summarize(patches, length_buckets(patches)).to(summaries.dtype)
         summaries[patch_loss] = summarized
