@@ -6,6 +6,8 @@ python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.75 --onse
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
 生成は原曲の最初の音から始め (trim_lead)、出力はそのぶん後ろにずらして原曲の時刻に戻す。
 --onset-bias を付けると、出力の onset を原曲の onset (全楽器の音と拍) に寄せる (onset_time_bias)。
+Planner のあるモデルは、原曲から予測した強弱と音の多さの曲線を条件にして生成する。--dynamics / --density は
+その曲線の山と谷を何倍にするか (1 で学習データと同じくらい、大きくするほどメリハリが付く。0 で指定なし)。
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ def main() -> None:
         help="原曲の onset に出力の onset を寄せる強さ (TIME の logit に足す最大値)。0 で使わない。4 前後がよい",
     )
     parser.add_argument("--onset-bias-width", type=float, default=0.02, help="寄せる範囲 (秒)")
+    parser.add_argument("--dynamics", type=float, default=1.0, help="強弱の曲線の倍率 (0 で指定なし)")
+    parser.add_argument("--density", type=float, default=1.0, help="音の多さの曲線の倍率 (0 で指定なし)")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
     args = parser.parse_args()
@@ -106,7 +110,10 @@ def main() -> None:
         common["time_bias"] = torch.from_numpy(bias).to(device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         condition = SourceCondition(model, source)
-        samples = model.decoder.generate(tokenizer, num_samples=args.num_samples, condition=condition, **common)
+        dynamics = model.planned_dynamics(condition.memory, channel, num_patches, args.dynamics, args.density)
+        samples = model.decoder.generate(
+            tokenizer, num_samples=args.num_samples, condition=condition, dynamics=dynamics, **common
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -27,8 +27,13 @@ class CoverConfig:
     local_cross_radius: int = 1
     # 学習できる onset-bias (OnsetHead) の中の幅。原曲の onset の位置を Local の TIME の予測に直接足す。0 で使わない
     onset_head_dim: int = 32
+    # 原曲の全体から、パッチごとの強弱と音の多さの曲線を予測する Planner の幅と層数 (0 で使わない)。
+    # デコーダの強弱の条件 (ModelConfig.dynamics_bins) と一緒に使う
+    planner_dim: int = 256
+    planner_layers: int = 3
 
     @classmethod
     def from_dict(cls, values: dict) -> CoverConfig:
-        """チェックポイントに保存した設定から作る。onset_head_dim のない以前のチェックポイントは OnsetHead なし"""
-        return cls(**{"onset_head_dim": 0, **values})
+        """チェックポイントに保存した設定から作る。あとから足した部分 (OnsetHead・Planner) のない以前のチェックポイントは、
+        それらなしとして読む"""
+        return cls(**{"onset_head_dim": 0, "planner_dim": 0, **values})
