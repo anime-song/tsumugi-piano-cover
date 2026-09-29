@@ -8,6 +8,8 @@
 --freeze-loaded ならそのとき読んだ重みは固定して、足した部分だけを学習する。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
+--drift-prob の割合で窓の前半のカバーの時刻を原曲からずらし、後半で原曲に戻らせる (DriftConfig、exposure bias 対策)。
+検証の val/loss_resync はずらした直後の 2 パッチだけの損失で、ずれた状態から原曲に戻れるかを測る。
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
 from piano_ar.train import limit_gpu_memory, lr_at, to_device
 
 from .config import CoverConfig
-from .data import CoverCache, CoverWindowDataset, collate_cover, make_cover_sampler, source_tensors
+from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
 from .model import CoverModel, SourceCondition
 from .source import SourceVocab, source_features
 
@@ -73,6 +75,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--channel-dropout", type=float, default=0.15)
     parser.add_argument("--source-dropout", type=float, default=0.1, help="原曲を外す確率 (CFG 用)")
     parser.add_argument("--structure-dropout", type=float, default=0.2, help="拍・コード・キーをそれぞれ外す確率")
+    parser.add_argument(
+        "--drift-prob", type=float, default=0.0, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
+    )
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
@@ -269,10 +274,14 @@ def main() -> None:
         source_dropout=args.source_dropout,
         structure_dropout=args.structure_dropout,
         pretraining=pretraining,
+        drift=DriftConfig(prob=args.drift_prob) if args.drift_prob > 0 else None,
         **common,
     )
     val_set = CoverWindowDataset(cache, split="val", source_dropout=0.0, **common)
     val_nosource = CoverWindowDataset(cache, split="val", source_dropout=1.0, **common)
+    val_resync = CoverWindowDataset(
+        cache, split="val", source_dropout=0.0, drift=DriftConfig(prob=1.0, loss_patches=2), **common
+    )
     micro_steps = args.steps * args.grad_accum
     loader_options = {"num_workers": args.num_workers, "collate_fn": collate_cover}
     train_loader = DataLoader(
@@ -286,6 +295,7 @@ def main() -> None:
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, **loader_options)
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
+    val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options)
     print(
         f"学習 カバー {len(train_set.covers)} 本 (+ 事前学習 {len(pretraining) if pretraining else 0} 曲を"
         f" {args.pretrain_mix:.0%}) / 検証 {len(val_set)} 本 / 窓 {window_patches} パッチ"
@@ -416,15 +426,18 @@ def main() -> None:
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
+            resync = evaluate(model, val_resync_loader, device)
             print(
                 f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}) "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+                + f" | ずれから戻る loss {resync['loss']:.4f} time {resync['loss_time']:.3f}"
             )
             if wandb_run:
                 logs = {f"val/{k}": v for k, v in val.items()}
                 logs.update(
                     {"val/loss_nosource": val_nosource_loss, "val/source_gain": val_nosource_loss - val["loss"]}
                 )
+                logs.update({f"val_resync/{k}": v for k, v in resync.items()})
                 wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]
