@@ -201,6 +201,7 @@ def sample_evaluation(
                 context_patches=round(args.window_seconds / c.patch_seconds),
                 condition=condition,
                 condition_cfg_scale=args.sample_source_cfg,
+                end_after=features["features"].shape[0] - 2,
             )[0]
         events = tokenizer.patches_to_events(patches)
         sync = sync_metrics(events, cache.source_rows(source), c.frame_rate)

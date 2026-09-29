@@ -18,7 +18,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
-from .tokenizer import PAD, TOKEN_GROUPS, PatchGrammar, PianoTokenizer
+from .tokenizer import EOS, PAD, TOKEN_GROUPS, PatchGrammar, PianoTokenizer
 
 # Transformer のブロックの後に挟む処理 (ブロック番号, x) -> x。カバーモデルの cross-attention に使う
 CrossHook = Callable[[int, Tensor], Tensor]
@@ -392,6 +392,7 @@ class PianoARModel(nn.Module):
         condition: GenerationConditionSource | None = None,
         condition_cfg_scale: float = 1.0,
         time_bias: Tensor | None = None,
+        end_after: int = 0,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -401,6 +402,7 @@ class PianoARModel(nn.Module):
         condition (原曲など) を渡すと cross-attention で条件を入れる。
         time_bias [num_patches, patch_frames] を渡すと、パッチ内の各 onset の TIME トークンの logit にその値を足す
         (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
+        end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -469,6 +471,8 @@ class PianoARModel(nn.Module):
                 logits = self.local_forward(sequence, context, local_cross, local_output)[:, -1].float()
                 logits = guide(logits)
                 allowed = torch.stack([g.allowed() for g in grammars]).to(device)
+                if p < end_after:
+                    allowed[:, EOS] = False  # EOP はいつも一緒に許されているので、パッチは EOP で終われる
                 logits = logits.masked_fill(~allowed, float("-inf"))
                 if time_bias is not None:
                     logits = _bias_time(logits, time_bias[p].to(logits), tokenizer)
