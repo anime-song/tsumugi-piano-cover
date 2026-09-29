@@ -4,6 +4,8 @@
 
 --pretrained の重みでデコーダを初期化し、新しく足した部分は --lr、デコーダは --lr x --decoder-lr-scale で学習する。
 --freeze-decoder ならデコーダは固定して、新しく足した部分だけを学習する (Flamingo と同じ)。
+--init-cover なら学習済みのカバーモデルから始めて、あとから足した部分 (--onset-head-dim の OnsetHead など) を足す。
+--freeze-loaded ならそのとき読んだ重みは固定して、足した部分だけを学習する。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
 """
@@ -14,7 +16,7 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +41,15 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", default="checkpoints/piano_ar/best.pt")
     parser.add_argument("--out-dir", default="checkpoints/piano_cover")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--init-cover",
+        default=None,
+        help="学習済みのカバーモデルで初期化する (--pretrained の代わり)。設定はそのチェックポイントのものを使い、"
+        "--onset-head-dim だけ引数で変えられる",
+    )
+    parser.add_argument(
+        "--freeze-loaded", action="store_true", help="--init-cover で読んだ重みを固定して、足した部分だけを学習する"
+    )
     parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
     parser.add_argument("--window-seconds", type=float, default=64.0)
@@ -228,7 +239,11 @@ def main() -> None:
     tokenizer = PianoTokenizer(cache.tokenizer_config)
     vocab = SourceVocab(cache.tokenizer_config)
     cover_config = CoverConfig(**{f.name: getattr(args, f.name) for f in fields(CoverConfig)})
-    pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+    if args.init_cover:
+        pretrained = torch.load(args.init_cover, map_location="cpu", weights_only=False, mmap=True)
+        cover_config = replace(CoverConfig(**pretrained["cover_config"]), onset_head_dim=args.onset_head_dim)
+    else:
+        pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):
         raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
     model_config = ModelConfig.from_dict(pretrained["model_config"])
@@ -280,6 +295,17 @@ def main() -> None:
     model.set_gradient_checkpointing(not args.no_grad_checkpoint)
     if args.freeze_decoder:
         model.decoder.requires_grad_(False)
+    if args.init_cover:
+        missing, unexpected = model.load_state_dict(pretrained["model"], strict=False)
+        if unexpected:
+            raise SystemExit(f"{args.init_cover} にこのモデルにない重みがあります: {unexpected[:5]}")
+        if args.freeze_loaded:
+            loaded = set(pretrained["model"])
+            for name, param in model.named_parameters():
+                if name in loaded:
+                    param.requires_grad_(False)
+        if not args.resume:
+            print(f"{args.init_cover} (step {pretrained['step']}) で初期化 (足した重み {len(missing)} 個)")
     optimizer = make_optimizer(model, args)
     step = 0
     best_val_loss = float("inf")
@@ -291,7 +317,7 @@ def main() -> None:
         step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
         print(f"{args.resume} の step {step} から再開 (これまでの最良の検証損失 {best_val_loss:.4f})")
-    else:
+    elif not args.init_cover:
         model.decoder.load_state_dict(pretrained["model"])
         print(f"{args.pretrained} (step {pretrained['step']}) でデコーダを初期化")
     if args.compile:
