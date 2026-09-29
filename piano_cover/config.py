@@ -26,4 +26,9 @@ class CoverConfig:
     # Local が見る原曲の音の範囲 (対応するパッチから ± 何パッチ)
     local_cross_radius: int = 1
     # 学習できる onset-bias (OnsetHead) の中の幅。原曲の onset の位置を Local の TIME の予測に直接足す。0 で使わない
-    onset_head_dim: int = 0
+    onset_head_dim: int = 32
+
+    @classmethod
+    def from_dict(cls, values: dict) -> CoverConfig:
+        """チェックポイントに保存した設定から作る。onset_head_dim のない以前のチェックポイントは OnsetHead なし"""
+        return cls(**{"onset_head_dim": 0, **values})
