@@ -42,6 +42,8 @@ class ModelConfig:
     # パッチごとの強さ (平均ベロシティ) と音の多さを、曲の中で標準化して何段階の条件にするか (0 で使わない)。
     # 以前のチェックポイントにはないので既定は 0 (新しく学習するときは piano_ar.train の既定値で入れる)
     dynamics_bins: int = 0
+    # 条件の列の数。強さと音の多さの 2 列に、カバーでは編曲の性質 (piano_cover.arrangement) を後ろに足す
+    dynamics_columns: int = 2
 
     @classmethod
     def from_dict(cls, values: dict) -> ModelConfig:
