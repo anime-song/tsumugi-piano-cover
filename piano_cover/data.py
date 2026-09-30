@@ -18,14 +18,16 @@ from piano_ar.data import (
     PianoWindowDataset,
     collate,
     dynamics_item,
+    quantize_dynamics,
     sampling_weights,
     shift_velocity,
     stretch_events,
     transpose_events,
     window_locate,
 )
-from piano_ar.tokenizer import ONSET, PianoTokenizer, sort_events
+from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PianoTokenizer, sort_events
 
+from .arrangement import ARRANGEMENT_NAMES, arrangement_values, map_to_source
 from .config import CoverConfig
 from .source import (
     ROW_TYPE,
@@ -196,7 +198,8 @@ class CoverWindowDataset(Dataset):
     ずらすので、毎回同じ窓になる。
     memory_patches と val_start_patch は PianoWindowDataset と同じ (窓の前の記憶。pretraining も同じ長さにそろえる)。
     dynamics_bins > 0 なら、窓のパッチごとの強弱と音の多さの条件 (piano_ar.data.dynamics_item) と、
-    Planner の正解 (原曲のパッチごとの曲線、plan_target) も返す。
+    Planner の正解 (原曲のパッチごとの曲線、plan_target) も返す。arrangement なら、その後ろに編曲の性質
+    (piano_cover.arrangement の fill / above / span) の列も足す (条件は強弱と同じ確率で列ごとに落とす)。
     sync_mask なら、原曲に沿っていない所 (キャッシュの align_ok が半分以上 0 のパッチ) の損失を取らない
     (窓の損失を取るパッチが全部なくなるときは外さない)。
     """
@@ -219,9 +222,11 @@ class CoverWindowDataset(Dataset):
         val_start_patch: int = 0,
         dynamics_bins: int = 0,
         dynamics_dropout: float = 0.2,
+        arrangement: bool = False,
         sync_mask: bool = False,
     ) -> None:
         self.cache = cache
+        self.arrangement = arrangement and dynamics_bins > 0
         self.sync_mask = sync_mask
         self.dynamics_bins = dynamics_bins
         self.dynamics_dropout = dynamics_dropout if split == "train" else 0.0
@@ -250,6 +255,10 @@ class CoverWindowDataset(Dataset):
             item["align"] = torch.zeros(len(item["tokens"]), 2)
             item["has_source"] = torch.tensor(False)
             item.update(empty_source())
+            if self.arrangement and "dynamics" in item:
+                # 事前学習の曲には原曲がないので、編曲の性質の列は「指定なし」
+                extra = torch.zeros(len(item["dynamics"]), len(ARRANGEMENT_NAMES), dtype=item["dynamics"].dtype)
+                item["dynamics"] = torch.cat([item["dynamics"], extra], dim=1)
             return item
 
         cover = int(self.covers[index])
@@ -302,6 +311,12 @@ class CoverWindowDataset(Dataset):
         bounds = start + np.arange(total + 1) * F
         mapped = factor * np.interp(bounds / factor / self.cache.align_step, np.arange(len(align)), align)
         align_window = np.stack([mapped[:-1], mapped[1:]], axis=1).astype(np.float32)
+        frame_rate = self.tokenizer.config.frame_rate
+        if self.arrangement:
+            notes = events[events[:, KIND] == KIND_NOTE]
+            note_times = map_to_source(notes[:, ONSET].astype(np.float64), align, self.cache.align_step, factor)
+            # 窓の各パッチの編曲の性質 (パッチの境界を原曲の時刻に写した区間で測る)
+            window_arrangement = arrangement_values(events, note_times, rows, mapped, frame_rate)
 
         has_source = random.random() >= self.source_dropout
         if has_source:
@@ -311,7 +326,11 @@ class CoverWindowDataset(Dataset):
             features = source_features(rows, source_end, self.tokenizer, self.vocab, self.cover_config.max_source_rows)
             source_items = source_tensors(features)
             if self.dynamics_bins:
-                target = plan_target(events, align, self.cache.align_step, factor, len(features["features"]), F)
+                S = len(features["features"])
+                target = plan_target(events, align, self.cache.align_step, factor, S, F)
+                if self.arrangement:
+                    values = arrangement_values(events, note_times, rows, np.arange(S + 1) * F, frame_rate)
+                    target = np.concatenate([target, values.astype(np.float32)], axis=1)
                 source_items["plan_target"] = torch.from_numpy(target)
         else:
             source_items = empty_source()
@@ -319,6 +338,17 @@ class CoverWindowDataset(Dataset):
         channel = int(self.cache.channels[cover])
         if random.random() < self.channel_dropout:
             channel = 0
+        dynamics = dynamics_item(events, end_frame, start, total, F, self.dynamics_bins, self.dynamics_dropout)
+        if self.arrangement:
+            index = quantize_dynamics(window_arrangement, self.dynamics_bins)
+            if self.dynamics_dropout > 0:
+                if random.random() < self.dynamics_dropout:
+                    index[:] = 0
+                else:
+                    for column in range(index.shape[1]):
+                        if random.random() < self.dynamics_dropout / 2:
+                            index[:, column] = 0
+            dynamics["dynamics"] = torch.cat([dynamics["dynamics"], torch.from_numpy(index)], dim=1)
         return {
             "tokens": torch.from_numpy(window["tokens"]),
             "patch_valid": torch.from_numpy(window["patch_valid"]),
@@ -328,7 +358,7 @@ class CoverWindowDataset(Dataset):
             "align": torch.from_numpy(align_window),
             "has_source": torch.tensor(has_source),
             "patch_loss": torch.from_numpy(patch_loss),
-            **dynamics_item(events, end_frame, start, total, F, self.dynamics_bins, self.dynamics_dropout),
+            **dynamics,
             **source_items,
         }
 
@@ -385,10 +415,13 @@ def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
         patch_valid[i, :s] = item["src_patch_valid"]
     out.update(src_features=features, src_onset=onset, src_valid=valid, src_patch_valid=patch_valid)
     if any("plan_target" in item for item in batch):
-        target = torch.full((len(batch), num_patches, 2), float("nan"))
+        # 原曲のない行 (事前学習の曲) の正解は列が少ない (すべて NaN) ので、一番多い列に合わせる
+        columns = max(item["plan_target"].shape[1] for item in batch if "plan_target" in item)
+        target = torch.full((len(batch), num_patches, columns), float("nan"))
         for i, item in enumerate(batch):
             if "plan_target" in item:
-                target[i, : len(item["plan_target"])] = item["plan_target"]
+                s, c = item["plan_target"].shape
+                target[i, :s, :c] = item["plan_target"]
         out["plan_target"] = target
     return out
 

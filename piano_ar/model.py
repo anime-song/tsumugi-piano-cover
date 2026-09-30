@@ -86,6 +86,21 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
+def prepare_block_compile(recompile_limit: int = 64) -> None:
+    """ブロック単位の torch.compile の前に、作り直しの上限を上げて、使うグラフの順番を固定する。
+
+    ブロックの種類 x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。既定の上限 (8) を超えると
+    以降は compile されずに通常実行になり、gradient checkpointing の再計算が forward と別の実行 (graph) になって失敗する。
+    torch 2.13 から dynamo の設定への代入はスレッドごとで、backward (checkpoint の再計算) は autograd の別スレッドで
+    動くので、代入ではなく既定値を書き換えて全スレッドに効かせる。
+    """
+    for name in ("recompile_limit", "cache_size_limit"):
+        setattr(torch._dynamo.config, name, recompile_limit)
+    torch._dynamo.config._config["recompile_limit"].default = recompile_limit
+    # グラフが増えたときに、checkpoint の再計算が forward と別のグラフを選ばないよう、見る順番を固定する
+    torch._C._dynamo.eval_frame._set_lru_cache(False)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -240,9 +255,9 @@ class PianoARModel(nn.Module):
         self.bos = nn.Embedding(2, dim)
         self.pedal_embedding = nn.Embedding(2, dim)
         self.channel_embedding = nn.Embedding(config.num_channels, dim)
-        # パッチごとの強さと音の多さ (0 は指定なし)。強さの番号 0..bins と、音の多さの番号 + (bins + 1) を同じ表で引く
+        # パッチごとの強さと音の多さなど (0 は指定なし)。列 c の番号 + c * (bins + 1) を同じ表で引く
         if config.dynamics_bins:
-            self.dynamics_embedding = nn.Embedding(2 * (config.dynamics_bins + 1), dim)
+            self.dynamics_embedding = nn.Embedding(config.dynamics_columns * (config.dynamics_bins + 1), dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
@@ -285,11 +300,11 @@ class PianoARModel(nn.Module):
         dynamics: Tensor | None = None,
     ) -> Tensor:
         """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す。
-        dynamics [B, P, 2] はパッチ p の強さと音の多さの番号 (0 は指定なし)"""
+        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
         if dynamics is not None and self.config.dynamics_bins:
-            offset = torch.tensor([0, self.config.dynamics_bins + 1], device=dynamics.device)
+            offset = torch.arange(dynamics.shape[-1], device=dynamics.device) * (self.config.dynamics_bins + 1)
             inputs = inputs + self.dynamics_embedding(dynamics + offset).sum(-2)
         return self.global_transformer(inputs, cross=cross)
 
@@ -318,12 +333,7 @@ class PianoARModel(nn.Module):
         使い回せる。学習時間の多くは行列積ではなく RMSNorm・RoPE・型変換などの細かい演算なので、融合の効果が大きい。
         nn.Module.compile はその場で置き換えるので、state_dict のキー名は変わらない。最初の 1 ステップは数分かかる。
         """
-        # ブロックの種類 x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。
-        # 既定の上限 (8) を超えると以降は compile されずに通常実行になるので、余裕を持たせる
-        torch._dynamo.config.recompile_limit = 64
-        torch._dynamo.config.cache_size_limit = 64
-        # グラフが増えたときに、checkpoint の再計算が forward と別のグラフを選ばないよう、見る順番を固定する
-        torch._C._dynamo.eval_frame._set_lru_cache(False)
+        prepare_block_compile()
         for module in self.modules():
             if isinstance(module, (Block, CrossBlock)):
                 module.compile(dynamic=True)
@@ -435,7 +445,7 @@ class PianoARModel(nn.Module):
         time_bias [num_patches, patch_frames] を渡すと、パッチ内の各 onset の TIME トークンの logit にその値を足す
         (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
-        dynamics [num_patches, 2] はパッチごとの強さと音の多さの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
+        dynamics [num_patches, C] はパッチごとの強さと音の多さなどの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って

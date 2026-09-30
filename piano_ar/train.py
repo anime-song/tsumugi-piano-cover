@@ -156,6 +156,12 @@ def adapt_state(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[
         if key.startswith("dynamics_embedding"):
             state[key] = current[key]
             print(f"{key} はチェックポイントにないので新しく作る")
+    key = "dynamics_embedding.weight"
+    if key in state and state[key].shape[0] < current[key].shape[0]:
+        # 条件の列を後ろに足した: 既存の列はそのまま、足した列は model の初期値 (0) にする
+        old = state[key]
+        state[key] = torch.cat([old.to(current[key].dtype), current[key][old.shape[0] :].to(old.device)])
+        print(f"強弱の条件の表を {old.shape[0]} -> {current[key].shape[0]} 行に増やした")
     return state
 
 
