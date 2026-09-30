@@ -40,7 +40,7 @@ TV サイズ・ショート版・メドレーなどで原曲の一部しか対�
 弾き出す (しばらくして急に原曲に沿い出す)。
 
 音声の DTW は音符の単位では粗い (平均 40ms 早く、±40ms 揺れる) ので、最後に音符の onset 同士が合うよう
-窓ごとに細かく補正する (refine_alignment)。
+窓ごとに細かく補正する (refine_alignment で 10 秒ごと、refine_fine で原曲のメロディとベースに 3 秒ごと)。
 
 DTW の経路をそのまま使うとガタつく (4 秒の平滑化との差が上位 5% で 0.14 秒) ので、
 --smooth-seconds の移動平均をかける。カバーのリズムは伸縮せず、この対応は cross-attention の位置にだけ使う。
@@ -175,6 +175,79 @@ def refine_alignment(
     return (align + correction).astype(np.float32), len(centers) / max(total, 1)
 
 
+# 細かい補正 (refine_fine) で合わせる原曲の楽器。全部の音だと密すぎて (1 秒に 16 個ほど) 偶然の一致が多い
+ANCHOR_INSTRUMENTS = ("melody", "vocal_harmony", "acoustic_bass", "electric_bass", "slap_bass", "synth_bass")
+
+
+def anchor_rows(source_rows: np.ndarray) -> np.ndarray:
+    """refine_fine で合わせる原曲の音 (メロディとベース)"""
+    from .source import INSTRUMENT_ID, ROW_D, ROW_TYPE, TYPE_NOTE
+
+    ids = [INSTRUMENT_ID[name] for name in ANCHOR_INSTRUMENTS]
+    return source_rows[(source_rows[:, ROW_TYPE] == TYPE_NOTE) & np.isin(source_rows[:, ROW_D], ids)]
+
+
+def refine_fine(
+    align: np.ndarray,
+    cover_notes: np.ndarray,
+    anchors: np.ndarray,
+    window: int = 300,
+    hop: int = 50,
+    max_lag: int = 10,
+    tolerance: int = 2,
+    min_hits: int = 3,
+) -> tuple[np.ndarray, float]:
+    """refine_alignment の後に、短い窓 (window フレーム、hop ずつ) で対応を細かく補正する。
+
+    refine_alignment (10 秒の窓) と 4 秒の移動平均では、2 秒単位で見ると対応が 20〜30ms ほど揺れていた
+    (演奏のためや走りが均されている)。メロディの音を半分に分け、片方とベースで補正を決めて残りの半分で測ると、
+    写したカバーの音と同じ音名の原曲のメロディが ±30ms に入る割合は 0.543 -> 0.619、±10ms は 0.278 -> 0.321
+    (窓 4 秒・6 秒、一致 ±10ms などより、この設定が一番よかった)。
+
+    窓ごとに、写したカバーの onset を ±max_lag フレームずらして、原曲のメロディとベース (anchors) の同じ音名の
+    onset と ±tolerance フレームで一致する数が最も多いずれを探す。はっきりした山 (min_hits 以上で、ずらしの中央値の
+    2 倍以上) のない窓は使わず、1 つだけ外れた窓に引っ張られないよう前後 2 つずつと合わせた 5 つの中央値にしてから
+    窓の間を補間して足す。返り値は補正後の対応と、使えた窓の割合。
+    """
+    from .source import ROW_A, ROW_ONSET
+
+    if len(anchors) == 0 or len(cover_notes) == 0:
+        return align, 0.0
+    targets = [np.unique(anchors[anchors[:, ROW_A] % 12 == pc, ROW_ONSET]).astype(np.float64) for pc in range(12)]
+    onsets = cover_notes[:, ONSET].astype(np.float64)
+    mapped = np.interp(onsets / ALIGN_STEP, np.arange(len(align)), align)
+    pitch_class = cover_notes[:, 2] % 12
+    lags = np.arange(-max_lag, max_lag + 1)
+    centers, found, total = [], [], 0
+    for start in range(0, int(onsets.max()) + 1, hop):
+        selected = (onsets >= start) & (onsets < start + window)
+        if selected.sum() < 8:
+            continue
+        total += 1
+        hits = np.zeros(len(lags))
+        for pc in range(12):
+            t = targets[pc]
+            x = mapped[selected & (pitch_class == pc)]
+            if len(t) < 2 or len(x) == 0:
+                continue
+            shifted = x[None, :] + lags[:, None]
+            k = np.clip(np.searchsorted(t, shifted), 1, len(t) - 1)
+            distance = np.minimum(np.abs(t[k] - shifted), np.abs(t[k - 1] - shifted))
+            hits += (distance <= tolerance).sum(axis=1)
+        if hits.max() >= min_hits and hits.max() >= 2 * np.median(hits):
+            centers.append(start + window / 2)
+            found.append(lags[hits.argmax()])
+    if not found:
+        return align, 0.0
+    found = np.asarray(found, dtype=np.float64)
+    if len(found) >= 5:
+        padded = np.pad(found, 2, mode="edge")
+        found = np.median(np.stack([padded[i : i + len(found)] for i in range(5)]), axis=0)
+    grid = np.arange(len(align)) * ALIGN_STEP
+    correction = np.interp(grid, np.asarray(centers), found)
+    return (align + correction).astype(np.float32), len(centers) / max(total, 1)
+
+
 def melody_match(align: np.ndarray, cover_notes: np.ndarray, source_rows: np.ndarray, tolerance: int = 5) -> float:
     """原曲のメロディの音のうち、対応する時刻の ±tolerance フレームに同じ音名のカバーの音がある割合
     (カバーが弾いている範囲のメロディだけで数える)"""
@@ -264,6 +337,7 @@ def _load_song(args: tuple) -> dict | str:
             )
             note_events = events[events[:, KIND] == KIND_NOTE]
             align, refined = refine_alignment(align, note_events, rows)
+            align, _ = refine_fine(align, note_events, anchor_rows(rows))
             match = melody_match(align, note_events, rows)
             results.append((piano_id, events, end_frame, align, refined, match, sync_ok(align, note_events, rows)))
         return {"original_id": original_id, "rows": rows, "end_frame": source_end, "covers": results}
