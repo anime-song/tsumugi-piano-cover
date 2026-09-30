@@ -404,9 +404,11 @@ class CoverModel(nn.Module):
         condition = _TrainingCondition(self, memory, batch, centers, song_of)
         output = self.decoder(batch, num_length_buckets, condition)
         if self.planner is not None and "plan_target" in batch:
-            target = batch["plan_target"]
-            known = ~target.isnan() & has_source[:, None, None]
             predicted = self.plan(memory, batch["channel"])
+            target = batch["plan_target"]
+            # 原曲のない batch や編曲の性質を付けない検証では正解の列が少ないので、足りない列は測れない (NaN) とする
+            target = F.pad(target, (0, predicted.shape[-1] - target.shape[-1]), value=float("nan"))
+            known = ~target.isnan() & has_source[:, None, None]
             error = (predicted - target.nan_to_num()) ** 2
             output["loss_plan"] = (error * known).sum() / known.sum().clamp_min(1)
         return output
