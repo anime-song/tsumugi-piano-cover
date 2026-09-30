@@ -31,6 +31,14 @@ TV サイズ・ショート版・メドレーなどで原曲の一部しか対�
 カバーごとに、原曲のメロディの音のうち、対応する時刻 (±50ms) に同じ音名のカバーの音がある割合
 (melody_match) を測って保存する (アラインメントの失敗や別アレンジの組を見つけるため)。
 
+カバーの ALIGN_STEP ごとに、原曲に沿っているか (align_ok) も保存する (sync_ok)。学習ではそうでない所の損失を取らない。
+    - 前後 1 秒の対応の傾き (原曲が進む速さ) が曲全体の中央値の 0.75〜1.33 倍の外: カバーだけのイントロや間奏を
+      原曲の一点に押し込んだ所など、対応が崩れている所。曲の冒頭 4 秒では 18% (曲の途中は 3〜6%)
+    - 前後 2 秒の原曲のメロディの音 (3 音以上) のうち、カバーが同じ音名を ±50ms で弾いている割合が 0.2 未満:
+      原曲を離れて弾いている所。
+学習データは全体で 13%、冒頭 4 秒では 23% が外れる。原曲を無視した冒頭を学ぶと、生成の冒頭で原曲を無視して
+弾き出す (しばらくして急に原曲に沿い出す)。
+
 音声の DTW は音符の単位では粗い (平均 40ms 早く、±40ms 揺れる) ので、最後に音符の onset 同士が合うよう
 窓ごとに細かく補正する (refine_alignment)。
 
@@ -185,6 +193,48 @@ def melody_match(align: np.ndarray, cover_notes: np.ndarray, source_rows: np.nda
     return float(np.mean(hits))
 
 
+def sync_ok(
+    align: np.ndarray,
+    cover_notes: np.ndarray,
+    source_rows: np.ndarray,
+    slope_range: tuple[float, float] = (0.75, 1.33),
+    min_melody: float = 0.2,
+    tolerance: int = 5,
+) -> np.ndarray:
+    """カバーの ALIGN_STEP ごとに、原曲に沿っているか (uint8、1 = 沿っている) を返す (上の説明)"""
+    from .source import INSTRUMENT_ID, ROW_A, ROW_D, ROW_ONSET, ROW_TYPE, TYPE_NOTE
+
+    n = len(align)
+    align = align.astype(np.float64)
+    index = np.arange(n)
+    # 前後 1 秒の傾き (曲全体の中央値との比)
+    half = max(1, 100 // ALIGN_STEP)
+    lo, hi = np.clip(index - half, 0, n - 1), np.clip(index + half, 0, n - 1)
+    slope = (align[hi] - align[lo]) / np.maximum((hi - lo) * ALIGN_STEP, 1)
+    median = np.median(slope)
+    bad = (slope < slope_range[0] * median) | (slope > slope_range[1] * median) if median > 0 else np.zeros(n, bool)
+
+    # 前後 2 秒のメロディの一致
+    melody = source_rows[(source_rows[:, ROW_TYPE] == TYPE_NOTE) & (source_rows[:, ROW_D] == INSTRUMENT_ID["melody"])]
+    melody = melody[(melody[:, ROW_ONSET] >= align[0]) & (melody[:, ROW_ONSET] <= align[-1])]
+    if len(melody) and len(cover_notes):
+        mapped = np.interp(cover_notes[:, ONSET].astype(np.float64) / ALIGN_STEP, index, align)
+        order = np.argsort(mapped)
+        mapped, pitch_class = mapped[order], cover_notes[order, 2] % 12
+        start = np.searchsorted(mapped, melody[:, ROW_ONSET] - tolerance)
+        end = np.searchsorted(mapped, melody[:, ROW_ONSET] + tolerance, side="right")
+        hit = np.array([(pitch_class[a:b] == p % 12).any() for a, b, p in zip(start, end, melody[:, ROW_A])], float)
+        # メロディの音を、カバーの時刻 (対応の逆) に置いて数える。対応が単調でない所があっても近くに落ちればよい
+        position = np.clip(
+            np.interp(melody[:, ROW_ONSET], np.maximum.accumulate(align), index).astype(np.int64), 0, n - 1
+        )
+        kernel = np.ones(2 * max(1, 200 // ALIGN_STEP) + 1)
+        count = np.convolve(np.bincount(position, minlength=n).astype(np.float64), kernel, mode="same")
+        hits = np.convolve(np.bincount(position, weights=hit, minlength=n), kernel, mode="same")
+        bad |= (count >= 3) & (hits < min_melody * count)
+    return (~bad).astype(np.uint8)
+
+
 def _load_song(args: tuple) -> dict | str:
     original_id, covers, source_dir, cover_dir, alignment_dir, source_offset, config, smooth = args
     try:
@@ -214,7 +264,8 @@ def _load_song(args: tuple) -> dict | str:
             )
             note_events = events[events[:, KIND] == KIND_NOTE]
             align, refined = refine_alignment(align, note_events, rows)
-            results.append((piano_id, events, end_frame, align, refined, melody_match(align, note_events, rows)))
+            match = melody_match(align, note_events, rows)
+            results.append((piano_id, events, end_frame, align, refined, match, sync_ok(align, note_events, rows)))
         return {"original_id": original_id, "rows": rows, "end_frame": source_end, "covers": results}
     except Exception as e:  # 壊れた MIDI などは飛ばす
         return f"{original_id}: {e!r}"
@@ -288,7 +339,7 @@ def main() -> None:
     cover_events, cover_ids, cover_ends, cover_lengths, cover_source, channels, splits = [], [], [], [], [], [], []
     aligns, align_lengths = [], []
     refined_rates: list[float] = []
-    matches, is_mined = [], []
+    matches, is_mined, align_ok = [], [], []
     dropped = {"length": [0, 0], "mined_eval": 0}  # 長さで外した本数 [前の組, 足した組]、検証・テスト側の曲の足した組
     failed = 0
     with ProcessPoolExecutor(args.workers) as pool:
@@ -317,7 +368,8 @@ def main() -> None:
             source_rows.append(result["rows"])
             source_lengths.append(len(result["rows"]))
             source_ends.append(result["end_frame"])
-            for piano_id, events, end_frame, align, refined, match in result["covers"]:
+            for piano_id, events, end_frame, align, refined, match, ok in result["covers"]:
+                align_ok.append(ok)
                 refined_rates.append(refined)
                 matches.append(match)
                 is_mined.append(piano_id in mined)
@@ -343,6 +395,8 @@ def main() -> None:
     )
     np.save(out_dir / "cover_events.npy", np.concatenate(cover_events).astype(np.int32))
     np.save(out_dir / "align.npy", np.concatenate(aligns).astype(np.float32))
+    # align と同じ並び・同じ範囲 (align_offsets) で、原曲に沿っているか
+    np.save(out_dir / "align_ok.npy", np.concatenate(align_ok).astype(np.uint8))
     np.savez(
         out_dir / "covers.npz",
         offsets=offsets(cover_lengths),
@@ -369,6 +423,9 @@ def main() -> None:
         f"長さの比で外したカバー: 前の組 {dropped['length'][0]} / 足した組 {dropped['length'][1]}、"
         f"検証・テスト側の曲なので外した足した組 {dropped['mined_eval']}"
     )
+    ok_all = np.concatenate(align_ok)
+    ok_start = np.concatenate([ok[: 400 // ALIGN_STEP] for ok in align_ok])
+    print(f"原曲に沿っていない (損失を取らない) 所: 全体 {1 - ok_all.mean():.0%} / 冒頭 4 秒 {1 - ok_start.mean():.0%}")
     matches_array, mined_array = np.asarray(matches), np.asarray(is_mined, dtype=bool)
     for name, selected in (("前の組", ~mined_array), ("足した組", mined_array)):
         values = matches_array[selected & ~np.isnan(matches_array)]

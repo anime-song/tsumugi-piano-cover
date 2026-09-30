@@ -96,7 +96,8 @@ class CoverCache:
         if self._arrays is None:
             self._arrays = {
                 name: np.load(self.cache_dir / f"{name}.npy", mmap_mode="r")
-                for name in ("source_rows", "cover_events", "align")
+                for name in ("source_rows", "cover_events", "align", "align_ok")
+                if name != "align_ok" or (self.cache_dir / "align_ok.npy").exists()
             }
         return self._arrays
 
@@ -105,6 +106,13 @@ class CoverCache:
 
     def cover_align(self, cover: int) -> np.ndarray:
         return np.asarray(self._open()["align"][self.align_offsets[cover] : self.align_offsets[cover + 1]])
+
+    def cover_align_ok(self, cover: int) -> np.ndarray | None:
+        """カバーの ALIGN_STEP ごとに原曲に沿っているか (piano_cover.prepare.sync_ok)。古いキャッシュにはない"""
+        arrays = self._open()
+        if "align_ok" not in arrays:
+            return None
+        return np.asarray(arrays["align_ok"][self.align_offsets[cover] : self.align_offsets[cover + 1]])
 
     def source_rows(self, source: int) -> np.ndarray:
         return np.asarray(self._open()["source_rows"][self.source_offsets[source] : self.source_offsets[source + 1]])
@@ -154,6 +162,20 @@ def plan_target(
     return out
 
 
+def patch_sync(
+    ok: np.ndarray, start: int, num_patches: int, patch_frames: int, factor: float, align_step: int
+) -> np.ndarray:
+    """窓の各パッチ (伸縮後のフレーム start + k * patch_frames から) が原曲に沿っているか [num_patches]。
+    ok (ALIGN_STEP ごと、伸縮前) の半分以上が 1 なら沿っているとする。カバーの外のパッチは沿っているとする"""
+    bounds = (start + np.arange(num_patches + 1) * patch_frames) / factor / align_step
+    first = np.clip(np.floor(bounds[:-1]).astype(np.int64), 0, len(ok))
+    last = np.clip(np.ceil(bounds[1:]).astype(np.int64), 0, len(ok))
+    cumulative = np.concatenate([[0], np.cumsum(ok, dtype=np.int64)])
+    count = last - first
+    rate = (cumulative[last] - cumulative[first]) / np.maximum(count, 1)
+    return (count == 0) | (rate >= 0.5)
+
+
 def source_tensors(features: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
     return {
         "src_features": torch.from_numpy(features["features"]),
@@ -175,6 +197,8 @@ class CoverWindowDataset(Dataset):
     memory_patches と val_start_patch は PianoWindowDataset と同じ (窓の前の記憶。pretraining も同じ長さにそろえる)。
     dynamics_bins > 0 なら、窓のパッチごとの強弱と音の多さの条件 (piano_ar.data.dynamics_item) と、
     Planner の正解 (原曲のパッチごとの曲線、plan_target) も返す。
+    sync_mask なら、原曲に沿っていない所 (キャッシュの align_ok が半分以上 0 のパッチ) の損失を取らない
+    (窓の損失を取るパッチが全部なくなるときは外さない)。
     """
 
     def __init__(
@@ -195,8 +219,10 @@ class CoverWindowDataset(Dataset):
         val_start_patch: int = 0,
         dynamics_bins: int = 0,
         dynamics_dropout: float = 0.2,
+        sync_mask: bool = False,
     ) -> None:
         self.cache = cache
+        self.sync_mask = sync_mask
         self.dynamics_bins = dynamics_bins
         self.dynamics_dropout = dynamics_dropout if split == "train" else 0.0
         self.tokenizer = PianoTokenizer(cache.tokenizer_config)
@@ -263,6 +289,14 @@ class CoverWindowDataset(Dataset):
         song_start = start == 0
         total = len(patch_loss)
         patch_loss = self._drift(window, patch_loss, events, end_frame, start, index)
+        if self.sync_mask:
+            ok = self.cache.cover_align_ok(cover)
+            if ok is not None:
+                masked = patch_loss & patch_sync(
+                    ok, start, total, self.tokenizer.patch_frames, factor, self.cache.align_step
+                )
+                if masked.any():
+                    patch_loss = masked
 
         # 窓の各パッチの始まりと終わりが、原曲のどのフレームに当たるか (伸縮したら両方の時刻を factor 倍する)
         bounds = start + np.arange(total + 1) * F
