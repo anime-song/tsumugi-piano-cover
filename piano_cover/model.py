@@ -129,7 +129,12 @@ class OnsetHead(nn.Module):
     def forward(self, h: Tensor, logits: Tensor, features: Tensor) -> Tensor:
         """h [N, T, D], logits [N, T, V], features [N, F, *] -> TIME の中の配分を変えた logits"""
         with torch.autocast(h.device.type, enabled=False):
-            bias = torch.einsum("ntk,nfk->ntf", self.query(h.float()), self.candidate(features))
+            return self.apply_candidates(h, logits, self.candidate(features))
+
+    def apply_candidates(self, h: Tensor, logits: Tensor, candidates: Tensor) -> Tensor:
+        """forward の後半。candidates = candidate(features) [N, F, hidden] (生成ではパッチごとに 1 回だけ作る)"""
+        with torch.autocast(h.device.type, enabled=False):
+            bias = torch.einsum("ntk,nfk->ntf", self.query(h.float()), candidates)
             logits = logits.float()
             s = self.time_slice
             time = logits[..., s]
@@ -368,6 +373,48 @@ class CoverModel(nn.Module):
         pos = memory.row_onset[safe].reshape(n, -1) - start[:, None]
         return rows, pos, valid
 
+    def local_step_tensors(
+        self, memory: SourceMemory, index: Tensor, start: Tensor, end: Tensor, keep: Tensor | None = None
+    ) -> dict[str, Tensor]:
+        """Local を 1 トークンずつ生成するときの、パッチの中で変わらない量 (piano_ar.model.StepCondition の tensors)。
+        index [N, 2r+1] は Local が見る rows の番号、start / end [N] はパッチに対応する原曲の区間 (フレーム)、
+        keep [N] が False の行 (cfg の「原曲なし」) は原曲を見せない。cross-attention のキー側の k / v と
+        OnsetHead の候補の特徴を先に作っておく"""
+        rows, k_pos, valid = self.local_memory(memory, index, start)
+        if keep is not None:
+            valid = valid & keep[:, None]
+        # 生成の CUDA Graph を使い回せるよう、原曲の行の数を最大 (パッチごとの行の上限 x パッチ数) にそろえる (足した行は見ない)
+        pad = max(0, index.shape[1] * self.config.max_source_rows - rows.shape[1])
+        rows, k_pos, valid = F.pad(rows, (0, 0, 0, pad)), F.pad(k_pos, (0, pad)), F.pad(valid, (0, pad), value=False)
+        # パッチ内の onset を、そのパッチに対応する原曲の区間に線形に写す (q_pos = q_scale * onset)
+        tensors = {"mask": valid[:, None, :], "q_scale": (end - start).float() / self.patch_frames}
+        for n, block in enumerate(self.local_cross):
+            k, v = getattr(block, "_orig_mod", block).memory_kv(rows, k_pos)
+            tensors[f"cross_k{n}"], tensors[f"cross_v{n}"] = k, v
+        if self.onset_head is not None:
+            onset, group, onset_valid = self.local_onsets(memory, index)
+            if keep is not None:
+                # 特徴が 0 なら TIME の中で一定の値になり、配分は変わらない
+                onset_valid = onset_valid & keep[:, None]
+            features = self.onset_head.features(onset, group, onset_valid, start, end)
+            with torch.autocast(features.device.type, enabled=False):
+                tensors["onset_candidates"] = self.onset_head.candidate(features)
+        return tensors
+
+    def step_cross(self, tensors: dict[str, Tensor], i: int, x: Tensor, onset: Tensor) -> Tensor:
+        """local_step_tensors を使う Local の cross-attention (piano_ar.model.StepCondition)"""
+        if i not in self.local_cross_blocks:
+            return x
+        n = self.local_cross_blocks.index(i)
+        block = getattr(self.local_cross[n], "_orig_mod", self.local_cross[n])
+        q_pos = (tensors["q_scale"] * onset)[:, None]
+        return block.attend(x, q_pos, tensors[f"cross_k{n}"], tensors[f"cross_v{n}"], tensors["mask"])
+
+    def step_output(self, tensors: dict[str, Tensor], h: Tensor, logits: Tensor) -> Tensor:
+        if "onset_candidates" not in tensors:
+            return logits
+        return self.onset_head.apply_candidates(h, logits, tensors["onset_candidates"])
+
     def local_onsets(self, memory: SourceMemory, index: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """index [N, 2r+1] の rows の (原曲の絶対フレーム, onset の種類, 有効) [N, M] (OnsetHead 用)"""
         n = index.shape[0]
@@ -511,6 +558,11 @@ class _TrainingCondition:
         features = head.features(onset, group, valid, align[:, 0], align[:, 1])
         return lambda h, logits: head(h, logits, features)
 
+    def local_step_tensors(self, index: Tensor) -> dict[str, Tensor]:
+        """有効なパッチの番号 index [N] を Local で 1 トークンずつ生成するときの量 (piano_cover.rollout)"""
+        align = self.local_align[index]
+        return self.model.local_step_tensors(self.memory, self.local_index[index], align[:, 0], align[:, 1])
+
 
 # ----------------------------------------------------------------------
 # 生成
@@ -571,16 +623,17 @@ class _BoundSourceCondition:
 
         return hook
 
-    def local_output(self, patch: int, prefix: Tensor) -> OutputHook | None:
+    def local_step_tensors(self, patch: int) -> dict[str, Tensor]:
         model, memory = self.model, self.memory
-        head = model.onset_head
-        if head is None:
-            return None
         device = memory.song.device
         F_ = model.patch_frames
-        index = model.local_neighbors(torch.tensor([patch], device=device), memory.lookup)
-        onset, group, valid = (t.expand(self.rows, -1) for t in model.local_onsets(memory, index))
+        index = model.local_neighbors(torch.tensor([patch], device=device), memory.lookup).expand(self.rows, -1)
         start = torch.full((self.rows,), patch * F_, dtype=torch.float32, device=device)
-        # CFG の「原曲なし」の行は onset を見せない (特徴が 0 なら TIME の中で一定の値になり、配分は変わらない)
-        features = head.features(onset, group, valid & self.conditioned[:, None], start, start + F_)
-        return lambda h, logits: head(h, logits, features)
+        # CFG の「原曲なし」の行は原曲を見せない
+        return model.local_step_tensors(memory, index, start, start + F_, self.conditioned)
+
+    def step_cross(self, tensors: dict[str, Tensor], i: int, x: Tensor, onset: Tensor) -> Tensor:
+        return self.model.step_cross(tensors, i, x, onset)
+
+    def step_output(self, tensors: dict[str, Tensor], h: Tensor, logits: Tensor) -> Tensor:
+        return self.model.step_output(tensors, h, logits)

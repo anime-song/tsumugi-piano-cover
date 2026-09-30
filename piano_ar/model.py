@@ -10,6 +10,7 @@ Global の入力は生成済みパッチの中身そのものなので、Local �
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 import torch
@@ -18,7 +19,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
-from .tokenizer import EOS, PAD, TOKEN_GROUPS, PatchGrammar, PianoTokenizer
+from .tokenizer import EOS, PAD, TOKEN_GROUPS, BatchGrammar, PianoTokenizer
 
 # Transformer のブロックの後に挟む処理 (ブロック番号, x) -> x。カバーモデルの cross-attention に使う
 CrossHook = Callable[[int, Tensor], Tensor]
@@ -38,14 +39,27 @@ class Condition(Protocol):
     def local_output(self, index: Tensor, prefix: Tensor) -> OutputHook | None: ...
 
 
-class GenerationCondition(Protocol):
+class StepCondition(Protocol):
+    """Local を 1 トークンずつ生成するとき (local_step) に条件を入れる。パッチごとに変わる量は tensors にまとめて先に作り
+    (形は同じ生成の中でパッチによらず同じ)、トークンごとにはそれを読むだけにする (CUDA Graph に取り込めるように)"""
+
+    def step_cross(self, tensors: dict[str, Tensor], i: int, x: Tensor, onset: Tensor) -> Tensor:
+        """Local の i 番目のブロックの後に挟む。x [N, 1, D]、onset [N] はその位置までに進んだパッチ内の onset"""
+        ...
+
+    def step_output(self, tensors: dict[str, Tensor], h: Tensor, logits: Tensor) -> Tensor: ...
+
+
+class GenerationCondition(StepCondition, Protocol):
     def global_cross(self, first: int, last: int) -> CrossHook:
         """Global にパッチ first..last を入れるときのフック"""
         ...
 
     def local_cross(self, patch: int, prefix: Tensor) -> CrossHook: ...
 
-    def local_output(self, patch: int, prefix: Tensor) -> OutputHook | None: ...
+    def local_step_tensors(self, patch: int) -> dict[str, Tensor]:
+        """パッチ patch を local_step で生成するときの tensors"""
+        ...
 
 
 class GenerationConditionSource(Protocol):
@@ -136,6 +150,24 @@ class Block(nn.Module):
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + self.residual_dropout(self.down(F.silu(gate) * up))
 
+    def forward_step(
+        self, x: Tensor, rope: tuple[Tensor, Tensor], cache: tuple[Tensor, Tensor], step: Tensor, key_valid: Tensor
+    ) -> Tensor:
+        """生成用 (因果・推論のみ): 位置 step ([1]、GPU の上の番号) の 1 トークン x [N, 1, D] だけを計算する。
+        k / v は固定長の cache [N, H, L, head_dim] の step の所に書き、key_valid [L] (step 以前) の位置を見る。
+        形が毎回同じなので CUDA Graph に取り込める"""
+        batch, _, dim = x.shape
+        q, k, v = self.qkv(self.attn_norm(x)).view(batch, 1, 3, self.heads, dim // self.heads).permute(2, 0, 3, 1, 4)
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+        q, k = _apply_rope(q, *rope), _apply_rope(k, *rope)
+        cache_k, cache_v = cache
+        cache_k.index_copy_(2, step, k.to(cache_k.dtype))
+        cache_v.index_copy_(2, step, v.to(cache_v.dtype))
+        attn = F.scaled_dot_product_attention(q, cache_k.to(v.dtype), cache_v.to(v.dtype), attn_mask=key_valid)
+        x = x + self.attn_out(attn.transpose(1, 2).reshape(batch, 1, dim))
+        gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
+        return x + self.down(F.silu(gate) * up)
+
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelConfig, layers: int, causal: bool) -> None:
@@ -215,16 +247,25 @@ class CrossBlock(nn.Module):
 
     def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
         """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
-        batch, length, _ = x.shape
+        return self.attend(x, q_pos, *self.memory_kv(memory, k_pos), mask)
+
+    def memory_kv(self, memory: Tensor, k_pos: Tensor) -> tuple[Tensor, Tensor]:
+        """キー側の k / v [B, H, 1+M, head_dim] (先頭は空のキー)。生成ではパッチごとに 1 回だけ作って使い回す"""
+        batch = memory.shape[0]
         head_dim = self.inner_dim // self.heads
-        q = self.q(self.norm(x)).view(batch, length, self.heads, head_dim).transpose(1, 2)
         k, v = self.kv(self.memory_norm(memory)).view(batch, -1, 2, self.heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
-        q, k = _apply_rope(q, *_rope(q_pos, head_dim)), _apply_rope(k, *_rope(k_pos, head_dim))
+        k = _apply_rope(self.k_norm(k).to(v.dtype), *_rope(k_pos, head_dim))
         # 空のキーは位置によらないよう回転をかけない
         null_k = self.k_norm(self.null_k).to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
         null_v = self.null_v.to(v.dtype)[None, :, None].expand(batch, -1, -1, -1)
-        k, v = torch.cat((null_k, k), dim=2), torch.cat((null_v, v), dim=2)
+        return torch.cat((null_k, k), dim=2), torch.cat((null_v, v), dim=2)
+
+    def attend(self, x: Tensor, q_pos: Tensor, k: Tensor, v: Tensor, mask: Tensor) -> Tensor:
+        """memory_kv の k / v を見る。mask [B, Lq or 1, M] は空のキーを除いた分"""
+        batch, length, _ = x.shape
+        head_dim = self.inner_dim // self.heads
+        q = self.q(self.norm(x)).view(batch, length, self.heads, head_dim).transpose(1, 2)
+        q = _apply_rope(self.q_norm(q).to(v.dtype), *_rope(q_pos, head_dim))
         mask = F.pad(mask, (1, 0), value=True)[:, None]
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
         attn = self.out(attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
@@ -317,6 +358,35 @@ class PianoARModel(nn.Module):
         h = self.local_transformer(x, cross=cross)
         logits = self.head(h)
         return output(h, logits) if output is not None else logits
+
+    def local_step(
+        self,
+        token: Tensor,
+        step: Tensor,
+        context: Tensor,
+        cache: list[tuple[Tensor, Tensor]],
+        onset: Tensor,
+        condition: StepCondition | None = None,
+        tensors: dict[str, Tensor] | None = None,
+    ) -> Tensor:
+        """local_forward の生成用の 1 トークン版: 位置 step ([1]) の入力 token [N] (step 0 は BOS) から次の logits [N, V]。
+        cache はブロックごとの固定長の k / v (LocalSampler)。onset [N] はその位置までに進んだパッチ内の onset
+        (query_onsets の最後の列と同じ)。condition と tensors (パッチごとの量) で原曲などの条件を入れる"""
+        embedded = self.token_embedding(token)[:, None]
+        bos = self.local_bos.to(embedded.dtype)
+        x = torch.where(step == 0, bos, embedded) + self.local_context(context)[:, None]
+        transformer = self.local_transformer
+        rope = _rope(step, transformer.head_dim)
+        key_valid = torch.arange(cache[0][0].shape[2], device=step.device) <= step
+        for i, block in enumerate(transformer.blocks):
+            x = getattr(block, "_orig_mod", block).forward_step(x, rope, cache[i], step, key_valid)
+            if condition is not None:
+                x = condition.step_cross(tensors, i, x, onset)
+        h = transformer.norm(x)
+        logits = self.head(h)
+        if condition is not None:
+            logits = condition.step_output(tensors, h, logits)
+        return logits[:, 0]
 
     # ------------------------------------------------------------------
     # 学習
@@ -478,6 +548,7 @@ class PianoARModel(nn.Module):
                 guided = nothing + condition_cfg_scale * (no_channel - nothing) + cfg_scale * (full - no_channel)
             return guided
 
+        sampler = LocalSampler(self, tokenizer, bound)
         patches: list[list[list[int]]] = [[] for _ in range(num_samples)]
         summaries: list[Tensor] = []  # パッチごとの要約 [rows, D]
         pedal_states: list[bool] = [False] * num_samples
@@ -503,43 +574,224 @@ class PianoARModel(nn.Module):
                 stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics
             )[:, -1]
 
-            grammars = [PatchGrammar(tokenizer, pedal_states[i]) for i in range(num_samples)]
-            for i in range(num_samples):
-                if done[i]:
-                    grammars[i].finished = True
-            forced = [
-                prompts[i][p] if prompts is not None and p < len(prompts[i]) else None for i in range(num_samples)
-            ]
-            sequence = torch.zeros(rows, 0, dtype=torch.long, device=device)
-            while not all(g.finished for g in grammars):
-                local_cross = bound.local_cross(p, sequence) if bound is not None else None
-                local_output = bound.local_output(p, sequence) if bound is not None else None
-                logits = self.local_forward(sequence, context, local_cross, local_output)[:, -1].float()
-                logits = guide(logits)
-                allowed = torch.stack([g.allowed() for g in grammars]).to(device)
-                if p < end_after:
-                    allowed[:, EOS] = False  # EOP はいつも一緒に許されているので、パッチは EOP で終われる
-                logits = logits.masked_fill(~allowed, float("-inf"))
-                if time_bias is not None:
-                    logits = _bias_time(logits, time_bias[p].to(logits), tokenizer)
-                next_token = _sample(logits, temperature, top_p)
-                step = sequence.shape[1]
-                for i, prompt in enumerate(forced):
-                    if prompt is not None and not grammars[i].finished:
-                        next_token[i] = prompt[step]
-                for i, g in enumerate(grammars):
-                    g.update(int(next_token[i]))
-                sequence = torch.cat((sequence, next_token.repeat(rows // num_samples)[:, None]), dim=1)
+            forced = None
+            if prompts is not None and any(p < len(prompt) for prompt in prompts):
+                forced = torch.full((num_samples, tokenizer.config.max_patch_tokens), -1, dtype=torch.long)
+                for i, prompt in enumerate(prompts):
+                    if p < len(prompt):
+                        forced[i, : len(prompt[p])] = torch.tensor(prompt[p])
+                forced = forced.to(device)
+            sequence, pedal_down, song_end = sampler.sample_patch(
+                context,
+                bound.local_step_tensors(p) if bound is not None else {},
+                torch.tensor(pedal_states, device=device),
+                guide=guide,
+                temperature=temperature,
+                top_p=top_p,
+                finished=torch.tensor(done, device=device),
+                allow_eos=p >= end_after,
+                time_bias=time_bias[p] if time_bias is not None else None,
+                forced=forced,
+            )
 
-            for i, g in enumerate(grammars):
+            pedal_down, song_end = pedal_down.tolist(), song_end.tolist()
+            for i, tokens in enumerate(sequence.tolist()):
                 if done[i]:
                     continue
-                tokens = [t for t in sequence[i].tolist() if t != PAD]
-                patches[i].append(tokens)
-                pedal_states[i] = g.pedal_down
-                done[i] = g.song_end
-            summaries.append(self.summarize_patches(sequence))
+                patches[i].append([t for t in tokens if t != PAD])
+                pedal_states[i] = pedal_down[i]
+                done[i] = song_end[i]
+            summaries.append(self.summarize_patches(sequence).repeat(rows // num_samples, 1))
         return patches
+
+
+class LocalSampler:
+    """Local (パッチ内のトークン列) を 1 トークンずつ生成する。
+
+    1 トークンの計算は小さい (1 行 1 位置) ので、素直に書くと GPU のカーネルの起動・Python の文法の判定・CPU と GPU の
+    同期に時間の大半を使う (1 トークン約 10ms)。ここでは
+        - 文法 (BatchGrammar) とサンプリングを GPU の上で行い、トークンごとに CPU に戻さない
+        - 過去の k / v を固定長のキャッシュに置き、1 トークンの計算 (local_step) の形を毎回同じにする
+        - 原曲のキー側など、パッチの中で変わらない量はパッチごとに 1 回だけ作る (StepCondition の tensors)
+        - GPU なら 1 トークン分 (モデル・文法・サンプリング) を CUDA Graph に取り込み、1 回の起動で流す
+    Graph は入力の形 (行数・tensors の形など) ごとに取り込んで使い回すので、同じ sampler を続けて使うほど速い。
+    guide (cfg) は取り込んだときのものが使われるので、同じ sampler では同じ計算の guide を渡す。
+    """
+
+    def __init__(
+        self, model: PianoARModel, tokenizer: PianoTokenizer, condition: StepCondition | None = None, graph: bool = True
+    ) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.condition = condition
+        self.device = model.token_embedding.weight.device
+        self.use_graph = graph and self.device.type == "cuda"
+        self.caches: dict[tuple, list[tuple[Tensor, Tensor]]] = {}
+        self.states: dict[tuple, _SamplerState] = {}
+
+    @torch.no_grad()
+    def sample_patch(
+        self,
+        context: Tensor,
+        tensors: dict[str, Tensor],
+        pedal_down: Tensor,
+        *,
+        guide: Callable[[Tensor], Tensor],
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        finished: Tensor | None = None,
+        allow_eos: bool = True,
+        time_bias: Tensor | None = None,
+        forced: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """1 パッチを生成する。context [rows, D] は Global の出力、tensors はこのパッチの StepCondition の量。
+        guide は rows 行の logits を samples 行にまとめる (cfg)。行 r の入力はサンプル r % samples のトークン。
+        pedal_down / finished [samples] はパッチの頭のペダルと、もう曲が終わった行 (PAD だけを出す)。
+        time_bias [patch_frames] は TIME の logit に足す量 (_bias_time)、forced [samples, max_patch_tokens] は
+        決めたトークン (-1 は決めない)。返り値は生成したトークン [samples, T] (PAD 埋め)・パッチの終わりのペダル・
+        曲の終わり (EOS) を出したか"""
+        state = self._state(context, tensors, pedal_down.shape[0], temperature, top_p, time_bias, forced)
+        state.context.copy_(context)
+        for name, value in tensors.items():
+            state.tensors[name].copy_(value)
+        if time_bias is not None:
+            state.time_bias.copy_(time_bias)
+        if forced is not None:
+            state.forced.copy_(forced)
+        state.allow_eos.fill_(allow_eos)
+
+        def reset() -> None:
+            state.grammar.reset(pedal_down, finished)
+            state.step.zero_()
+            state.token.zero_()
+            state.sequence.fill_(PAD)
+
+        def run() -> None:
+            self._token_step(state, guide, temperature, top_p)
+
+        reset()
+        if self.use_graph and state.graph is None:
+            # 取り込みの前に別のストリームで数回流す (PyTorch の CUDA Graph の決まった手順)。流した分の状態は戻す
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    run()
+            torch.cuda.current_stream().wait_stream(side)
+            reset()
+            state.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(state.graph):
+                run()
+        for step in range(self.tokenizer.config.max_patch_tokens):
+            if state.graph is not None:
+                state.graph.replay()
+            else:
+                run()
+            # 終わったかを見るのは CPU と同期するので数トークンに 1 回にする (終わった後は PAD が並ぶだけ)
+            if step % 8 == 7 and bool(state.grammar.finished.all()):
+                break
+        grammar = state.grammar
+        return state.sequence[:, : step + 1].clone(), grammar.pedal_down.clone(), grammar.song_end.clone()
+
+    def _state(
+        self,
+        context: Tensor,
+        tensors: dict[str, Tensor],
+        samples: int,
+        temperature: float,
+        top_p: float,
+        time_bias: Tensor | None,
+        forced: Tensor | None,
+    ) -> _SamplerState:
+        device = self.device
+        autocast = torch.is_autocast_enabled(device.type)
+        dtype = torch.get_autocast_dtype(device.type) if autocast else self.model.token_embedding.weight.dtype
+        rows = context.shape[0]
+        shapes = tuple((name, tuple(value.shape), value.dtype) for name, value in tensors.items())
+        key = (
+            rows,
+            samples,
+            tuple(context.shape),
+            shapes,
+            temperature,
+            top_p,
+            time_bias is None,
+            forced is None,
+            dtype,
+        )
+        if key in self.states:
+            return self.states[key]
+        transformer = self.model.local_transformer
+        length = self.tokenizer.config.max_patch_tokens
+        if (rows, dtype) not in self.caches:
+            heads = getattr(transformer.blocks[0], "_orig_mod", transformer.blocks[0]).heads
+            shape = (rows, heads, length, transformer.head_dim)
+            self.caches[rows, dtype] = [
+                (torch.zeros(shape, dtype=dtype, device=device), torch.zeros(shape, dtype=dtype, device=device))
+                for _ in transformer.blocks
+            ]
+        state = _SamplerState(
+            autocast=(autocast, dtype),
+            cache=self.caches[rows, dtype],
+            grammar=BatchGrammar(self.tokenizer, samples, device),
+            token=torch.zeros(rows, dtype=torch.long, device=device),
+            step=torch.zeros(1, dtype=torch.long, device=device),
+            sequence=torch.full((samples, length), PAD, dtype=torch.long, device=device),
+            context=context.clone(),
+            tensors={name: value.clone() for name, value in tensors.items()},
+            time_bias=time_bias.clone() if time_bias is not None else None,
+            forced=forced.clone() if forced is not None else None,
+            allow_eos=torch.ones(1, dtype=torch.bool, device=device),
+        )
+        self.states[key] = state
+        return state
+
+    def _token_step(
+        self, state: _SamplerState, guide: Callable[[Tensor], Tensor], temperature: float, top_p: float
+    ) -> None:
+        """1 トークン分: モデル -> cfg -> 文法 -> サンプリング -> 状態の更新。すべて state のテンソルをその場で書き換える"""
+        grammar = state.grammar
+        repeat = state.token.shape[0] // grammar.onset.shape[0]
+        enabled, dtype = state.autocast
+        # CUDA Graph に取り込むときは、autocast の型変換のキャッシュを切る (取り込んだ後に消えるテンソルを指さないよう)
+        with torch.autocast(self.device.type, dtype=dtype, enabled=enabled, cache_enabled=False):
+            onset = grammar.onset.clamp(min=0).float().repeat(repeat)
+            logits = self.model.local_step(
+                state.token, state.step, state.context, state.cache, onset, self.condition, state.tensors
+            )
+            logits = guide(logits.float())
+            allowed = grammar.allowed()
+            # EOP はいつも一緒に許されているので、EOS を止めてもパッチは EOP で終われる
+            allowed[:, EOS] &= state.allow_eos
+            logits = logits.masked_fill(~allowed, float("-inf"))
+            if state.time_bias is not None:
+                logits = _bias_time(logits, state.time_bias.to(logits), self.tokenizer)
+            next_token = _sample(logits, temperature, top_p)
+            if state.forced is not None:
+                forced = state.forced.index_select(1, state.step).squeeze(1)
+                next_token = torch.where((forced >= 0) & ~grammar.finished, forced, next_token)
+            grammar.update(next_token)
+            state.sequence.index_copy_(1, state.step, next_token[:, None])
+            state.token.copy_(next_token.repeat(repeat))
+            state.step += 1
+
+
+@dataclass
+class _SamplerState:
+    """LocalSampler の入力の形ごとの置き場。CUDA Graph はこれらのテンソルを読み書きする"""
+
+    autocast: tuple[bool, torch.dtype]
+    cache: list[tuple[Tensor, Tensor]]
+    grammar: BatchGrammar
+    token: Tensor  # [rows] 次の位置の入力 (直前に出したトークン)
+    step: Tensor  # [1] 次の位置
+    sequence: Tensor  # [samples, max_patch_tokens] 出したトークン
+    context: Tensor
+    tensors: dict[str, Tensor]
+    time_bias: Tensor | None
+    forced: Tensor | None
+    allow_eos: Tensor  # [1]
+    graph: torch.cuda.CUDAGraph | None = None
 
 
 def _bias_time(logits: Tensor, bias: Tensor, tokenizer: PianoTokenizer) -> Tensor:
