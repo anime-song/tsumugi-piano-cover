@@ -45,9 +45,9 @@ from piano_ar.train import adapt_state, context_patches, limit_gpu_memory, lr_at
 from .arrangement import ARRANGEMENT_NAMES, measurable
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
-from .rollout import KINDS, RolloutBank
 from .metrics import sync_metrics
 from .model import CoverModel, SourceCondition
+from .rollout import KINDS, RolloutBank
 from .source import SourceVocab, source_features, trim_lead
 
 
