@@ -92,6 +92,11 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--dynamics-dropout", type=float, default=0.2, help="強弱と音の多さの条件を落とす確率")
     parser.add_argument("--plan-weight", type=float, default=1.0, help="Planner の損失の重み")
     parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument(
+        "--no-sync-mask",
+        action="store_true",
+        help="原曲に沿っていない所 (キャッシュの align_ok) の損失も取る (既定では学習で取らない)",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=1000)
@@ -312,6 +317,7 @@ def main() -> None:
         structure_dropout=args.structure_dropout,
         pretraining=pretraining,
         drift=DriftConfig(prob=args.drift_prob) if args.drift_prob > 0 else None,
+        sync_mask=not args.no_sync_mask,
         dynamics_dropout=args.dynamics_dropout,
         **common,
     )
