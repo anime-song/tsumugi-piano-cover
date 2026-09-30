@@ -23,11 +23,12 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 KINDS = ("start", "mid")
 
@@ -114,14 +115,16 @@ def rollout_batch(
     top_p: float = 0.95,
     source_cfg: float = 1.75,
     summary_chunk: int = 256,
+    sampler=None,
 ) -> tuple[list[list[list[int]]], list[list[bool]]]:
     """batch (collate_cover したもの、窓は伸縮なし) の各行で、パッチ split[b] から count パッチを生成する。
 
     学習の forward と同じ窓・同じ原曲の対応 (align) のまま、それより前は正解のパッチを文脈にして 1 パッチずつ生成する
     (原曲なしの行を並べて原曲の cfg をかける)。返り値は行ごとの (生成したパッチのトークン, 各パッチの頭のペダル)。
+    sampler (piano_ar.model.LocalSampler、条件は model) を続けて渡すと、取り込んだ CUDA Graph を batch をまたいで使い回す。
     """
-    from piano_ar.model import _sample
-    from piano_ar.tokenizer import EOS, PAD, PatchGrammar
+    from piano_ar.model import LocalSampler
+    from piano_ar.tokenizer import PAD
 
     from .model import _TrainingCondition
 
@@ -147,17 +150,30 @@ def rollout_batch(
     needed = torch.zeros_like(both["src_patch_valid"])
     needed[song_of[:, None].expand_as(neighbors)[inside], neighbors[inside]] = True
     needed &= both["src_patch_valid"]
-    memory = model.encode_source(both, needed)
+    # 原曲なしの行 (後半) は原曲を見ないので、エンコードは前半だけにして並べる (見ないようにするのは has_source)
+    memory = model.encode_source(batch, needed[:B])
+    twice = {name: torch.cat([getattr(memory, name)] * 2) for name in ("song", "song_pos", "song_valid", "lookup")}
+    memory = replace(memory, **twice)
     condition = _TrainingCondition(model, memory, both, centers, song_of)
 
-    # 正解のパッチの要約 (生成したパッチはあとで上書きする)
-    tokens = both["tokens"]
-    flat = tokens[valid]
-    summaries = torch.zeros(*valid.shape, decoder.config.dim, device=tokens.device)
-    parts = [decoder.summarize_patches(flat[i : i + summary_chunk]) for i in range(0, len(flat), summary_chunk)]
-    summaries[valid] = torch.cat(parts).to(summaries.dtype)
+    # 正解のパッチの要約 (前半と後半で同じ)。Global は因果なので、生成するパッチより前 (split より前) の分だけ要る。
+    # その先は生成したパッチで上書きする
+    before = batch["patch_valid"] & (position < split[:B, None])
+    flat = batch["tokens"][before]
+    half = torch.zeros(*before.shape, decoder.config.dim, device=flat.device)
+    if len(flat):
+        flat = flat[:, : int((flat != PAD).sum(-1).max())]
+        parts = [decoder.summarize_patches(flat[i : i + summary_chunk]) for i in range(0, len(flat), summary_chunk)]
+        half[before] = torch.cat(parts).to(half.dtype)
+    summaries = torch.cat([half, half])
     flat_index = (valid.flatten().cumsum(0) - 1).reshape(valid.shape)
     pedal_state = both["pedal_state"].clone()
+
+    if sampler is None:
+        sampler = LocalSampler(decoder, tokenizer, model)
+
+    def guide(logits: torch.Tensor) -> torch.Tensor:
+        return logits[B:] + source_cfg * (logits[:B] - logits[B:])
 
     out_tokens: list[list[list[int]]] = [[] for _ in range(B)]
     out_pedal: list[list[bool]] = [[] for _ in range(B)]
@@ -171,32 +187,45 @@ def rollout_batch(
             cross=condition.global_cross(),
             dynamics=both.get("dynamics"),
         )[rows, p]
-        index = flat_index[rows, p]
-        grammars = [PatchGrammar(tokenizer, bool(pedal_state[b, p[b]])) for b in range(B)]
-        sequence = torch.zeros(2 * B, 0, dtype=torch.long, device=tokens.device)
-        while not all(g.finished for g in grammars):
-            logits = decoder.local_forward(
-                sequence, context, condition.local_cross(index, sequence), condition.local_output(index, sequence)
-            )[:, -1].float()
-            guided = logits[B:] + source_cfg * (logits[:B] - logits[B:])
-            allowed = torch.stack([g.allowed() for g in grammars]).to(guided.device)
-            allowed[:, EOS] = False
-            next_token = _sample(guided.masked_fill(~allowed, float("-inf")), temperature, top_p)
-            for g, t in zip(grammars, next_token.tolist()):
-                g.update(int(t))
-            sequence = torch.cat((sequence, next_token.repeat(2)[:, None]), dim=1)
-        for b, g in enumerate(grammars):
-            out_tokens[b].append([t for t in sequence[b].tolist() if t != PAD])
-            out_pedal[b].append(bool(pedal_state[b, p[b]]))
-        summaries[rows, p] = decoder.summarize_patches(sequence).to(summaries.dtype)
+        pedal = pedal_state[rows[:B], p[:B]].bool()
+        sequence, pedal_down, _ = sampler.sample_patch(
+            context,
+            condition.local_step_tensors(flat_index[rows, p]),
+            pedal,
+            guide=guide,
+            temperature=temperature,
+            top_p=top_p,
+            allow_eos=False,
+        )
+        for b, (patch_tokens, down) in enumerate(zip(sequence.tolist(), pedal.tolist())):
+            out_tokens[b].append([t for t in patch_tokens if t != PAD])
+            out_pedal[b].append(down)
+        summaries[rows, p] = decoder.summarize_patches(sequence).repeat(2, 1).to(summaries.dtype)
         following = p + 1 < valid.shape[1]
-        next_pedal = torch.tensor([int(g.pedal_down) for g in grammars] * 2, device=pedal_state.device)
+        next_pedal = pedal_down.long().repeat(2)
         pedal_state[rows[following], p[following] + 1] = next_pedal[following]
     return out_tokens, out_pedal
 
 
+class _Windows(Dataset):
+    """ロールアウトを作る窓 (カバー, 損失を取る窓の始まり) を順に作る。窓のトークン化は重いので DataLoader の worker で
+    並べて作り、GPU の生成と重ねる"""
+
+    def __init__(self, dataset, windows: list[tuple[int, int]]) -> None:
+        self.dataset = dataset
+        self.windows = windows
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        cover, first = self.windows[index]
+        return self.dataset.cover_item(cover, 0, first=first)
+
+
 def main() -> None:
     from piano_ar.config import ModelConfig
+    from piano_ar.model import LocalSampler
     from piano_ar.tokenizer import PianoTokenizer
     from piano_ar.train import limit_gpu_memory, to_device
 
@@ -220,6 +249,7 @@ def main() -> None:
     parser.add_argument("--source-cfg", type=float, default=1.75)
     parser.add_argument("--device", default=None)
     parser.add_argument("--gpu-memory-limit", type=float, default=0.5)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -281,16 +311,22 @@ def main() -> None:
     specs = [make_spec(0 if random.random() < args.start_fraction else 1) for _ in range(args.count)]
     # 同じ種類をまとめて batch にする (生成するパッチ数を揃える)
     order = sorted(range(len(specs)), key=lambda i: (specs[i][2] == 0 and specs[i][1] == 0, specs[i][3]))
+    loader = DataLoader(
+        _Windows(dataset, [specs[i][:2] for i in order]),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=collate_cover,
+    )
+    sampler = LocalSampler(model.decoder, tokenizer, model)
     rollouts: list[Rollout] = []
     started = time.time()
-    for batch_start in range(0, len(order), args.batch_size):
+    for batch_start, batch in zip(range(0, len(order), args.batch_size), loader):
         chosen = order[batch_start : batch_start + args.batch_size]
         count = max(specs[i][3] for i in chosen)
-        items = [dataset.cover_item(specs[i][0], 0, first=specs[i][1]) for i in chosen]
-        batch = to_device(collate_cover(items), device)
+        batch = to_device(batch, device)
         split = torch.tensor([specs[i][2] for i in chosen])
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            tokens, pedal = rollout_batch(model, batch, split, count, source_cfg=args.source_cfg)
+            tokens, pedal = rollout_batch(model, batch, split, count, source_cfg=args.source_cfg, sampler=sampler)
         for row, i in enumerate(chosen):
             cover, first, split_i, count_i = specs[i]
             start = max(0, first - memory_patches * F)

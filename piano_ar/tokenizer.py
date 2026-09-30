@@ -274,79 +274,90 @@ def trim_overlapping_notes(events: np.ndarray) -> np.ndarray:
     return events
 
 
-class PatchGrammar:
-    """生成時に 1 パッチ分のトークン列が文法に従うよう、次に出せるトークンを絞る"""
+class BatchGrammar:
+    """生成時に 1 パッチ分のトークン列が文法に従うよう、次に出せるトークンを絞る (N 行をまとめて)。
+    状態は行ごとのテンソルで GPU の上に置き、トークンごとに CPU と行き来しない。その場で書き換える (同じテンソルのまま)
+    ので、CUDA Graph に取り込める。パッチの頭で reset する"""
 
-    def __init__(self, tokenizer: PianoTokenizer, pedal_down: bool) -> None:
+    # stage: 0 = イベントの始め, 1 = TIME の後, 2 = PITCH の後, 3 = DUR の後
+    EVENT_START, AFTER_TIME, AFTER_PITCH, AFTER_DURATION = range(4)
+
+    def __init__(self, tokenizer: PianoTokenizer, rows: int, device: torch.device | str) -> None:
         self.tok = tokenizer
-        self.pedal_down = pedal_down
-        self.length = 0
-        self.stage = "event_start"  # event_start / after_time / after_pitch / after_duration
-        self.onset = -1
+        self.pedal_down = torch.zeros(rows, dtype=torch.bool, device=device)
+        self.finished = torch.zeros(rows, dtype=torch.bool, device=device)
+        self.song_end = torch.zeros(rows, dtype=torch.bool, device=device)
+        self.length = torch.zeros(rows, dtype=torch.long, device=device)
+        self.stage = torch.zeros(rows, dtype=torch.long, device=device)
+        self.onset = torch.zeros(rows, dtype=torch.long, device=device)
         # 同じ onset 内の並び: 0 = まだ何もない, 1 = PEDAL_OFF, 2 = PEDAL_ON, 3 = ノート
-        self.order = 0
-        self.last_pitch = -1
-        self.finished = False
-        self.song_end = False
+        self.order = torch.zeros(rows, dtype=torch.long, device=device)
+        self.last_pitch = torch.zeros(rows, dtype=torch.long, device=device)
+        self.vocab = torch.arange(tokenizer.vocab_size, device=device)[None]
+
+    def reset(self, pedal_down: torch.Tensor, finished: torch.Tensor | None = None) -> None:
+        """パッチの頭の状態にする。pedal_down [N] はパッチの頭のペダル、finished [N] の行は PAD だけを出す (曲が終わった行)"""
+        self.pedal_down.copy_(pedal_down)
+        if finished is None:
+            self.finished.zero_()
+        else:
+            self.finished.copy_(finished)
+        self.song_end.zero_()
+        self.length.zero_()
+        self.stage.fill_(self.EVENT_START)
+        self.onset.fill_(-1)
+        self.order.zero_()
+        self.last_pitch.fill_(-1)
 
     def allowed(self) -> torch.Tensor:
-        tok = self.tok
-        mask = torch.zeros(tok.vocab_size, dtype=torch.bool)
-        if self.finished:
-            mask[PAD] = True
-            return mask
+        """次に出せるトークン [N, vocab] (bool)"""
+        tok, v = self.tok, self.vocab
+        max_tokens = tok.config.max_patch_tokens
+        stage = self.stage[:, None]
+        end = (v == EOP) | (v == EOS)
         # 上限に達したら終端だけを許す
-        if self.length >= tok.config.max_patch_tokens - 1 and self.stage == "event_start":
-            mask[[EOP, EOS]] = True
-            return mask
-        if self.stage == "after_pitch":
-            mask[tok.duration_offset : tok.velocity_offset] = True
-        elif self.stage == "after_duration":
-            mask[tok.velocity_offset :] = True
-        elif self.stage == "after_time":
-            self._allow_same_onset(mask, after_time=True)
-        else:
-            mask[[EOP, EOS]] = True
-            # 残りトークン数で 1 イベントが収まる場合だけ新しいイベントを始められる
-            if self.length + 5 <= tok.config.max_patch_tokens:
-                mask[tok.time_offset + self.onset + 1 : tok.pitch_offset] = True
-                if self.onset >= 0:
-                    self._allow_same_onset(mask, after_time=False)
-        return mask
+        limit = (self.length >= max_tokens - 1)[:, None] & (stage == self.EVENT_START)
+        after_pitch = (stage == self.AFTER_PITCH) & (v >= tok.duration_offset) & (v < tok.velocity_offset)
+        after_duration = (stage == self.AFTER_DURATION) & (v >= tok.velocity_offset)
+        after_time = (stage == self.AFTER_TIME) & self._same_onset(
+            torch.zeros_like(self.order), torch.full_like(self.last_pitch, -1)
+        )
+        # 残りトークン数で 1 イベントが収まる場合だけ新しいイベントを始められる
+        room = (self.length + 5 <= max_tokens)[:, None]
+        new_time = room & (v >= tok.time_offset + self.onset[:, None] + 1) & (v < tok.pitch_offset)
+        same = room & (self.onset >= 0)[:, None] & self._same_onset(self.order, self.last_pitch)
+        event_start = (stage == self.EVENT_START) & (end | new_time | same)
+        mask = torch.where(limit, end, after_pitch | after_duration | after_time | event_start)
+        return torch.where(self.finished[:, None], v == PAD, mask)
 
-    def _allow_same_onset(self, mask: torch.Tensor, after_time: bool) -> None:
-        tok = self.tok
-        order = 0 if after_time else self.order
-        if order < 1 and self.pedal_down:
-            mask[PEDAL_OFF] = True
-        if order < 2 and not self.pedal_down:
-            mask[PEDAL_ON] = True
-        last_pitch = -1 if after_time else self.last_pitch
-        first_pitch = max(0, last_pitch - tok.config.pitch_min + 1) if order == 3 else 0
-        mask[tok.pitch_offset + first_pitch : tok.duration_offset] = True
+    def _same_onset(self, order: torch.Tensor, last_pitch: torch.Tensor) -> torch.Tensor:
+        tok, v = self.tok, self.vocab
+        order, pedal = order[:, None], self.pedal_down[:, None]
+        pedal_off = (order < 1) & pedal & (v == PEDAL_OFF)
+        pedal_on = (order < 2) & ~pedal & (v == PEDAL_ON)
+        first_pitch = torch.where(order == 3, (last_pitch[:, None] - tok.config.pitch_min + 1).clamp(min=0), 0)
+        pitch = (v >= tok.pitch_offset + first_pitch) & (v < tok.duration_offset)
+        return pedal_off | pedal_on | pitch
 
-    def update(self, token: int) -> None:
+    def update(self, token: torch.Tensor) -> None:
+        """token [N] を出したあとの状態にする (終わった行は変えない)"""
         tok = self.tok
-        if self.finished:
-            return
-        self.length += 1
-        if token in (EOP, EOS):
-            self.finished = True
-            self.song_end = token == EOS
-        elif tok.time_offset <= token < tok.pitch_offset:
-            self.onset = token - tok.time_offset
-            self.order = 0
-            self.last_pitch = -1
-            self.stage = "after_time"
-        elif token in (PEDAL_ON, PEDAL_OFF):
-            self.pedal_down = token == PEDAL_ON
-            self.order = 2 if token == PEDAL_ON else 1
-            self.stage = "event_start"
-        elif tok.pitch_offset <= token < tok.duration_offset:
-            self.last_pitch = token - tok.pitch_offset + tok.config.pitch_min
-            self.order = 3
-            self.stage = "after_pitch"
-        elif tok.duration_offset <= token < tok.velocity_offset:
-            self.stage = "after_duration"
-        else:
-            self.stage = "event_start"
+        live = ~self.finished
+        is_time = live & (token >= tok.time_offset) & (token < tok.pitch_offset)
+        is_pedal = live & ((token == PEDAL_ON) | (token == PEDAL_OFF))
+        is_pitch = live & (token >= tok.pitch_offset) & (token < tok.duration_offset)
+        is_duration = live & (token >= tok.duration_offset) & (token < tok.velocity_offset)
+        is_velocity = live & (token >= tok.velocity_offset)
+        self.length += live.long()
+        self.song_end |= live & (token == EOS)
+        self.finished |= live & ((token == EOP) | (token == EOS))
+        self.onset.copy_(torch.where(is_time, token - tok.time_offset, self.onset))
+        self.pedal_down.copy_(torch.where(is_pedal, token == PEDAL_ON, self.pedal_down))
+        order = torch.where(token == PEDAL_ON, 2, 1)
+        self.order.copy_(torch.where(is_time, 0, torch.where(is_pedal, order, torch.where(is_pitch, 3, self.order))))
+        pitch = token - tok.pitch_offset + tok.config.pitch_min
+        self.last_pitch.copy_(torch.where(is_time, -1, torch.where(is_pitch, pitch, self.last_pitch)))
+        stage = torch.where(is_time, self.AFTER_TIME, self.stage)
+        stage = torch.where(is_pedal | is_velocity, self.EVENT_START, stage)
+        stage = torch.where(is_pitch, self.AFTER_PITCH, stage)
+        self.stage.copy_(torch.where(is_duration, self.AFTER_DURATION, stage))
