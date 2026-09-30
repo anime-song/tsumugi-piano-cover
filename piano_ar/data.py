@@ -258,15 +258,19 @@ def window_locate(
     train: bool,
     song_start_prob: float,
     val_start_patch: int = 0,
+    first: int | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, int]:
     """損失を取る窓 (window_patches) の位置を決め、その前に最大 memory_patches の記憶を付けてトークン化する。
 
     返り値は (tokenize_window の出力 [memory_patches + window_patches], 損失を取るパッチ, 窓 (記憶の頭) の始まりのフレーム)。
     記憶は曲の頭より前には延ばせないので、窓が曲の冒頭に近いときは記憶が短くなり、そのぶん窓の後ろが余る
     (余りは patch_valid を False にして計算しない)。memory_patches = 0 なら以前と同じ固定長の窓。
+    first を渡すと、損失を取る窓の始まりをそのフレームにする (ロールアウトの窓を作り直すとき)。
     """
     F = tokenizer.patch_frames
-    if train:
+    if first is not None:
+        pass
+    elif train:
         if random.random() < song_start_prob:
             first = 0
         else:
