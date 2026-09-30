@@ -240,9 +240,9 @@ class PianoARModel(nn.Module):
         self.bos = nn.Embedding(2, dim)
         self.pedal_embedding = nn.Embedding(2, dim)
         self.channel_embedding = nn.Embedding(config.num_channels, dim)
-        # パッチごとの強さと音の多さ (0 は指定なし)。強さの番号 0..bins と、音の多さの番号 + (bins + 1) を同じ表で引く
+        # パッチごとの強さと音の多さなど (0 は指定なし)。列 c の番号 + c * (bins + 1) を同じ表で引く
         if config.dynamics_bins:
-            self.dynamics_embedding = nn.Embedding(2 * (config.dynamics_bins + 1), dim)
+            self.dynamics_embedding = nn.Embedding(config.dynamics_columns * (config.dynamics_bins + 1), dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
@@ -285,11 +285,11 @@ class PianoARModel(nn.Module):
         dynamics: Tensor | None = None,
     ) -> Tensor:
         """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す。
-        dynamics [B, P, 2] はパッチ p の強さと音の多さの番号 (0 は指定なし)"""
+        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
         if dynamics is not None and self.config.dynamics_bins:
-            offset = torch.tensor([0, self.config.dynamics_bins + 1], device=dynamics.device)
+            offset = torch.arange(dynamics.shape[-1], device=dynamics.device) * (self.config.dynamics_bins + 1)
             inputs = inputs + self.dynamics_embedding(dynamics + offset).sum(-2)
         return self.global_transformer(inputs, cross=cross)
 
@@ -435,7 +435,7 @@ class PianoARModel(nn.Module):
         time_bias [num_patches, patch_frames] を渡すと、パッチ内の各 onset の TIME トークンの logit にその値を足す
         (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
-        dynamics [num_patches, 2] はパッチごとの強さと音の多さの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
+        dynamics [num_patches, C] はパッチごとの強さと音の多さなどの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って

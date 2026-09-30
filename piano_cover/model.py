@@ -6,7 +6,9 @@
     Local : 数ブロックごとに、対応するパッチ ± local_cross_radius パッチの原曲の各行へ cross-attention
 
     onset_head_dim > 0 なら OnsetHead: Local の TIME の予測に、候補の各時刻の近くにある原曲の onset を直接足す
-    planner_dim > 0 なら Planner: SongEncoder の出力から、パッチごとの強弱と音の多さの曲線を予測する (生成でデコーダの条件にする)
+    planner_dim > 0 なら Planner: SongEncoder の出力から、パッチごとの強弱と音の多さの曲線を予測する (生成でデコーダの条件にする)。
+    デコーダの条件の列が 2 より多ければ (ModelConfig.dynamics_columns)、後ろの列は編曲の性質 (piano_cover.arrangement) で、
+    Planner はそれも予測する
 
 「対応する時刻」は、学習時はアラインメント (カバー -> 原曲)、生成時は原曲の時間軸の上に生成するので恒等写像。
 cross-attention の RoPE の位置は、クエリに対応する原曲の時刻、キーに原曲の時刻を使うので、時刻の差で見る場所が決まる。
@@ -17,8 +19,10 @@ cross-attention の RoPE の位置は、クエリに対応する原曲の時刻�
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -132,18 +136,19 @@ class Planner(nn.Module):
     デコーダは左から順に生成するので、サビの手前でいったん引いてから盛り上げる、のような先を見越した強弱が苦手。
     SongEncoder は曲全体を双方向に見ているので、その出力から曲線を先に決めて、デコーダの条件 (dynamics) にする。
     入力はパッチごとの SongEncoder の出力 (K 本をつないだもの)・演奏者 (デコーダのチャンネルの埋め込み)・曲の中の位置。
+    columns > 2 なら、編曲の性質 (合いの手の量など、piano_cover.arrangement) の曲線も予測する。
     """
 
-    def __init__(self, song_dim: int, channel_dim: int, config: ModelConfig, layers: int) -> None:
+    def __init__(self, song_dim: int, channel_dim: int, config: ModelConfig, layers: int, columns: int = 2) -> None:
         super().__init__()
         self.song = nn.Sequential(nn.LayerNorm(song_dim), nn.Linear(song_dim, config.dim))
         self.channel = nn.Linear(channel_dim, config.dim)
         self.position = nn.Linear(8, config.dim)
         self.transformer = Transformer(config, layers, causal=False)
-        self.head = nn.Linear(config.dim, 2)
+        self.head = nn.Linear(config.dim, columns)
 
     def forward(self, song: Tensor, channel: Tensor, valid: Tensor) -> Tensor:
-        """song [B, S, song_dim], channel [B, channel_dim], valid [B, S] -> [B, S, 2]"""
+        """song [B, S, song_dim], channel [B, channel_dim], valid [B, S] -> [B, S, columns]"""
         S = song.shape[1]
         index = torch.arange(S, device=song.device).float()
         relative = index[None] / valid.sum(1, keepdim=True).clamp_min(1)  # 曲の中の位置 (0-1)
@@ -202,7 +207,9 @@ class CoverModel(nn.Module):
             head_dim = model_config.dim // model_config.heads
             planner_dim = cover_config.planner_dim
             planner_config = replace(model_config, dim=planner_dim, heads=planner_dim // head_dim)
-            self.planner = Planner(K * dim, model_config.dim, planner_config, cover_config.planner_layers)
+            self.planner = Planner(
+                K * dim, model_config.dim, planner_config, cover_config.planner_layers, model_config.dynamics_columns
+            )
         self.gradient_checkpointing = False
 
         for module in (self.source_embedding, self.source_onset, self.latent_slot, self.patch_encoder,
@@ -399,23 +406,39 @@ class CoverModel(nn.Module):
 
     @torch.no_grad()
     def planned_dynamics(
-        self, memory: SourceMemory, channel: int, num_patches: int, loudness: float = 1.0, density: float = 1.0
+        self,
+        memory: SourceMemory,
+        channel: int,
+        num_patches: int,
+        loudness: float = 1.0,
+        density: float = 1.0,
+        arrangement: Sequence[float | None] = (),
+        known: np.ndarray | None = None,
     ) -> Tensor | None:
-        """生成用: Planner の曲線に倍率をかけて、デコーダの強弱の条件の番号 [num_patches, 2] にする。
-        倍率を上げるほど強弱 (音の多さ) の山と谷が大きくなる。0 ならその条件は指定なし。使えないモデルなら None"""
+        """生成用: Planner の曲線に倍率をかけて、デコーダの条件の番号 [num_patches, C] にする。
+        倍率を上げるほど強弱 (音の多さ) の山と谷が大きくなる。0 ならその条件は指定なし。
+        arrangement は編曲の性質 (fill / above / span) の曲線に足す量 (全カバーでの標準偏差の単位、None ならその条件は
+        指定なし)。1 なら全体を標準偏差 1 つ分だけ多く (広く) する。known [num_patches, 3] (piano_cover.arrangement の
+        measurable) を渡すと、学習で測れなかった所 (メロディの隙間がないパッチの fill など) は指定なしにする。
+        使えないモデルなら None"""
         bins = self.decoder.config.dynamics_bins
         if self.planner is None or not bins:
             return None
         curve = self.plan(memory, torch.tensor([channel], device=memory.song.device))[0, :num_patches]
-        curve = curve * torch.tensor([loudness, density], device=curve.device)
-        index = torch.from_numpy(quantize_dynamics(curve.cpu().numpy(), bins)).to(curve.device)
-        for column, scale in enumerate((loudness, density)):
-            if scale == 0:
+        extra = curve.shape[1] - 2
+        offsets = list(arrangement)[:extra] + [0.0] * max(0, extra - len(arrangement))
+        scale = torch.tensor([loudness, density] + [1.0] * extra, device=curve.device)
+        shift = torch.tensor([0.0, 0.0] + [o or 0.0 for o in offsets], device=curve.device)
+        index = torch.from_numpy(quantize_dynamics((curve * scale + shift).cpu().numpy(), bins)).to(curve.device)
+        for column, off in enumerate([loudness == 0, density == 0] + [o is None for o in offsets]):
+            if off:
                 index[:, column] = 0
+        if known is not None and extra:
+            index[:, 2:][~torch.from_numpy(known[:num_patches, :extra]).to(index.device)] = 0
         return index
 
     def plan(self, memory: SourceMemory, channel: Tensor) -> Tensor:
-        """パッチごとの強弱と音の多さの曲線 [B, S, 2] (カバーの中で標準化した値) を予測する"""
+        """パッチごとの強弱と音の多さ (カバーの中で標準化した値) と編曲の性質の曲線 [B, S, C] を予測する"""
         B = memory.song.shape[0]
         K = self.config.source_latents
         song = memory.song.reshape(B, -1, K * memory.song.shape[-1])
