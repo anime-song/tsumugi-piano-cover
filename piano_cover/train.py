@@ -6,6 +6,8 @@
 --freeze-decoder ならデコーダは固定して、新しく足した部分だけを学習する (Flamingo と同じ)。
 --init-cover なら学習済みのカバーモデルから始めて、あとから足した部分 (--onset-head-dim の OnsetHead など) を足す。
 --freeze-loaded ならそのとき読んだ重みは固定して、足した部分だけを学習する。
+--decoder-from を一緒に渡すと、--init-cover のデコーダだけを別の事前学習のチェックポイント (続きを学習したもの) に
+差し替える。原曲エンコーダと cross-attention は学習済みのものから始まるので、新しいデコーダで原曲を使い始めるのが速い。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
 --drift-prob の割合で窓の前半のカバーの時刻を原曲からずらし、後半で原曲に戻らせる (DriftConfig、exposure bias 対策)。
@@ -59,6 +61,11 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--freeze-loaded", action="store_true", help="--init-cover で読んだ重みを固定して、足した部分だけを学習する"
+    )
+    parser.add_argument(
+        "--decoder-from",
+        default=None,
+        help="--init-cover のデコーダをこの事前学習のチェックポイントのものに差し替える (設定もこちらを使う)",
     )
     parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
@@ -298,11 +305,19 @@ def main() -> None:
         )
     else:
         pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-    if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):
-        raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
+    decoder_from = None
+    if args.decoder_from:
+        if not args.init_cover:
+            raise SystemExit("--decoder-from は --init-cover と一緒に使います")
+        decoder_from = torch.load(args.decoder_from, map_location="cpu", weights_only=False, mmap=True)
+    # デコーダの設定とチャンネルの番号の表は、デコーダの重みを読むチェックポイントのものを使う
+    decoder_checkpoint = decoder_from or pretrained
+    for checkpoint_ in (pretrained, decoder_checkpoint):
+        if checkpoint_["tokenizer_config"] != asdict(cache.tokenizer_config):
+            raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
     arrangement = bool(args.dynamics_bins) and not args.no_arrangement
     model_config = replace(
-        ModelConfig.from_dict(pretrained["model_config"]),
+        ModelConfig.from_dict(decoder_checkpoint["model_config"]),
         dynamics_bins=args.dynamics_bins,
         dynamics_columns=2 + (len(ARRANGEMENT_NAMES) if arrangement else 0),
     )
@@ -400,9 +415,17 @@ def main() -> None:
     if args.freeze_decoder:
         model.decoder.requires_grad_(False)
     if args.init_cover:
-        missing, unexpected = model.load_state_dict(expand_rows(pretrained["model"], model), strict=False)
+        state = pretrained["model"]
+        if decoder_from is not None:
+            state = {key: value for key, value in state.items() if not key.startswith("decoder.")}
+        missing, unexpected = model.load_state_dict(expand_rows(state, model), strict=False)
         if unexpected:
             raise SystemExit(f"{args.init_cover} にこのモデルにない重みがあります: {unexpected[:5]}")
+        if decoder_from is not None:
+            model.decoder.load_state_dict(adapt_state(decoder_from["model"], model.decoder))
+            missing = [key for key in missing if not key.startswith("decoder.")]
+            if not args.resume:
+                print(f"デコーダは {args.decoder_from} (step {decoder_from['step']}) に差し替えた")
         if args.freeze_loaded:
             loaded = set(pretrained["model"])
             for name, param in model.named_parameters():
@@ -461,7 +484,7 @@ def main() -> None:
                 "cover_config": asdict(cover_config),
                 "tokenizer_config": asdict(cache.tokenizer_config),
                 "source_vocab_size": vocab.size,
-                "channel_index": pretrained.get("channel_index"),
+                "channel_index": decoder_checkpoint.get("channel_index"),
                 "args": vars(args),
                 "wandb_id": wandb_run.id if wandb_run else None,
                 "best_val_loss": best_val_loss,
