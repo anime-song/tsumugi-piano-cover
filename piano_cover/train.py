@@ -6,6 +6,8 @@
 --freeze-decoder ならデコーダは固定して、新しく足した部分だけを学習する (Flamingo と同じ)。
 --init-cover なら学習済みのカバーモデルから始めて、あとから足した部分 (--onset-head-dim の OnsetHead など) を足す。
 --freeze-loaded ならそのとき読んだ重みは固定して、足した部分だけを学習する。
+--decoder-from を一緒に渡すと、--init-cover のデコーダだけを別の事前学習のチェックポイント (続きを学習したもの) に
+差し替える。原曲エンコーダと cross-attention は学習済みのものから始まるので、新しいデコーダで原曲を使い始めるのが速い。
 --pretrain-mix の割合で事前学習の曲を原曲なしで混ぜ、ピアノの生成の力を忘れないようにする。
 検証では原曲ありとなしの両方で損失を測り、その差 (val/source_gain) で原曲がどれだけ効いているかを見る。
 --drift-prob の割合で窓の前半のカバーの時刻を原曲からずらし、後半で原曲に戻らせる (DriftConfig、exposure bias 対策)。
@@ -13,6 +15,9 @@
 生成評価では、生成したものが原曲の時刻とメロディにどれだけ合っているか (piano_cover.metrics) も測る。
 --dynamics-bins でデコーダにパッチごとの強弱と音の多さの条件を入れ、Planner (原曲から曲線を予測する) も一緒に
 学習する (損失 loss_plan を --plan-weight 倍して足す)。生成評価では Planner の曲線を条件にする。
+--no-arrangement でなければ、その条件に編曲の性質 (合いの手の量・メロディの上に重ねる割合・音域の広さ、
+piano_cover.arrangement) の列も足し、Planner も予測する。検証の val/arrangement_gain はその列を外したときの損失の差。
+--init-cover で以前のカバーモデルから始めるときは、足した列の分だけ条件の表と Planner の出力を増やす。
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from piano_ar.evaluation import piano_roll_image, sample_stats, synthesize
 from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
 from piano_ar.train import adapt_state, context_patches, limit_gpu_memory, lr_at, to_device
 
+from .arrangement import ARRANGEMENT_NAMES, measurable
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
 from .metrics import sync_metrics
@@ -55,6 +61,11 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--freeze-loaded", action="store_true", help="--init-cover で読んだ重みを固定して、足した部分だけを学習する"
+    )
+    parser.add_argument(
+        "--decoder-from",
+        default=None,
+        help="--init-cover のデコーダをこの事前学習のチェックポイントのものに差し替える (設定もこちらを使う)",
     )
     parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
@@ -91,6 +102,9 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument("--dynamics-dropout", type=float, default=0.2, help="強弱と音の多さの条件を落とす確率")
     parser.add_argument("--plan-weight", type=float, default=1.0, help="Planner の損失の重み")
+    parser.add_argument(
+        "--no-arrangement", action="store_true", help="編曲の性質 (piano_cover.arrangement) を条件に入れない"
+    )
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument(
         "--no-sync-mask",
@@ -125,6 +139,19 @@ def build_args() -> argparse.Namespace:
         else:
             parser.add_argument(name, type=type(field.default), default=field.default)
     return parser.parse_args()
+
+
+def expand_rows(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """条件の列を足したモデルに以前の重みを読めるようにする。強弱の条件の表と Planner の出力が、以前より行が多ければ
+    既存の行はそのまま使い、増えた行は model の初期値 (条件の表は 0 なので、足す前と同じ出力) にする"""
+    state = dict(state)
+    current = model.state_dict()
+    for key in ("decoder.dynamics_embedding.weight", "planner.head.weight", "planner.head.bias"):
+        if key in state and key in current and state[key].shape[0] < current[key].shape[0]:
+            old = state[key]
+            state[key] = torch.cat([old.to(current[key].dtype), current[key][old.shape[0] :].to(old.device)])
+            print(f"{key} を {old.shape[0]} -> {current[key].shape[0]} 行に増やした")
+    return state
 
 
 def make_optimizer(model: CoverModel, args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -211,7 +238,8 @@ def sample_evaluation(
         source_items = {key: value.to(device) for key, value in source_tensors(features).items()}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             condition = SourceCondition(model, source_items)
-            dynamics = model.planned_dynamics(condition.memory, int(cache.channels[cover]), num_patches)
+            known = measurable(rows, num_patches, tokenizer.patch_frames, c.frame_rate)
+            dynamics = model.planned_dynamics(condition.memory, int(cache.channels[cover]), num_patches, known=known)
             patches = model.decoder.generate(
                 tokenizer,
                 num_patches=num_patches,
@@ -282,9 +310,22 @@ def main() -> None:
         )
     else:
         pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-    if pretrained["tokenizer_config"] != asdict(cache.tokenizer_config):
-        raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
-    model_config = replace(ModelConfig.from_dict(pretrained["model_config"]), dynamics_bins=args.dynamics_bins)
+    decoder_from = None
+    if args.decoder_from:
+        if not args.init_cover:
+            raise SystemExit("--decoder-from は --init-cover と一緒に使います")
+        decoder_from = torch.load(args.decoder_from, map_location="cpu", weights_only=False, mmap=True)
+    # デコーダの設定とチャンネルの番号の表は、デコーダの重みを読むチェックポイントのものを使う
+    decoder_checkpoint = decoder_from or pretrained
+    for checkpoint_ in (pretrained, decoder_checkpoint):
+        if checkpoint_["tokenizer_config"] != asdict(cache.tokenizer_config):
+            raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
+    arrangement = bool(args.dynamics_bins) and not args.no_arrangement
+    model_config = replace(
+        ModelConfig.from_dict(decoder_checkpoint["model_config"]),
+        dynamics_bins=args.dynamics_bins,
+        dynamics_columns=2 + (len(ARRANGEMENT_NAMES) if arrangement else 0),
+    )
     window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
     memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
 
@@ -306,6 +347,7 @@ def main() -> None:
         "cover_config": cover_config,
         "memory_patches": memory_patches,
         "dynamics_bins": args.dynamics_bins,
+        "arrangement": arrangement,
     }
     train_set = CoverWindowDataset(
         cache,
@@ -323,6 +365,12 @@ def main() -> None:
     )
     val_set = CoverWindowDataset(cache, split="val", source_dropout=0.0, **common)
     val_nosource = CoverWindowDataset(cache, split="val", source_dropout=1.0, **common)
+    # 編曲の性質の条件を外した検証 (条件がどれだけ効いているか)
+    val_noarr = (
+        CoverWindowDataset(cache, split="val", source_dropout=0.0, **{**common, "arrangement": False})
+        if arrangement
+        else None
+    )
     val_resync = CoverWindowDataset(
         cache, split="val", source_dropout=0.0, drift=DriftConfig(prob=1.0, loss_patches=2), **common
     )
@@ -338,6 +386,7 @@ def main() -> None:
                 memory_patches=memory,
                 val_start_patch=memory_patches,
                 dynamics_bins=args.dynamics_bins,
+                arrangement=arrangement,
             )
             for name, memory in (("long", memory_patches), ("long_nomem", 0))
         }
@@ -357,6 +406,7 @@ def main() -> None:
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, **loader_options)
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
+    val_noarr_loader = DataLoader(val_noarr, batch_size=args.batch_size, **loader_options) if val_noarr else None
     val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options)
     long_loaders = {
         name: DataLoader(ds, batch_size=args.batch_size, **loader_options) for name, ds in long_sets.items()
@@ -371,9 +421,17 @@ def main() -> None:
     if args.freeze_decoder:
         model.decoder.requires_grad_(False)
     if args.init_cover:
-        missing, unexpected = model.load_state_dict(pretrained["model"], strict=False)
+        state = pretrained["model"]
+        if decoder_from is not None:
+            state = {key: value for key, value in state.items() if not key.startswith("decoder.")}
+        missing, unexpected = model.load_state_dict(expand_rows(state, model), strict=False)
         if unexpected:
             raise SystemExit(f"{args.init_cover} にこのモデルにない重みがあります: {unexpected[:5]}")
+        if decoder_from is not None:
+            model.decoder.load_state_dict(adapt_state(decoder_from["model"], model.decoder))
+            missing = [key for key in missing if not key.startswith("decoder.")]
+            if not args.resume:
+                print(f"デコーダは {args.decoder_from} (step {decoder_from['step']}) に差し替えた")
         if args.freeze_loaded:
             loaded = set(pretrained["model"])
             for name, param in model.named_parameters():
@@ -432,7 +490,7 @@ def main() -> None:
                 "cover_config": asdict(cover_config),
                 "tokenizer_config": asdict(cache.tokenizer_config),
                 "source_vocab_size": vocab.size,
-                "channel_index": pretrained.get("channel_index"),
+                "channel_index": decoder_checkpoint.get("channel_index"),
                 "args": vars(args),
                 "wandb_id": wandb_run.id if wandb_run else None,
                 "best_val_loss": best_val_loss,
@@ -496,12 +554,14 @@ def main() -> None:
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
             resync = evaluate(model, val_resync_loader, device)
             long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
+            noarr = evaluate(model, val_noarr_loader, device) if val_noarr_loader else None
             print(
                 f"[val] step {step} loss {val['loss']:.4f} (原曲なし {val_nosource_loss:.4f}) "
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
                 + (f" plan {val['loss_plan']:.3f}" if "loss_plan" in val else "")
                 + f" | ずれから戻る loss {resync['loss']:.4f} time {resync['loss_time']:.3f}"
                 + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
+                + (f" | 編曲の条件なし {noarr['loss']:.4f}" if noarr else "")
             )
             if wandb_run:
                 logs = {f"val/{k}": v for k, v in val.items()}
@@ -512,6 +572,11 @@ def main() -> None:
                 logs.update({f"val/loss_{name}": v for name, v in long.items()})
                 if long:
                     logs["val/memory_gain"] = long["long_nomem"] - long["long"]
+                if noarr:
+                    logs["val/loss_noarr"] = noarr["loss"]
+                    logs["val/arrangement_gain"] = noarr["loss"] - val["loss"]
+                    for g in TOKEN_GROUPS:
+                        logs[f"val/arrangement_gain_{g}"] = noarr[f"loss_{g}"] - val[f"loss_{g}"]
                 wandb_run.log(logs, step=step)
             if val["loss"] < best_val_loss:
                 best_val_loss = val["loss"]

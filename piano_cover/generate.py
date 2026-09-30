@@ -8,6 +8,9 @@ python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.75 --onse
 --onset-bias を付けると、出力の onset を原曲の onset (全楽器の音と拍) に寄せる (onset_time_bias)。
 Planner のあるモデルは、原曲から予測した強弱と音の多さの曲線を条件にして生成する。--dynamics / --density は
 その曲線の山と谷を何倍にするか (1 で学習データと同じくらい、大きくするほどメリハリが付く。0 で指定なし)。
+編曲の性質も条件にしたモデル (piano_cover.arrangement) は、--fill (合いの手・オブリの量) / --above (メロディの上に
+音を重ねる割合) / --span (音域の広さ) で、Planner の予測を全カバーでの標準偏差の単位でずらせる
+(0 で予測のまま、+0.5 前後で合いの手の多い演奏者くらい)。--no-arrangement でその条件を外す。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from piano_ar.evaluation import synthesize, write_wav
 from piano_ar.tokenizer import PianoTokenizer
 from piano_ar.train import context_patches
 
+from .arrangement import measurable
 from .config import CoverConfig
 from .data import source_tensors
 from .model import CoverModel, SourceCondition
@@ -53,6 +57,10 @@ def main() -> None:
     parser.add_argument("--onset-bias-width", type=float, default=0.02, help="寄せる範囲 (秒)")
     parser.add_argument("--dynamics", type=float, default=1.0, help="強弱の曲線の倍率 (0 で指定なし)")
     parser.add_argument("--density", type=float, default=1.0, help="音の多さの曲線の倍率 (0 で指定なし)")
+    parser.add_argument("--fill", type=float, default=0.0, help="合いの手・オブリの量を増やす量 (標準偏差の単位)")
+    parser.add_argument("--above", type=float, default=0.0, help="メロディの上に音を重ねる割合を増やす量 (同上)")
+    parser.add_argument("--span", type=float, default=0.0, help="音域の広さを増やす量 (同上)")
+    parser.add_argument("--no-arrangement", action="store_true", help="編曲の性質の条件を指定なしにする")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
     args = parser.parse_args()
@@ -110,7 +118,11 @@ def main() -> None:
         common["time_bias"] = torch.from_numpy(bias).to(device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         condition = SourceCondition(model, source)
-        dynamics = model.planned_dynamics(condition.memory, channel, num_patches, args.dynamics, args.density)
+        arrangement = (None,) * 3 if args.no_arrangement else (args.fill, args.above, args.span)
+        known = measurable(rows, num_patches, tokenizer.patch_frames, tokenizer.config.frame_rate)
+        dynamics = model.planned_dynamics(
+            condition.memory, channel, num_patches, args.dynamics, args.density, arrangement, known
+        )
         samples = model.decoder.generate(
             tokenizer, num_samples=args.num_samples, condition=condition, dynamics=dynamics, **common
         )
