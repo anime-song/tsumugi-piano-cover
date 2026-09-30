@@ -9,6 +9,7 @@
     data/alignments/<原曲>/<カバー>.pt           音声同士の DTW で求めたカバー -> 原曲の時刻の対応
     data/alignments/source_offsets.json         アラインメントの原曲側の時刻の基準 (下記)
     data/metadata/piano_to_performer.json        カバー -> チャンネル ID (事前学習と同じ番号)
+    data/metadata/dataset_mined.json            事前学習のカバーから足した組 (local/pair_review.py、あれば)
 
 出力 (--out-dir):
     source_rows.npy / sources.npz   原曲の行 (piano_cover.source) を連結したものと曲ごとの範囲
@@ -20,6 +21,15 @@
     カバー側: カバー MIDI (今と同じ Transkun のもの) の最初の音の onset
     原曲側  : 旧 tsumugi の原曲 MIDI (Dataset/original_midis/merged) の最初の音の onset -> source_offsets.json
 新しい原曲 MIDI は音声の絶対時刻なので、原曲側に source_offsets の秒数を足して戻す。
+あとから作った対応 (version 3、local/align_mined.py) は原曲側が最初から音声の絶対時刻なので戻さない。
+
+dataset_mined.json の組のカバーは事前学習に入っているので、原曲の分け方に関係なく学習側に入れる
+(検証・テスト側の原曲の曲なら入れない)。チャンネルは事前学習の一覧の演奏者から引く。
+原曲と長さが大きく違うカバー (カバー / 原曲 が --min-length-ratio〜--max-length-ratio の外) は入れない。
+今の組では、範囲外のカバーはメロディの一致率 (下記) の中央値が 0.3 前後しかなく (範囲内は 0.69)、
+TV サイズ・ショート版・メドレーなどで原曲の一部しか対応しない。
+カバーごとに、原曲のメロディの音のうち、対応する時刻 (±50ms) に同じ音名のカバーの音がある割合
+(melody_match) を測って保存する (アラインメントの失敗や別アレンジの組を見つけるため)。
 
 音声の DTW は音符の単位では粗い (平均 40ms 早く、±40ms 揺れる) ので、最後に音符の onset 同士が合うよう
 窓ごとに細かく補正する (refine_alignment)。
@@ -47,7 +57,10 @@ from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PianoTokenizer
 from .source import load_source
 
 PAIR_DATASET = Path("data/metadata/dataset.json")
+MINED_DATASET = Path("data/metadata/dataset_mined.json")
 PIANO_TO_PERFORMER = Path("data/metadata/piano_to_performer.json")
+PRETRAINING_MANIFEST = Path("data/metadata/pretraining_manifest.csv")
+CHANNEL_INDEX = Path("data/metadata/channel_index.json")
 # アラインメントを持つ間隔 (フレーム)。10 フレーム = 0.1 秒
 ALIGN_STEP = 10
 
@@ -73,11 +86,16 @@ def cover_alignment(
 ) -> np.ndarray:
     """カバー (先頭を shift_frames 詰めたもの) の ALIGN_STEP フレームごとに、原曲 (音声の絶対時刻) のフレームを返す。
 
-    raw_note_start: カバー MIDI の最初の音の onset (秒)、source_offset: 旧原曲 MIDI の最初の音の onset (秒)
+    raw_note_start: カバー MIDI の最初の音の onset (秒)、source_offset: 旧原曲 MIDI の最初の音の onset (秒)。
+    version 3 の対応は原曲側が音声の絶対時刻なので source_offset を使わない (None でもよい)
     """
     import torch
 
     payload = torch.load(alignment_path, map_location="cpu", weights_only=False)
+    if payload.get("version", 0) >= 3:
+        source_offset = 0.0
+    elif source_offset is None:
+        raise ValueError(f"{alignment_path} は旧原曲 MIDI の時刻だが source_offsets.json に原曲がない")
     target = payload["target_time_knots_seconds"].numpy().astype(np.float64)
     source = payload["source_time_knots_seconds"].numpy().astype(np.float64)
     grid = np.arange(0, num_frames + ALIGN_STEP, ALIGN_STEP)
@@ -149,6 +167,24 @@ def refine_alignment(
     return (align + correction).astype(np.float32), len(centers) / max(total, 1)
 
 
+def melody_match(align: np.ndarray, cover_notes: np.ndarray, source_rows: np.ndarray, tolerance: int = 5) -> float:
+    """原曲のメロディの音のうち、対応する時刻の ±tolerance フレームに同じ音名のカバーの音がある割合
+    (カバーが弾いている範囲のメロディだけで数える)"""
+    from .source import INSTRUMENT_ID, ROW_A, ROW_D, ROW_ONSET, ROW_TYPE, TYPE_NOTE
+
+    melody = source_rows[(source_rows[:, ROW_TYPE] == TYPE_NOTE) & (source_rows[:, ROW_D] == INSTRUMENT_ID["melody"])]
+    mapped = np.interp(cover_notes[:, ONSET].astype(np.float64) / ALIGN_STEP, np.arange(len(align)), align)
+    melody = melody[(melody[:, ROW_ONSET] >= mapped.min()) & (melody[:, ROW_ONSET] <= mapped.max())]
+    if len(melody) == 0:
+        return float("nan")
+    order = np.argsort(mapped)
+    mapped, pitch_class = mapped[order], cover_notes[order, 2] % 12
+    lo = np.searchsorted(mapped, melody[:, ROW_ONSET] - tolerance)
+    hi = np.searchsorted(mapped, melody[:, ROW_ONSET] + tolerance, side="right")
+    hits = [(pitch_class[a:b] == p % 12).any() for a, b, p in zip(lo, hi, melody[:, ROW_A])]
+    return float(np.mean(hits))
+
+
 def _load_song(args: tuple) -> dict | str:
     original_id, covers, source_dir, cover_dir, alignment_dir, source_offset, config, smooth = args
     try:
@@ -176,8 +212,9 @@ def _load_song(args: tuple) -> dict | str:
                 config.frame_rate,
                 smooth,
             )
-            align, refined = refine_alignment(align, events[events[:, KIND] == KIND_NOTE], rows)
-            results.append((piano_id, events, end_frame, align, refined))
+            note_events = events[events[:, KIND] == KIND_NOTE]
+            align, refined = refine_alignment(align, note_events, rows)
+            results.append((piano_id, events, end_frame, align, refined, melody_match(align, note_events, rows)))
         return {"original_id": original_id, "rows": rows, "end_frame": source_end, "covers": results}
     except Exception as e:  # 壊れた MIDI などは飛ばす
         return f"{original_id}: {e!r}"
@@ -193,6 +230,9 @@ def main() -> None:
     parser.add_argument("--val-percent", type=float, default=5.0)
     parser.add_argument("--test-percent", type=float, default=5.0)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--min-length-ratio", type=float, default=0.75, help="カバー / 原曲 の長さの比の下限")
+    parser.add_argument("--max-length-ratio", type=float, default=1.33, help="カバー / 原曲 の長さの比の上限")
+    parser.add_argument("--no-mined", action="store_true", help="dataset_mined.json の組を使わない")
     args = parser.parse_args()
 
     config = TokenizerConfig()
@@ -203,21 +243,41 @@ def main() -> None:
     performer = json.loads(PIANO_TO_PERFORMER.read_text(encoding="utf-8"))
     source_offsets = json.loads((alignment_dir / "source_offsets.json").read_text(encoding="utf-8"))
 
+    # 原曲ごとのカバー。足した組 (mined) は事前学習の一覧の演奏者 (チャンネル ID) から番号を引く
+    covers_of: dict[str, list[str]] = {}
+    for entry in pairs.values():
+        covers_of.setdefault(entry["original"], []).extend(entry["pianos"])
+    mined: set[str] = set()
+    if not args.no_mined and MINED_DATASET.exists():
+        import csv
+
+        channel_index = json.loads(CHANNEL_INDEX.read_text(encoding="utf-8"))
+        channel_of = {
+            row["id"]: row["performer"] for row in csv.DictReader(PRETRAINING_MANIFEST.open(encoding="utf-8-sig"))
+        }
+        for entry in json.loads(MINED_DATASET.read_text(encoding="utf-8")).values():
+            new = [p for p in entry["pianos"] if p not in covers_of.get(entry["original"], [])]
+            covers_of.setdefault(entry["original"], []).extend(new)
+            mined.update(new)
+            for piano_id in new:
+                if channel_of.get(piano_id) in channel_index:
+                    performer[piano_id] = channel_index[channel_of[piano_id]]
+        print(f"足した組のカバー {len(mined)} 本")
+
     jobs = []
     missing_source = 0
-    for entry in pairs.values():
-        original_id = entry["original"]
-        if not (source_dir / f"{original_id}.mid").exists() or original_id not in source_offsets:
+    for original_id, covers in covers_of.items():
+        if not (source_dir / f"{original_id}.mid").exists():
             missing_source += 1
             continue
         jobs.append(
             (
                 original_id,
-                entry["pianos"],
+                covers,
                 source_dir,
                 cover_dir,
                 alignment_dir,
-                source_offsets[original_id],
+                source_offsets.get(original_id),
                 config,
                 args.smooth_seconds,
             )
@@ -228,6 +288,8 @@ def main() -> None:
     cover_events, cover_ids, cover_ends, cover_lengths, cover_source, channels, splits = [], [], [], [], [], [], []
     aligns, align_lengths = [], []
     refined_rates: list[float] = []
+    matches, is_mined = [], []
+    dropped = {"length": [0, 0], "mined_eval": 0}  # 長さで外した本数 [前の組, 足した組]、検証・テスト側の曲の足した組
     failed = 0
     with ProcessPoolExecutor(args.workers) as pool:
         for result in pool.map(_load_song, jobs, chunksize=4):
@@ -235,6 +297,19 @@ def main() -> None:
                 failed += 1
                 print(f"失敗 {result}")
                 continue
+            split = split_of(result["original_id"], args.val_percent, args.test_percent)
+            kept = []
+            for cover in result["covers"]:
+                piano_id, end_frame = cover[0], cover[2]
+                if piano_id in mined and split != 0:
+                    dropped["mined_eval"] += 1
+                    continue
+                ratio = end_frame / max(result["end_frame"], 1)
+                if not args.min_length_ratio <= ratio <= args.max_length_ratio:
+                    dropped["length"][piano_id in mined] += 1
+                    continue
+                kept.append(cover)
+            result["covers"] = kept
             if not result["covers"]:
                 continue
             source_index = len(source_ids)
@@ -242,9 +317,10 @@ def main() -> None:
             source_rows.append(result["rows"])
             source_lengths.append(len(result["rows"]))
             source_ends.append(result["end_frame"])
-            split = split_of(result["original_id"], args.val_percent, args.test_percent)
-            for piano_id, events, end_frame, align, refined in result["covers"]:
+            for piano_id, events, end_frame, align, refined, match in result["covers"]:
                 refined_rates.append(refined)
+                matches.append(match)
+                is_mined.append(piano_id in mined)
                 cover_ids.append(piano_id)
                 cover_events.append(events)
                 cover_lengths.append(len(events))
@@ -276,6 +352,8 @@ def main() -> None:
         source_index=np.asarray(cover_source, dtype=np.int64),
         channels=np.asarray(channels, dtype=np.int64),
         split=np.asarray(splits, dtype=np.int64),
+        melody_match=np.asarray(matches, dtype=np.float32),
+        mined=np.asarray(is_mined, dtype=bool),
     )
     meta = {"tokenizer": asdict(config), "align_step": ALIGN_STEP, "smooth_seconds": args.smooth_seconds}
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -287,6 +365,18 @@ def main() -> None:
         f"学習 {(splits_array == 0).sum()} 検証 {(splits_array == 1).sum()} テスト {(splits_array == 2).sum()} / 失敗 {failed}"
     )
     print(f"音符の onset で補正できた窓の割合: 平均 {np.mean(refined_rates):.0%}")
+    print(
+        f"長さの比で外したカバー: 前の組 {dropped['length'][0]} / 足した組 {dropped['length'][1]}、"
+        f"検証・テスト側の曲なので外した足した組 {dropped['mined_eval']}"
+    )
+    matches_array, mined_array = np.asarray(matches), np.asarray(is_mined, dtype=bool)
+    for name, selected in (("前の組", ~mined_array), ("足した組", mined_array)):
+        values = matches_array[selected & ~np.isnan(matches_array)]
+        if len(values):
+            print(
+                f"メロディの一致率 {name} {selected.sum()} 本: 中央値 {np.median(values):.2f} / "
+                f"0.3 未満 {(values < 0.3).sum()} 本"
+            )
     print(f"出力: {out_dir}")
 
 
