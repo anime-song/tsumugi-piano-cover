@@ -25,10 +25,11 @@ from piano_ar.data import (
     transpose_events,
     window_locate,
 )
-from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PianoTokenizer, sort_events
+from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PAD, PianoTokenizer, sort_events
 
 from .arrangement import ARRANGEMENT_NAMES, arrangement_values, map_to_source
 from .config import CoverConfig
+from .rollout import Rollout, RolloutBank
 from .source import (
     ROW_TYPE,
     TYPE_BEAT,
@@ -202,6 +203,10 @@ class CoverWindowDataset(Dataset):
     (piano_cover.arrangement の fill / above / span) の列も足す (条件は強弱と同じ確率で列ごとに落とす)。
     sync_mask なら、原曲に沿っていない所 (キャッシュの align_ok が半分以上 0 のパッチ) の損失を取らない
     (窓の損失を取るパッチが全部なくなるときは外さない)。
+    rollouts (piano_cover.rollout) を渡すと、学習では rollout_prob の確率で、その窓をモデル自身が生成したパッチに
+    差し替え、その後の正解のパッチだけで損失を取る (自分の生成の失敗から原曲に戻る学習。時間伸縮などとずらし学習は
+    かけない)。検証 (rollout_eval) ではロールアウトを 1 つずつ順に使い、差し替えた後の rollout_loss_patches
+    パッチだけで損失を取る。
     """
 
     def __init__(
@@ -224,8 +229,16 @@ class CoverWindowDataset(Dataset):
         dynamics_dropout: float = 0.2,
         arrangement: bool = False,
         sync_mask: bool = False,
+        rollouts: RolloutBank | None = None,
+        rollout_prob: float = 0.0,
+        rollout_eval: bool = False,
+        rollout_loss_patches: int = 0,
     ) -> None:
         self.cache = cache
+        self.rollouts = rollouts
+        self.rollout_prob = rollout_prob
+        self.rollout_eval = rollout_eval and rollouts is not None
+        self.rollout_loss_patches = rollout_loss_patches
         self.arrangement = arrangement and dynamics_bins > 0
         self.sync_mask = sync_mask
         self.dynamics_bins = dynamics_bins
@@ -247,9 +260,14 @@ class CoverWindowDataset(Dataset):
         self.val_start_patch = val_start_patch
 
     def __len__(self) -> int:
+        if self.rollout_eval:
+            return len(self.rollouts)
         return len(self.covers) + (len(self.pretraining) if self.pretraining is not None else 0)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self.rollout_eval:
+            rollout = self.rollouts[index]
+            return self.cover_item(rollout.cover, index, rollout=rollout)
         if index >= len(self.covers):
             item = self.pretraining[index - len(self.covers)]
             item["align"] = torch.zeros(len(item["tokens"]), 2)
@@ -262,6 +280,15 @@ class CoverWindowDataset(Dataset):
             return item
 
         cover = int(self.covers[index])
+        rollout = None
+        if self.rollouts is not None and self.train and random.random() < self.rollout_prob:
+            rollout = self.rollouts.pick(cover)
+        return self.cover_item(cover, index, rollout=rollout)
+
+    def cover_item(
+        self, cover: int, index: int, *, first: int | None = None, rollout: Rollout | None = None
+    ) -> dict[str, torch.Tensor]:
+        """カバー cover の窓。first で損失を取る窓の始まりのフレームを決められる (ロールアウトを作るとき)"""
         source = int(self.cache.source_index[cover])
         events = self.cache.cover_events(cover)
         end_frame = int(self.cache.end_frames[cover])
@@ -270,8 +297,10 @@ class CoverWindowDataset(Dataset):
         source_end = int(self.cache.source_end_frames[source])
 
         factor = 1.0
-        if self.augment is not None:
-            a = self.augment
+        # ロールアウトは伸縮・移調なしの窓で作ったので、差し替えるときは同じ窓にする
+        augment = self.augment if rollout is None else None
+        if augment is not None:
+            a = augment
             if a.time_stretch > 0:
                 factor = random.uniform(1 - a.time_stretch, 1 + a.time_stretch)
                 events, end_frame = stretch_events(events, end_frame, factor)
@@ -294,10 +323,14 @@ class CoverWindowDataset(Dataset):
             train=self.train,
             song_start_prob=self.song_start_prob,
             val_start_patch=self.val_start_patch,
+            first=rollout.first if rollout is not None else first,
         )
         song_start = start == 0
         total = len(patch_loss)
-        patch_loss = self._drift(window, patch_loss, events, end_frame, start, index)
+        if rollout is not None:
+            patch_loss = self._apply_rollout(window, patch_loss, rollout, start)
+        else:
+            patch_loss = self._drift(window, patch_loss, events, end_frame, start, index)
         if self.sync_mask:
             ok = self.cache.cover_align_ok(cover)
             if ok is not None:
@@ -361,6 +394,27 @@ class CoverWindowDataset(Dataset):
             **dynamics,
             **source_items,
         }
+
+    def _apply_rollout(
+        self, window: dict[str, np.ndarray], patch_loss: np.ndarray, rollout: Rollout, start: int
+    ) -> np.ndarray:
+        """窓のパッチ rollout.split から先をロールアウトのトークンとペダルに差し替え、その後だけで損失を取る"""
+        if start != rollout.start:
+            raise ValueError(
+                f"ロールアウトの窓の始まり {rollout.start} と作り直した窓 {start} が違う (記憶の長さが違う?)"
+            )
+        width = window["tokens"].shape[1]
+        for j, (tokens, pedal) in enumerate(zip(rollout.patches, rollout.pedal)):
+            row = np.full(width, PAD, dtype=window["tokens"].dtype)
+            row[: min(len(tokens), width)] = tokens[:width]
+            window["tokens"][rollout.split + j] = row
+            window["pedal_state"][rollout.split + j] = int(pedal)
+        patch_loss = patch_loss.copy()
+        resume = rollout.split + len(rollout.patches)
+        patch_loss[:resume] = False
+        if self.rollout_loss_patches:
+            patch_loss[resume + self.rollout_loss_patches :] = False
+        return patch_loss
 
     def _drift(
         self,

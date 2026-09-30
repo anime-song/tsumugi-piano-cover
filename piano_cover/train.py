@@ -18,6 +18,9 @@
 --no-arrangement でなければ、その条件に編曲の性質 (合いの手の量・メロディの上に重ねる割合・音域の広さ、
 piano_cover.arrangement) の列も足し、Planner も予測する。検証の val/arrangement_gain はその列を外したときの損失の差。
 --init-cover で以前のカバーモデルから始めるときは、足した列の分だけ条件の表と Planner の出力を増やす。
+--rollouts (piano_cover.rollout で作ったモデル自身の生成) を渡すと、--rollout-prob の確率で窓の一部をそれに差し替え、
+その後の正解で損失を取る (自分の失敗から原曲に戻る学習)。--val-rollouts を渡すと、差し替えた直後の 2 パッチの損失を
+冒頭 (val_rollout_start) と途中 (val_rollout_mid) に分けて測る。
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from piano_ar.train import adapt_state, context_patches, limit_gpu_memory, lr_at
 from .arrangement import ARRANGEMENT_NAMES, measurable
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
+from .rollout import KINDS, RolloutBank
 from .metrics import sync_metrics
 from .model import CoverModel, SourceCondition
 from .source import SourceVocab, source_features, trim_lead
@@ -111,6 +115,9 @@ def build_args() -> argparse.Namespace:
         action="store_true",
         help="原曲に沿っていない所 (キャッシュの align_ok) の損失も取る (既定では学習で取らない)",
     )
+    parser.add_argument("--rollouts", default=None, help="学習に差し込むロールアウト (piano_cover.rollout の npz)")
+    parser.add_argument("--rollout-prob", type=float, default=0.15, help="カバーの窓をロールアウトに差し替える確率")
+    parser.add_argument("--val-rollouts", default=None, help="検証用のロールアウト (--split val で作ったもの)")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=1000)
@@ -360,6 +367,8 @@ def main() -> None:
         pretraining=pretraining,
         drift=DriftConfig(prob=args.drift_prob) if args.drift_prob > 0 else None,
         sync_mask=not args.no_sync_mask,
+        rollouts=RolloutBank.load(args.rollouts) if args.rollouts else None,
+        rollout_prob=args.rollout_prob,
         dynamics_dropout=args.dynamics_dropout,
         **common,
     )
@@ -408,6 +417,22 @@ def main() -> None:
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
     val_noarr_loader = DataLoader(val_noarr, batch_size=args.batch_size, **loader_options) if val_noarr else None
     val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options)
+    rollout_loaders = {}
+    if args.val_rollouts:
+        bank = RolloutBank.load(args.val_rollouts)
+        for kind in KINDS:
+            subset = bank.subset(kind)
+            if len(subset):
+                dataset = CoverWindowDataset(
+                    cache,
+                    split="val",
+                    source_dropout=0.0,
+                    rollouts=subset,
+                    rollout_eval=True,
+                    rollout_loss_patches=2,
+                    **common,
+                )
+                rollout_loaders[kind] = DataLoader(dataset, batch_size=args.batch_size, **loader_options)
     long_loaders = {
         name: DataLoader(ds, batch_size=args.batch_size, **loader_options) for name, ds in long_sets.items()
     }
@@ -553,6 +578,7 @@ def main() -> None:
             val = evaluate(model, val_loader, device)
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
             resync = evaluate(model, val_resync_loader, device)
+            rollout = {kind: evaluate(model, loader, device) for kind, loader in rollout_loaders.items()}
             long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
             noarr = evaluate(model, val_noarr_loader, device) if val_noarr_loader else None
             print(
@@ -560,6 +586,9 @@ def main() -> None:
                 + " ".join(f"{g} {val[f'loss_{g}']:.3f}" for g in TOKEN_GROUPS)
                 + (f" plan {val['loss_plan']:.3f}" if "loss_plan" in val else "")
                 + f" | ずれから戻る loss {resync['loss']:.4f} time {resync['loss_time']:.3f}"
+                + "".join(
+                    f" | 生成から戻る ({k}) loss {v['loss']:.4f} time {v['loss_time']:.3f}" for k, v in rollout.items()
+                )
                 + (f" | 曲の途中 記憶あり {long['long']:.4f} なし {long['long_nomem']:.4f}" if long else "")
                 + (f" | 編曲の条件なし {noarr['loss']:.4f}" if noarr else "")
             )
@@ -569,6 +598,8 @@ def main() -> None:
                     {"val/loss_nosource": val_nosource_loss, "val/source_gain": val_nosource_loss - val["loss"]}
                 )
                 logs.update({f"val_resync/{k}": v for k, v in resync.items()})
+                for kind, values in rollout.items():
+                    logs.update({f"val_rollout_{kind}/{k}": v for k, v in values.items()})
                 logs.update({f"val/loss_{name}": v for name, v in long.items()})
                 if long:
                     logs["val/memory_gain"] = long["long_nomem"] - long["long"]
