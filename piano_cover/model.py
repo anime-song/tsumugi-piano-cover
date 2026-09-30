@@ -30,7 +30,15 @@ from torch.utils.checkpoint import checkpoint
 
 from piano_ar.config import ModelConfig
 from piano_ar.data import quantize_dynamics
-from piano_ar.model import Block, CrossBlock, CrossHook, OutputHook, PianoARModel, Transformer
+from piano_ar.model import (
+    Block,
+    CrossBlock,
+    CrossHook,
+    OutputHook,
+    PianoARModel,
+    Transformer,
+    prepare_block_compile,
+)
 from piano_ar.tokenizer import PianoTokenizer
 
 from .config import CoverConfig
@@ -238,8 +246,7 @@ class CoverModel(nn.Module):
     def compile_blocks(self) -> None:
         """デコーダ・原曲エンコーダ・cross-attention のブロックを 1 つずつ torch.compile する (PianoARModel.compile_blocks と同じ)。
         batch 16 で 1 ステップ 1.49 秒 -> 1.02 秒。"""
-        torch._dynamo.config.recompile_limit = 64
-        torch._dynamo.config.cache_size_limit = 64
+        prepare_block_compile()
         for module in self.modules():
             if isinstance(module, (Block, CrossBlock)):
                 module.compile(dynamic=True)

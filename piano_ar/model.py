@@ -86,6 +86,21 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
+def prepare_block_compile(recompile_limit: int = 64) -> None:
+    """ブロック単位の torch.compile の前に、作り直しの上限を上げて、使うグラフの順番を固定する。
+
+    ブロックの種類 x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。既定の上限 (8) を超えると
+    以降は compile されずに通常実行になり、gradient checkpointing の再計算が forward と別の実行 (graph) になって失敗する。
+    torch 2.13 から dynamo の設定への代入はスレッドごとで、backward (checkpoint の再計算) は autograd の別スレッドで
+    動くので、代入ではなく既定値を書き換えて全スレッドに効かせる。
+    """
+    for name in ("recompile_limit", "cache_size_limit"):
+        setattr(torch._dynamo.config, name, recompile_limit)
+    torch._dynamo.config._config["recompile_limit"].default = recompile_limit
+    # グラフが増えたときに、checkpoint の再計算が forward と別のグラフを選ばないよう、見る順番を固定する
+    torch._C._dynamo.eval_frame._set_lru_cache(False)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -318,12 +333,7 @@ class PianoARModel(nn.Module):
         使い回せる。学習時間の多くは行列積ではなく RMSNorm・RoPE・型変換などの細かい演算なので、融合の効果が大きい。
         nn.Module.compile はその場で置き換えるので、state_dict のキー名は変わらない。最初の 1 ステップは数分かかる。
         """
-        # ブロックの種類 x 学習/評価 x マスクの有無、生成時の長さ 1 の入力などで作り直しが起きる。
-        # 既定の上限 (8) を超えると以降は compile されずに通常実行になるので、余裕を持たせる
-        torch._dynamo.config.recompile_limit = 64
-        torch._dynamo.config.cache_size_limit = 64
-        # グラフが増えたときに、checkpoint の再計算が forward と別のグラフを選ばないよう、見る順番を固定する
-        torch._C._dynamo.eval_frame._set_lru_cache(False)
+        prepare_block_compile()
         for module in self.modules():
             if isinstance(module, (Block, CrossBlock)):
                 module.compile(dynamic=True)
