@@ -5,3 +5,10 @@ symusic
 wandb
 # torch.compile 用 (torch 2.13 は triton 3.7 系)
 triton-windows>=3.7,<3.8; sys_platform == "win32"
+# 推論用の重みの読み書き (piano_ar.hub)
+safetensors
+huggingface_hub
+# UI (cover_studio)
+fastapi
+uvicorn
+python-multipart
