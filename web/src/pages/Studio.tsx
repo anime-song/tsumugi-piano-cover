@@ -66,6 +66,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [filter, setFilter] = useState<"all" | "favorite">("all");
   const [showSource, setShowSource] = useState(true);
   const [tab, setTab] = useState<Tab>("play");
+  // 携帯で巻物をたたむかどうか (広い画面では styles.css がボタンごと隠す)
+  const [rollOpen, setRollOpen] = useState(true);
   const [continueFrom, setContinueFrom] = useState<ContinueFrom | null>(null);
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
@@ -264,7 +266,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
 
         <section className="center">
           <div className="song-head">
-            <div>
+            <div className="song-title-block">
               <h1>{data.title}</h1>
               <div className="muted small">
                 {data.audio ?? t.noAudio} · {t.sourceMidi}:{" "}
@@ -290,12 +292,24 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           {!data.source ? (
             <TranscribePanel project={data} pid={pid} player={player} onChange={refresh} onError={setError} />
           ) : (
-            <div className="roll-card">
+            <div className={`roll-card ${rollOpen ? "" : "collapsed"}`}>
               <div className="roll-head">
                 <span className="roll-title">
-                  {selectedTake ? takeLabel(selectedTake, t) : t.sourceMidiTitle}
+                  <span className="roll-title-text">
+                    {selectedTake ? takeLabel(selectedTake, t) : t.sourceMidiTitle}
+                  </span>
                   <span className="spinner small" style={{ visibility: takeView.isFetching ? "visible" : "hidden" }} />
                 </span>
+                {/* 携帯だけに出る巻物の開閉 (広い画面では styles.css が隠す) */}
+                <button
+                  className={`roll-toggle ${rollOpen ? "open" : ""}`}
+                  onClick={() => setRollOpen(!rollOpen)}
+                  aria-expanded={rollOpen}
+                  title={rollOpen ? t.rollCollapse : t.rollExpand}
+                >
+                  <Icon name="chevron" size={14} />
+                  {rollOpen ? t.rollCollapse : t.rollExpand}
+                </button>
                 <div className="legend">
                   <label className="check">
                     <input type="checkbox" checked={showSource} onChange={(e) => setShowSource(e.target.checked)} />
@@ -321,7 +335,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                 continueAt={continueFrom?.seconds ?? null}
               />
               <div className="roll-hint muted small">
-                {t.rollHint}
+                <span className="roll-hint-text">{t.rollHint}</span>
                 {player.loop && (
                   <>
                     {" · "}

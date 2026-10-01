@@ -783,7 +783,26 @@ input[type="range"]:disabled {
   padding: 10px 14px;
 }
 .roll-title {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
   font-weight: 600;
+}
+/* 長いテイク名でも 1 行のまま (はみ出したら … にする) */
+.roll-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roll-title .spinner {
+  flex-shrink: 0;
+}
+/* 巻物の開閉ボタン (携帯だけ。広い画面では出さない) */
+.roll-toggle {
+  display: none;
 }
 .legend {
   display: flex;
@@ -1295,6 +1314,128 @@ input[type="range"]:disabled {
   .center {
     padding: 16px 16px 20px;
   }
+  /* 曲の見出しは 1 行にまとめて、巻物に場所をあける */
+  .song-head {
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .song-title-block {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .song-head h1,
+  .song-head .muted.small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .song-head h1 {
+    font-size: 18px;
+  }
+
+  /* 演奏の面: 巻物はそのまま置いて、下のテイク一覧だけをスクロールさせる */
+  .studio[data-tab="play"] > .center {
+    display: block;
+    /* overflow を付けると、この要素が sticky の基準になって巻物が貼り付かない。
+       (スクロールは外側の .studio が持つ) */
+    overflow: visible;
+    padding: 0 16px;
+  }
+  .studio[data-tab="play"] .roll-card {
+    /* 上に貼り付けて、下の一覧だけが動くようにする (指でどこをなぞっても送れる) */
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    margin-bottom: 12px;
+    /* 角の丸みから下の一覧が覗かないように背景色で縁取る */
+    box-shadow: 0 0 0 8px var(--bg);
+  }
+  /* 巻物の説明文は指では当てはまらないので隠す (ループを消すボタンは残す) */
+  .studio[data-tab="play"] .roll-hint {
+    padding: 0 0 4px;
+  }
+  .studio[data-tab="play"] .roll-hint-text {
+    display: none;
+  }
+  /* 1 行目に見出しと開閉ボタン、2 行目に楽器の色の見出しを置く */
+  .studio[data-tab="play"] .roll-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "title toggle"
+      "legend legend";
+    align-items: center;
+    gap: 4px 8px;
+    padding: 6px 12px;
+  }
+  .studio[data-tab="play"] .roll-title {
+    grid-area: title;
+  }
+  .studio[data-tab="play"] .roll-toggle {
+    display: inline-flex;
+    grid-area: toggle;
+    align-items: center;
+    gap: 4px;
+    min-height: 36px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text-2);
+    font-size: 12px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .studio[data-tab="play"] .roll-toggle svg {
+    transition: transform 0.15s;
+  }
+  .studio[data-tab="play"] .roll-toggle.open svg {
+    transform: rotate(180deg);
+  }
+  .studio[data-tab="play"] .legend {
+    grid-area: legend;
+  }
+  .studio[data-tab="play"] .roll-zoom input {
+    height: 26px;
+  }
+  /* 楽器の色の見出しは 1 行のまま横に流す (折り返して巻物を狭めない) */
+  .studio[data-tab="play"] .legend,
+  .studio[data-tab="play"] .legend-items {
+    flex-wrap: nowrap;
+  }
+  .studio[data-tab="play"] .legend {
+    overflow-x: auto;
+    touch-action: pan-x;
+  }
+  /* 「原曲を重ねる」が潰れて折り返すと、その分だけ巻物が狭くなる */
+  .studio[data-tab="play"] .check {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .studio[data-tab="play"] .roll {
+    --roll-h: clamp(190px, 34vh, 360px);
+  }
+  /* たたむと見出しだけが残り、下のテイク一覧に場所をあける */
+  .studio[data-tab="play"] .roll-card.collapsed .roll,
+  .studio[data-tab="play"] .roll-card.collapsed .roll-zoom,
+  .studio[data-tab="play"] .roll-card.collapsed .roll-hint {
+    display: none;
+  }
+  .studio[data-tab="play"] .takes-scroll {
+    overflow: visible;
+    margin-right: 0;
+    padding: 0 0 24px;
+  }
+  .studio[data-tab="play"] .takes-head {
+    position: static;
+    padding: 0;
+    margin-bottom: 8px;
+    background: none;
+  }
+  .studio[data-tab="play"] .song-head {
+    margin: 12px 0 10px;
+  }
   .right {
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
@@ -1392,12 +1533,36 @@ input[type="range"]:disabled {
   }
 
   .player {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px));
+    /* 原曲⇄カバーのつまみを再生ボタンの右の行に置く (下の行にはシークバー) */
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "controls mix"
+      "seek seek";
+    align-items: center;
+    gap: 6px 10px;
+    padding: 8px 14px calc(8px + env(safe-area-inset-bottom, 0px));
   }
   .player-info {
     display: none;
+  }
+  .player-main {
+    display: contents;
+  }
+  .player-controls {
+    grid-area: controls;
+    justify-content: flex-start;
+    gap: 4px;
+  }
+  .player-seek {
+    grid-area: seek;
+  }
+  .player-mix {
+    grid-area: mix;
+    gap: 6px;
+    font-size: 11px;
+  }
+  .player-mix input {
+    min-width: 36px;
   }
   .topbar {
     padding: 0 12px;
@@ -1424,6 +1589,13 @@ input[type="range"]:disabled {
   }
   .library {
     padding: 16px 12px 40px;
+  }
+}
+
+/* 幅が足りないときは「原曲 / カバー」の文字を省いてつまみを広く使う */
+@media (max-width: 400px) {
+  .player-mix > span {
+    display: none;
   }
 }
 

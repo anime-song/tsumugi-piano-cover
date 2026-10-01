@@ -139,6 +139,8 @@ const ja = {
   clearLoop: (a: string, b: string) => `ループ ${a}–${b} を消す`,
   view: "表示",
   viewSeconds: "表示する秒数",
+  rollCollapse: "たたむ",
+  rollExpand: "ひらく",
   // 携帯の表示切り替え
   viewSwitch: "表示の切り替え",
   tabCreate: "作る",
@@ -342,6 +344,8 @@ const en: Dict = {
   clearLoop: (a, b) => `Clear loop ${a}–${b}`,
   view: "View",
   viewSeconds: "Seconds shown",
+  rollCollapse: "Collapse",
+  rollExpand: "Expand",
   viewSwitch: "Switch view",
   tabCreate: "Create",
   tabPlay: "Play",
