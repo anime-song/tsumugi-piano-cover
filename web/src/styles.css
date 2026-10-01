@@ -821,6 +821,8 @@ input[type="range"]:disabled {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  /* 1 つ 1 つの見出しも折り返さない (日本語だと「メロディ」が 4 行になった) */
+  white-space: nowrap;
 }
 .legend-items i {
   display: inline-block;
@@ -1404,9 +1406,11 @@ input[type="range"]:disabled {
   .studio[data-tab="play"] .legend-items {
     flex-wrap: nowrap;
   }
+  .studio[data-tab="play"] .legend-items {
+    flex-shrink: 0;
+  }
   .studio[data-tab="play"] .legend {
     overflow-x: auto;
-    touch-action: pan-x;
   }
   /* 「原曲を重ねる」が潰れて折り返すと、その分だけ巻物が狭くなる */
   .studio[data-tab="play"] .check {
