@@ -1,36 +1,36 @@
 # tsumugi-piano-cover
 
-**Generate piano covers of pop songs as MIDI.** The original song is first transcribed into a multi-instrument MIDI with [tsumugi](https://github.com/anime-song/tsumugi), and a piano model pretrained on about 3,000 hours of piano performances generates the cover from it.
+**Generate piano covers of pop songs as MIDI.** The system first transcribes an audio track into multi-instrument MIDI using [tsumugi](https://github.com/anime-song/tsumugi), then generates an arrangement using an autoregressive piano model pretrained on ~3,000 hours of piano performances.
 
 [日本語 README](README_ja.md) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) | [![Model on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm.svg)](https://huggingface.co/anime-song/tsumugi-piano-cover) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_en.ipynb)
 
-- 🎹 **Covers on the original's time axis**: play the cover together with the original recording
-- 🎚️ **Controllable arrangement**: faithfulness to the original, dynamics, fills, range, and performer style
-- 🔁 **Cover Studio**: a web UI for regenerating with different settings, comparing takes, and regenerating from any point
+- 🎹 **Aligned to Original Timeline**: Play back covers synchronously with the original audio track.
+- 🎚️ **Controllable Arrangements**: Fine-tune fidelity to the source, dynamics, fills, pitch range, and performer styles.
+- 🔁 **Cover Studio**: Interactive web UI for iterative generation, comparing takes, and inpainting/regenerating from any point.
 
 ---
 
-## Quick start
+## Quick Start
 
 ### Google Colab
 
-The easiest way is the Colab notebook ([English](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_en.ipynb) / [日本語](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_ja.ipynb)). Select a GPU runtime, run the first cell, and click **"▶ Open Cover Studio"**. Upload a song, then transcribe, generate, compare, and download everything in the browser.
+The fastest way to get started is the Colab notebook ([English](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_en.ipynb) / [日本語](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_ja.ipynb)). Select a GPU runtime, run the first cell, and open **Cover Studio** to transcribe, generate, compare, and download covers directly from your browser.
 
-### Local
+### Local Installation
 
-Requires Python 3.12 and an NVIDIA GPU (a CPU works, but slowly). The requirements install PyTorch 2.13 with CUDA 13.0.
+Requires Python 3.12 and an NVIDIA GPU (CPU is supported but significantly slower).
 
 ```bash
 git clone https://github.com/anime-song/tsumugi-piano-cover.git
 cd tsumugi-piano-cover
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip
-.venv/bin/python -m cover_studio              # opens http://127.0.0.1:8100
+.venv/bin/python -m cover_studio              # Opens http://127.0.0.1:8100
 ```
 
-The model weights are downloaded from Hugging Face the first time you generate a cover. The built UI is downloaded from GitHub Releases, so Node.js is not required.
+Model weights are downloaded automatically from Hugging Face on the first run. The prebuilt frontend UI is fetched from GitHub Releases (Node.js is not required).
 
-To transcribe audio inside Cover Studio, set up tsumugi in its own environment at `.tsumugi/tsumugi`:
+To enable audio transcription within Cover Studio, set up tsumugi in `.tsumugi/tsumugi`:
 
 ```bash
 git clone https://github.com/anime-song/tsumugi.git .tsumugi/tsumugi
@@ -38,7 +38,7 @@ cd .tsumugi/tsumugi
 uv sync --locked --extra stem
 ```
 
-Cover Studio finds it automatically and runs it with tsumugi's own Python (`--tsumugi-dir` sets another location). On Windows, torchcodec also needs the shared FFmpeg libraries; put them in `.tsumugi/ffmpeg-shared/bin` or pass `--ffmpeg-dir`. Without tsumugi, you can still upload a MIDI file you have already transcribed, together with the audio.
+Cover Studio automatically detects tsumugi and runs it using tsumugi's Python environment (custom path configurable via `--tsumugi-dir`). On Windows, torchcodec requires shared FFmpeg libraries; place them in `.tsumugi/ffmpeg-shared/bin` or specify `--ffmpeg-dir`. If you already have a transcribed MIDI file, you can upload it directly with the audio without installing tsumugi.
 
 ---
 
@@ -46,14 +46,14 @@ Cover Studio finds it automatically and runs it with tsumugi's own Python (`--ts
 
 ![Cover Studio](docs/images/cover_studio.png)
 
-A song is transcribed only once. Generation reuses the loaded model, so you can change settings and generate again as often as you like.
+Audio is transcribed once per song. Once loaded, the model stays in memory for fast iterations:
 
-- **Takes**: every take keeps its settings, seed, and model. "Reuse settings" loads them back into the Create panel. Chips show only the settings that differ from the defaults
-- **Regenerate from here**: keep the take up to the playhead and regenerate only the rest, with new settings
-- **Compare**: the original audio and the cover play on the same clock. Switching takes (↑ / ↓) keeps the playback position. Use the piano roll with the source MIDI overlaid, loop regions, and the original / cover balance slider
-- **Live transcription**: notes appear in the piano roll as tsumugi transcribes them, stem by stem
-- **Export**: MIDI, or WAV rendered with piano samples in the browser
-- Favorites, notes, performer presets, and Japanese / English UI
+- **Take History**: Preserves settings, random seeds, and checkpoint metadata for each take. "Reuse settings" restores parameters to the Create panel. Filter chips highlight settings modified from default values.
+- **Regenerate from Playhead**: Keep the generated performance up to the cursor and regenerate the remainder with modified parameters.
+- **Synchronized Comparison**: Play back original audio and covers simultaneously on a shared timeline. Switching takes (↑ / ↓) preserves playback position. Includes overlaid source MIDI piano rolls, loop markers, and a source/cover balance slider.
+- **Live Transcription**: Displays detected notes on the piano roll in real-time as tsumugi processes each stem.
+- **Export Options**: Download standard MIDI or render WAV audio directly in-browser using sampled piano soundfonts.
+- **Presets & Localization**: Performer presets, bookmarking/notes, and Japanese/English language switching.
 
 ```bash
 python -m cover_studio --root D:/covers --port 8080 --no-browser
@@ -62,87 +62,87 @@ python -m cover_studio --device cpu
 
 ---
 
-## Python API and CLI
+## Python API & CLI
 
 ```python
 from piano_cover.generate import CoverParams, generate_covers, prepare_source
 from piano_cover.model import CoverModel
 
 model = CoverModel.from_pretrained(device="cuda")  # anime-song/tsumugi-piano-cover
-source = prepare_source("song.mid", model.tokenizer, model.config)  # tsumugi MIDI of the original
+source = prepare_source("song.mid", model.tokenizer, model.config)  # tsumugi multi-track MIDI
 cover = generate_covers(model, source, CoverParams(seconds=60, fill=2.5))[0]
 model.tokenizer.events_to_midi(cover.events, "cover.mid")
 ```
 
 ```bash
 python -m piano_cover.generate --checkpoint anime-song/tsumugi-piano-cover --source song.mid --seconds 60
-python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --seconds 60   # solo piano, no source
+python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --seconds 60   # Unconditioned solo piano
 ```
 
-The source MIDI must come from tsumugi with stem separation, instrument refinement, velocity, and beat/chord/key estimation enabled, the same settings used for training. [`cover_studio/tsumugi_worker.py`](cover_studio/tsumugi_worker.py) runs exactly this pipeline.
+The source MIDI must be transcribed with stem separation, instrument refinement, velocity estimation, and beat/chord/key detection enabled (matching training data conditions). [`cover_studio/tsumugi_worker.py`](cover_studio/tsumugi_worker.py) implements this exact pipeline.
 
-### Generation settings
+### Generation Parameters
 
-| Setting | Default | Effect |
+| Parameter | Default | Description |
 | --- | --- | --- |
-| `source_cfg` | 2.0 | Guidance on the original. Higher follows the melody and chords more closely |
-| `onset_bias` | 0.0 | Pulls note onsets toward the original's onsets (around 4 works well) |
-| `dynamics` / `density` | 2.0 / 1.0 | Scales the loudness and note-density curves predicted from the original |
-| `fill` / `above` / `span` | 2.0 / 0.0 / 1.5 | Shifts fills, notes above the melody, and range (in standard deviations) |
-| `channel` / `channel_cfg` | 0 / 3.0 | Performer index (0 = unspecified) and how strongly to follow it |
-| `temperature` / `top_p` | 1.0 / 0.90 | Sampling |
-| `seconds` | full song | Generate only the beginning (for quick previews) |
+| `source_cfg` | 2.0 | Classifier-Free Guidance scale on source MIDI. Higher values track melody and harmony more strictly |
+| `onset_bias` | 0.0 | Bias pulling generated note onsets toward source note onsets (values around 4.0 recommended) |
+| `dynamics` / `density` | 2.0 / 1.0 | Scaling factors for predicted velocity and note-density trajectories |
+| `fill` / `above` / `span` | 2.0 / 0.0 / 1.5 | Offsets for fill frequency, notes above melody, and register range (in standard deviations) |
+| `channel` / `channel_cfg` | 0 / 3.0 | Performer index (0 = unconditioned) and conditioning strength |
+| `temperature` / `top_p` | 1.0 / 0.90 | Sampling parameters |
+| `seconds` | full song | Target duration to generate (useful for quick previews) |
 
 ---
 
-## How it works
+## Architecture
 
 ![Architecture](docs/images/piano_cover_architecture_en.svg)
 
-- The song is generated in **2-second patches**. A Global Transformer runs across patches and a Local Transformer generates the notes inside each patch (time, pitch, duration, velocity, pedal), at 10 ms resolution.
-- The original is encoded as **tsumugi's multi-instrument MIDI** (notes of all instruments including drums, plus beats, chords, and keys), summarized per patch and encoded over the whole song.
-- The decoder looks at the original through **gated cross-attention** (gates start at 0): Global sees the song encoding around the current time, and Local sees the individual source notes.
-- A **Planner** predicts the loudness, density, and arrangement curves from the original. These curves condition generation and are what the dynamics and arrangement settings scale.
-- Covers are **not time-stretched** to the original during training. The alignment between cover and original only decides where cross-attention looks, so alignment errors do not distort the rhythm.
+- **Two-Stage Generation**: Songs are processed in **2-second patches**. A Global Transformer autoregressively plans across patches, while a Local Transformer generates individual note events (time, pitch, duration, velocity, pedal) within each patch at 10 ms resolution.
+- **Source Conditioning**: Input songs are transcribed into **tsumugi multi-instrument MIDI** (all tracks including drums, along with beat grids, chords, and key signatures), summarized per patch, and encoded across the entire song.
+- **Gated Cross-Attention**: The decoder attends to the source via gated cross-attention layers (initialized with zero gates). The Global model attends to contextual song encodings, and the Local model attends to individual source notes.
+- **Arrangement Planner**: Predicts velocity, density, and arrangement feature curves from the source track to condition decoding. Dynamics and arrangement sliders scale these trajectories.
+- **Unaligned Training**: Cover MIDI is **not time-stretched** to the original audio during training. Alignment between cover and source is solely used to index cross-attention windows, preventing rhythm distortion from alignment artifacts.
 
 ![Training pipeline](docs/images/training_pipeline_v2_en.svg)
 
-1. **Pretraining (`piano_ar`)**: about 3,000 hours of solo piano MIDI, including transcribed piano performances, PiJAMA, the piano side of Pop2Piano, PIAST, and MAESTRO.
-2. **Cover fine-tuning (`piano_cover`)**: about 3,000 piano covers (about 190 hours) of about 780 songs, paired with tsumugi transcriptions of the originals.
+1. **Pretraining (`piano_ar`)**: ~3,000 hours of solo piano MIDI, including transcribed acoustic performances, PiJAMA, Pop2Piano (piano tracks), PIAST, and MAESTRO.
+2. **Fine-Tuning (`piano_cover`)**: ~3,000 piano covers (~190 hours across ~780 songs) paired with tsumugi transcriptions of the original audio.
 
-The training data is not distributed.
+*Note: Training datasets are not redistributed.*
 
 ---
 
-## Repository layout
+## Repository Structure
 
-| Path | Contents |
+| Directory | Description |
 | --- | --- |
-| [`piano_ar/`](piano_ar) | Piano performance model (tokenizer, model, pretraining) |
-| [`piano_cover/`](piano_cover) | Cover model (source encoder, Planner, data preparation, training, generation) |
-| [`cover_studio/`](cover_studio) | Cover Studio server (FastAPI) and the tsumugi worker |
-| [`web/`](web) | Cover Studio UI (React + Vite). `npm run dev` / `npm run build` |
-| [`notebooks/`](notebooks) | Colab notebooks |
-| [`piano_score/`](piano_score) | Performance-to-score model (work in progress) |
+| [`piano_ar/`](piano_ar) | Autoregressive piano performance model (tokenizer, architecture, pretraining) |
+| [`piano_cover/`](piano_cover) | Cover generation model (source encoder, Planner, preprocessing, training, inference) |
+| [`cover_studio/`](cover_studio) | Cover Studio backend server (FastAPI) and tsumugi worker |
+| [`web/`](web) | Cover Studio web frontend (React + Vite). `npm run dev` / `npm run build` |
+| [`notebooks/`](notebooks) | Google Colab notebooks |
+| [`piano_score/`](piano_score) | Performance-to-score transcription model (WIP) |
 
-To export your own training checkpoint in the published format, run `python -m piano_cover.export --checkpoint <best.pt> --out <dir>` (and `piano_ar.export` for the piano model).
+To export custom checkpoints to the release format: `python -m piano_cover.export --checkpoint <best.pt> --out <dir>` (or `piano_ar.export` for the base piano model).
 
 ---
 
 ## Limitations
 
-- Errors in the tsumugi transcription (melody, beats, chords) carry over into the cover. The rhythm depends strongly on the beats in the source MIDI
-- Swing is often played straight
-- The sustain pedal tends to be held longer than in human performances
-- The output is a MIDI performance, not a score
+- Transcription inaccuracies in the source MIDI (melody, beat grid, chord labels) directly affect generation. Metric rhythm strongly depends on source beat tracking.
+- Swing rhythms may be rendered straight.
+- Sustain pedal durations tend to be longer than human performances.
+- Outputs represent expressive MIDI performances rather than cleanly quantized scores.
 
 ## License
 
 - Code: [MIT License](LICENSE)
-- Model weights ([Hugging Face](https://huggingface.co/anime-song/tsumugi-piano-cover)): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (non-commercial use only)
+- Model Weights ([Hugging Face](https://huggingface.co/anime-song/tsumugi-piano-cover)): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (Non-Commercial Use Only)
 
 ## Acknowledgements
 
-- [tsumugi](https://github.com/anime-song/tsumugi) — multi-instrument transcription of the original songs
-- [smplr](https://github.com/danigb/smplr) — piano samples for playback in Cover Studio
-- Cover Studio follows the structure of [audio2chordpro](https://github.com/anime-song/audio2chordpro)
+- [tsumugi](https://github.com/anime-song/tsumugi) — Multi-instrument automatic music transcription
+- [smplr](https://github.com/danigb/smplr) — In-browser piano sample player
+- [audio2chordpro](https://github.com/anime-song/audio2chordpro) — Architecture reference for Cover Studio
