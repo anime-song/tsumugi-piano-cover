@@ -26,6 +26,7 @@
 dataset_mined.json の組のカバーは事前学習に入っているので、原曲の分け方に関係なく学習側に入れる
 (検証・テスト側の原曲の曲なら入れない)。チャンネルは事前学習の一覧の演奏者から引く。
 原曲と長さが大きく違うカバー (カバー / 原曲 が --min-length-ratio〜--max-length-ratio の外) は入れない。
+--exclude にカバーの動画 ID の一覧 (JSON の配列) を渡すと、そのカバーは入れない (組の品質を確かめて弾いたものなど)。
 今の組では、範囲外のカバーはメロディの一致率 (下記) の中央値が 0.3 前後しかなく (範囲内は 0.69)、
 TV サイズ・ショート版・メドレーなどで原曲の一部しか対応しない。
 カバーごとに、原曲のメロディの音のうち、対応する時刻 (±50ms) に同じ音名のカバーの音がある割合
@@ -358,6 +359,7 @@ def main() -> None:
     parser.add_argument("--min-length-ratio", type=float, default=0.75, help="カバー / 原曲 の長さの比の下限")
     parser.add_argument("--max-length-ratio", type=float, default=1.33, help="カバー / 原曲 の長さの比の上限")
     parser.add_argument("--no-mined", action="store_true", help="dataset_mined.json の組を使わない")
+    parser.add_argument("--exclude", default=None, help="入れないカバーの動画 ID の一覧 (JSON の配列)")
     args = parser.parse_args()
 
     config = TokenizerConfig()
@@ -388,6 +390,12 @@ def main() -> None:
                 if channel_of.get(piano_id) in channel_index:
                     performer[piano_id] = channel_index[channel_of[piano_id]]
         print(f"足した組のカバー {len(mined)} 本")
+
+    if args.exclude:
+        excluded = set(json.loads(Path(args.exclude).read_text(encoding="utf-8")))
+        before = sum(len(covers) for covers in covers_of.values())
+        covers_of = {original: [p for p in covers if p not in excluded] for original, covers in covers_of.items()}
+        print(f"--exclude で外したカバー {before - sum(len(covers) for covers in covers_of.values())} 本")
 
     jobs = []
     missing_source = 0
