@@ -42,3 +42,9 @@ data/metadata/
 
 data/alignments/
 data/piano_score/
+
+# 公開用に書き出した重み (piano_ar.export / piano_cover.export) と UI のプロジェクト
+pretrained/
+projects/
+cover_studio/static/
+web/node_modules/
