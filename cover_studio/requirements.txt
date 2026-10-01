@@ -1,0 +1,8 @@
+# Cover Studio を tsumugi の環境 (uv sync --locked --extra stem で作ったもの) で動かすときに足すもの。
+# torch と numpy は tsumugi の環境に入っている版をそのまま使う (Colab のノートブックはこの形)
+symusic
+safetensors
+huggingface_hub
+fastapi
+uvicorn
+python-multipart

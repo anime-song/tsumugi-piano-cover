@@ -27,8 +27,8 @@ from pydantic import BaseModel, Field
 from .engine import Engine
 from .jobs import Job, LiveTranscription, Runner
 from .project import Project, projects, safe_name
+from .web import STATIC_DIR
 
-STATIC_DIR = Path(__file__).parent / "static"
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
 API_VERSION = 2
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")

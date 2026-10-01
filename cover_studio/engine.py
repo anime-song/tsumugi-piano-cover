@@ -14,6 +14,7 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
 import threading
 import zipfile
 from collections import OrderedDict
@@ -292,7 +293,8 @@ class Engine:
             "--out",
             str(out),
             "--work",
-            str(project.dir / "_tsumugi_work"),
+            # ステムの音声など大きい作業ファイル (1 曲数百 MB) は、プロジェクト (Google ドライブのこともある) に置かない
+            str(Path(tempfile.gettempdir()) / "cover_studio_tsumugi" / project.data["created"].replace(":", "")),
         ]
         if self.tsumugi.ffmpeg_dir:
             command += ["--ffmpeg-dir", str(self.tsumugi.ffmpeg_dir)]
