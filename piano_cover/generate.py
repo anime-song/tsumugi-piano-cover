@@ -45,10 +45,10 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--channel", default=None, help="チャンネル ID (UC...) か channel_index の番号。省略で指定なし")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--source-cfg", type=float, default=1.0, help="> 1 で原曲に忠実にする (原曲なしとの差を強調)")
+    parser.add_argument("--top-p", type=float, default=0.90)
+    parser.add_argument("--source-cfg", type=float, default=2.0, help="> 1 で原曲に忠実にする (原曲なしとの差を強調)")
     parser.add_argument(
-        "--channel-cfg", type=float, default=1.0, help="> 1 で演奏者らしさを強める (--channel を指定したときだけ効く)"
+        "--channel-cfg", type=float, default=3.0, help="> 1 で演奏者らしさを強める (--channel を指定したときだけ効く)"
     )
     parser.add_argument(
         "--onset-bias",
@@ -57,11 +57,11 @@ def main() -> None:
         help="原曲の onset に出力の onset を寄せる強さ (TIME の logit に足す最大値)。0 で使わない。4 前後がよい",
     )
     parser.add_argument("--onset-bias-width", type=float, default=0.02, help="寄せる範囲 (秒)")
-    parser.add_argument("--dynamics", type=float, default=1.0, help="強弱の曲線の倍率 (0 で指定なし)")
+    parser.add_argument("--dynamics", type=float, default=2.0, help="強弱の曲線の倍率 (0 で指定なし)")
     parser.add_argument("--density", type=float, default=1.0, help="音の多さの曲線の倍率 (0 で指定なし)")
-    parser.add_argument("--fill", type=float, default=0.0, help="合いの手・オブリの量を増やす量 (標準偏差の単位)")
+    parser.add_argument("--fill", type=float, default=2.0, help="合いの手・オブリの量を増やす量 (標準偏差の単位)")
     parser.add_argument("--above", type=float, default=0.0, help="メロディの上に音を重ねる割合を増やす量 (同上)")
-    parser.add_argument("--span", type=float, default=0.0, help="音域の広さを増やす量 (同上)")
+    parser.add_argument("--span", type=float, default=1.5, help="音域の広さを増やす量 (同上)")
     parser.add_argument("--no-arrangement", action="store_true", help="編曲の性質の条件を指定なしにする")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
