@@ -460,6 +460,16 @@ class CoverModel(nn.Module):
             output["loss_plan"] = (error * known).sum() / known.sum().clamp_min(1)
         return output
 
+    @classmethod
+    def from_pretrained(cls, name_or_path: str = "", **kwargs) -> CoverModel:
+        """推論用の重み (piano_cover.export の出力のフォルダか Hugging Face の repository) を読む。
+        model.context_patches (generate に渡す文脈の長さ) も付く。kwargs は piano_cover.hub.load_pretrained_cover"""
+        from piano_ar.hub import HF_REPO
+
+        from .hub import load_pretrained_cover
+
+        return load_pretrained_cover(name_or_path or HF_REPO, **kwargs)
+
     @torch.no_grad()
     def planned_dynamics(
         self,
