@@ -2,6 +2,9 @@
 
 python -m piano_ar.generate --checkpoint checkpoints/piano_ar/latest.pt --seconds 60 --num-samples 4
 python -m piano_ar.generate --checkpoint ... --channel UCxxxxxxxx --cfg-scale 1.5
+python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover   # 公開した重み (Hugging Face)
+
+--checkpoint は学習のチェックポイント (.pt)、piano_ar.export の出力のフォルダ、Hugging Face の repository のどれか。
 
 --cfg-scale はチャンネル (演奏者) の強さ。
 """
@@ -15,10 +18,8 @@ from pathlib import Path
 
 import torch
 
-from .config import ModelConfig, TokenizerConfig
 from .evaluation import synthesize, write_wav
-from .model import PianoARModel
-from .tokenizer import PianoTokenizer
+from .hub import load_ar
 
 
 def main() -> None:
@@ -39,23 +40,18 @@ def main() -> None:
     if args.seed is not None:
         torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # チェックポイントには optimizer の状態 (モデルの 2 倍の大きさ) も入っているので、GPU に丸ごと載せず、
-    # CPU で必要な分だけ読んで (mmap) モデルの重みだけを GPU に移す
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True)
-    tokenizer = PianoTokenizer(TokenizerConfig(**checkpoint["tokenizer_config"]))
-    model = PianoARModel(ModelConfig.from_dict(checkpoint["model_config"]), tokenizer).to(device).eval()
-    model.load_state_dict(checkpoint["model"])
+    model = load_ar(args.checkpoint, device)
+    tokenizer = model.tokenizer
 
     channel = 0
     if args.channel is not None:
         if args.channel.isdigit():
             channel = int(args.channel)
-        else:
-            channel = json.loads(Path(checkpoint["channel_index"]).read_text(encoding="utf-8"))[args.channel]
+        else:  # チャンネル ID から番号への対応は公開しないので、学習のチェックポイントのときだけ使える
+            index_path = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True)["channel_index"]
+            channel = json.loads(Path(index_path).read_text(encoding="utf-8"))[args.channel]
 
     patch_seconds = tokenizer.config.patch_seconds
-    saved = checkpoint["args"]
-    context_seconds = args.context_seconds or saved["window_seconds"] + saved.get("memory_seconds", 0.0)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         samples = model.generate(
             tokenizer,
@@ -65,12 +61,14 @@ def main() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             cfg_scale=args.cfg_scale,
-            context_patches=round(context_seconds / patch_seconds),
+            context_patches=(
+                round(args.context_seconds / patch_seconds) if args.context_seconds else model.context_patches
+            ),
         )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(args.checkpoint).stem
+    stem = Path(args.checkpoint).stem or "piano_ar"
     for i, patches in enumerate(samples):
         events = tokenizer.patches_to_events(patches)
         path = out_dir / f"{stem}_ch{channel}_{i}.mid"
