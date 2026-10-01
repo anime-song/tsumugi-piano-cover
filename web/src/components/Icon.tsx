@@ -13,6 +13,7 @@ const PATHS: Record<string, string> = {
   stop: "M7 7h10v10H7z",
   plus: "M12 5v14M5 12h14",
   close: "M6 6l12 12M18 6 6 18",
+  chevron: "M6 9l6 6 6-6",
   music: "M9 18V6l10-2v12M9 18a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zM19 16a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0z",
   sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
   layers: "M12 4 3 9l9 5 9-5zM3 14l9 5 9-5",
