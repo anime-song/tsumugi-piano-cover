@@ -1,4 +1,4 @@
-// 左の「作る」欄。設定はプロジェクトごとにブラウザに覚えておき (下書き)、テイクの「設定を使う」で戻せる
+// 左の「作る」欄。設定はブラウザに覚えておき (曲をまたいで共通)、テイクの「設定を使う」で戻せる
 import type { Config, ContinueFrom, Params, Take } from "../api";
 import { useT } from "../i18n";
 import { CHANNEL_CFG, GROUPS, LENGTHS, formatTime, formatValue, type SliderDef } from "../params";
