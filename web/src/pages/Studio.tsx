@@ -12,20 +12,30 @@ import { progressText, useT } from "../i18n";
 import { formatTime } from "../params";
 import { downloadCoverWav, getPlayer, type Player } from "../player";
 
+// 「作る」欄の設定は曲をまたいで同じものを使う (別の曲へ移っても、変えた設定のまま続けられる)
+const DRAFT_KEY = "cover-studio:draft";
+
 function loadDraft(pid: string, config: Config): Draft {
   const fallback: Draft = { params: { ...config.defaults }, model: null, count: 2, seedLocked: false, seed: null };
   try {
-    const saved = JSON.parse(localStorage.getItem(`cover-studio:draft:${pid}`) ?? "null");
-    if (saved) return { ...fallback, ...saved, params: { ...config.defaults, ...saved.params } };
+    // 以前は曲ごとに覚えていたので、共通のものがまだなければその曲のものを使う
+    const raw = localStorage.getItem(DRAFT_KEY) ?? localStorage.getItem(`cover-studio:draft:${pid}`);
+    const saved = JSON.parse(raw ?? "null");
+    if (saved) {
+      const draft: Draft = { ...fallback, ...saved, params: { ...config.defaults, ...saved.params } };
+      // 覚えていたモデルがもうなければ (消した・別の環境) 既定のモデルにする
+      if (draft.model && !config.models.some((m) => m.id === draft.model)) draft.model = null;
+      return draft;
+    }
   } catch {
     // 保存できない環境 (プライベートモードなど) では毎回既定値から
   }
   return fallback;
 }
 
-function saveDraft(pid: string, draft: Draft) {
+function saveDraft(draft: Draft) {
   try {
-    localStorage.setItem(`cover-studio:draft:${pid}`, JSON.stringify(draft));
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
   } catch {
     // 覚えておけなくても使える
   }
@@ -55,7 +65,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
     setDraftState(d);
-    saveDraft(pid, d);
+    saveDraft(d);
   };
   const [error, setError] = useState<string | null>(null);
 
