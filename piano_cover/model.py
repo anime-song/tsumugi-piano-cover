@@ -494,12 +494,16 @@ class CoverModel(nn.Module):
         return index
 
     def plan(self, memory: SourceMemory, channel: Tensor) -> Tensor:
-        """パッチごとの強弱と音の多さ (カバーの中で標準化した値) と編曲の性質の曲線 [B, S, C] を予測する"""
+        """パッチごとの強弱と音の多さ (カバーの中で標準化した値) と編曲の性質の曲線 [B, S, C] を予測する。
+
+        Planner の入力 (原曲エンコーダの出力と演奏者の埋め込み) は detach して、Planner の損失を原曲エンコーダと
+        デコーダに流さない。正解の大半は原曲から予測できない成分 (同じ曲の他のカバーの平均でも 0.76) なので、
+        流すと原曲エンコーダがカバーごとの曲線を覚える方向に引っ張られる。原曲エンコーダはデコーダの損失だけで学習する"""
         B = memory.song.shape[0]
         K = self.config.source_latents
-        song = memory.song.reshape(B, -1, K * memory.song.shape[-1])
+        song = memory.song.detach().reshape(B, -1, K * memory.song.shape[-1])
         valid = memory.song_valid.reshape(B, -1, K)[..., 0]
-        return self.planner(song, self.decoder.channel_embedding(channel), valid)
+        return self.planner(song, self.decoder.channel_embedding(channel).detach(), valid)
 
 
 class _TrainingCondition:
