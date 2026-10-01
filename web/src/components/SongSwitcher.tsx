@@ -1,6 +1,6 @@
 // 上の帯の曲名。押すと曲の一覧が開き、そこから別の曲へ移ったり新しい曲を足したりできる
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { useT } from "../i18n";
 import { Icon } from "./Icon";
@@ -18,8 +18,29 @@ export function SongSwitcher({ pid, onSelect, onNew, onAll }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const root = useRef<HTMLDivElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
   const projects = useQuery({ queryKey: ["projects"], queryFn: api.projects });
   const current = projects.data?.find((p) => p.id === pid);
+
+  // メニューは幅 340px あるので、狭い画面ではそのままだと右にはみ出す。開いたときに
+  // 画面内へ収まる左位置を計算して入れる (幅の上限は styles.css の max-width)
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const el = menu.current;
+      const box = root.current?.getBoundingClientRect();
+      const anchor = button.current?.getBoundingClientRect();
+      if (!el || !box || !anchor) return;
+      const vw = document.documentElement.clientWidth;
+      const margin = 8;
+      const left = Math.min(Math.max(margin, anchor.left), Math.max(margin, vw - el.offsetWidth - margin));
+      el.style.left = `${Math.round(left - box.left)}px`;
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -42,13 +63,13 @@ export function SongSwitcher({ pid, onSelect, onNew, onAll }: Props) {
 
   return (
     <div className="switcher" ref={root}>
-      <button className={`switcher-btn ${open ? "open" : ""}`} onClick={() => setOpen(!open)} title={t.switchSong}>
+      <button ref={button} className={`switcher-btn ${open ? "open" : ""}`} onClick={() => setOpen(!open)} title={t.switchSong}>
         <span className="switcher-art" style={songArt(current?.title ?? pid)} />
         <span className="switcher-title">{current?.title ?? pid}</span>
         <Icon name="chevron" size={14} />
       </button>
       {open && (
-        <div className="switcher-menu">
+        <div className="switcher-menu" ref={menu}>
           <button
             className="switcher-new"
             onClick={() => {

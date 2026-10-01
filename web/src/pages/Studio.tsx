@@ -15,6 +15,10 @@ import { downloadCoverWav, getPlayer, type Player } from "../player";
 // 「作る」欄の設定は曲をまたいで同じものを使う (別の曲へ移っても、変えた設定のまま続けられる)
 const DRAFT_KEY = "cover-studio:draft";
 
+// 携帯では 3 つの欄をタブで切り替える (styles.css の .tabs / .studio[data-tab] と対)
+type Tab = "create" | "play" | "detail";
+const isPhone = () => window.matchMedia("(max-width: 820px)").matches;
+
 function loadDraft(pid: string, config: Config): Draft {
   const fallback: Draft = { params: { ...config.defaults }, model: null, count: 2, seedLocked: false, seed: null };
   try {
@@ -61,6 +65,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "favorite">("all");
   const [showSource, setShowSource] = useState(true);
+  const [tab, setTab] = useState<Tab>("play");
   const [continueFrom, setContinueFrom] = useState<ContinueFrom | null>(null);
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
@@ -137,6 +142,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
       refresh(detail);
       setContinueFrom(null);
       setError(null);
+      // 携帯では、作り始めたら演奏の面へ移して進み具合を見せる
+      if (isPhone()) setTab("play");
       void qc.invalidateQueries({ queryKey: ["config"] });
     },
     onError: (e) => setError(e instanceof Error ? e.message : String(e)),
@@ -221,7 +228,28 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
 
   return (
     <>
-      <div className="studio">
+      {/* 携帯だけに出る切り替え (広い画面では styles.css が .tabs を隠す) */}
+      <nav className="tabs" role="tablist" aria-label={t.viewSwitch}>
+        {(
+          [
+            ["create", t.tabCreate],
+            ["play", t.tabPlay],
+            ["detail", t.tabDetail],
+          ] as [Tab, string][]
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            className={tab === id ? "on" : ""}
+            onClick={() => setTab(id)}
+          >
+            {label}
+            {id === "play" && takes.length > 0 && <span className="count">{takes.length}</span>}
+          </button>
+        ))}
+      </nav>
+      <div className="studio" data-tab={tab}>
         <CreatePanel
           config={config}
           draft={draft}
@@ -340,7 +368,11 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                     selected={take.id === selected}
                     playing={take.id === selected && player.playing}
                     continueLabel={cf ? t.continueChip(base ? takeLabel(base, t) : cf.take, formatTime(cf.seconds)) : null}
-                    onSelect={() => setSelected(take.id)}
+                    onSelect={() => {
+                      setSelected(take.id);
+                      // 携帯では選んだら詳細へ (広い画面ではタブ自体が出ないので何も変わらない)
+                      if (isPhone()) setTab("detail");
+                    }}
                     onPlay={() => playTake(take)}
                     onFavorite={() => updateTake(take, { favorite: !take.favorite })}
                     onReuse={() => reuse(take)}

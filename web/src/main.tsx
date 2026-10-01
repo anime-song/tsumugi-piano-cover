@@ -50,7 +50,7 @@ function App() {
           <span className="logo">
             <Icon name="music" size={16} />
           </span>
-          Cover Studio
+          <span className="brand-name">Cover Studio</span>
         </a>
         {pid && (
           <>
