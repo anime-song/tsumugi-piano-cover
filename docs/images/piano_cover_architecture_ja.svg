@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc" xml:lang="ja">
+<title id="title">piano_cover のアーキテクチャ</title>
+<desc id="desc">曲を2秒のパッチに区切り、パッチ p を生成している時点</desc>
+<defs>
+<pattern id="timeline" width="19" height="26" patternUnits="userSpaceOnUse"><rect width="5" height="26" fill="#d9730d"/></pattern>
+<marker id="mo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L10 5 L0 10 Z" fill="#d9730d"/></marker>
+<marker id="mb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L10 5 L0 10 Z" fill="#2b3040"/></marker>
+<marker id="mg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L10 5 L0 10 Z" fill="#8a8f9c"/></marker>
+<marker id="mu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L10 5 L0 10 Z" fill="#1d5fbf"/></marker>
+<style>text{font-synthesis:none}</style>
+</defs>
+<rect x="0" y="0" width="1600" height="720" fill="#ffffff" stroke="none" stroke-width="1"/>
+<text x="40" y="52" font-family="system-ui, sans-serif" font-size="26" font-weight="600" fill="#1f2328" text-anchor="start" >piano_cover のアーキテクチャ</text>
+<text x="40" y="75" font-family="system-ui, sans-serif" font-size="14" font-weight="400" fill="#5b6170" text-anchor="start" >曲を2秒のパッチに区切り、パッチ p を生成している時点</text>
+<rect x="1000" y="37" width="22" height="14" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="4"/>
+<text x="1030" y="50" font-family="system-ui, sans-serif" font-size="13" font-weight="400" fill="#3d4250" text-anchor="start" >piano_cover で追加</text>
+<rect x="1218" y="37" width="22" height="14" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="4"/>
+<text x="1248" y="50" font-family="system-ui, sans-serif" font-size="13" font-weight="400" fill="#3d4250" text-anchor="start" >piano_ar（事前学習済み）</text>
+<rect x="1433" y="37" width="22" height="14" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="4" stroke-dasharray="5 3"/>
+<text x="1463" y="50" font-family="system-ui, sans-serif" font-size="13" font-weight="400" fill="#3d4250" text-anchor="start" >未生成</text>
+<rect x="20" y="128" width="1560" height="244" fill="#fdf8f2" stroke="none" stroke-width="0" rx="12"/>
+<rect x="20" y="392" width="1560" height="308" fill="#f6f9fd" stroke="none" stroke-width="0" rx="12"/>
+<rect x="766" y="402" width="248" height="288" fill="#e3edfa" stroke="none" stroke-width="0" rx="10"/>
+<text x="330" y="115" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="17" font-weight="400" fill="#3d4250" text-anchor="middle" >p−2</text>
+<text x="610" y="115" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="17" font-weight="400" fill="#3d4250" text-anchor="middle" >p−1</text>
+<text x="890" y="115" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="17" font-weight="600" fill="#174a94" text-anchor="middle" >p</text>
+<text x="1170" y="115" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="17" font-weight="400" fill="#3d4250" text-anchor="middle" >p+1</text>
+<text x="1450" y="115" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="17" font-weight="400" fill="#3d4250" text-anchor="middle" >p+2</text>
+<g>
+<path d="M330 172 V192" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M330 236 V258" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M330 296 V316" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M610 172 V192" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M610 236 V258" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M610 296 V316" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M890 172 V192" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M890 236 V258" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M890 296 V316" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1170 172 V192" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1170 236 V258" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1170 296 V316" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1450 172 V192" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1450 236 V258" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M1450 296 V316" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M960 236 V247 H1030 V551 H972" fill="none" stroke="#d9730d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M820 296 V436" fill="none" stroke="#d9730d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mo)"/>
+<path d="M900 346 V436" fill="none" stroke="#d9730d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 4" marker-end="url(#mo)"/>
+<path d="M442 466 H496" fill="none" stroke="#1d5fbf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mu)"/>
+<path d="M722 466 H776" fill="none" stroke="#1d5fbf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mu)"/>
+<path d="M1002 466 H1056" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 4"/>
+<path d="M1282 466 H1336" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 4"/>
+<path d="M330 492 V524" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M330 576 V594" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M330 620 V638" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M610 492 V524" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M610 576 V594" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M610 620 V638" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M890 492 V524" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M890 576 V594" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M890 620 V638" fill="none" stroke="#2b3040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mb)"/>
+<path d="M1170 492 V524" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1170 576 V594" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1170 620 V638" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1450 492 V524" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1450 576 V594" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1450 620 V638" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M390 654 H470 V508 H530 V496" fill="none" stroke="#8a8f9c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mg)"/>
+<path d="M670 654 H750 V508 H810 V496" fill="none" stroke="#8a8f9c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#mg)"/>
+<path d="M950 654 H1310 V508 H1090 V496" fill="none" stroke="#c9ccd4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 4"/>
+</g>
+<rect x="220" y="146" width="1340" height="26" fill="#f8dcbd" stroke="none" stroke-width="0" rx="6"/>
+<rect x="220" y="146" width="1340" height="26" fill="url(#timeline)" stroke="none" stroke-width="0" rx="6"/>
+<rect x="220" y="192" width="220" height="44" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="6"/>
+<rect x="296" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="314" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="332" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="350" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="500" y="192" width="220" height="44" fill="#fdf1e4" stroke="#b45f0b" stroke-width="3" rx="6"/>
+<rect x="576" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="594" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="612" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="630" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="780" y="192" width="220" height="44" fill="#fdf1e4" stroke="#b45f0b" stroke-width="3" rx="6"/>
+<rect x="856" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="874" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="892" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="910" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1060" y="192" width="220" height="44" fill="#fdf1e4" stroke="#b45f0b" stroke-width="3" rx="6"/>
+<rect x="1136" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1154" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1172" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1190" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1340" y="192" width="220" height="44" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="6"/>
+<rect x="1416" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1434" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1452" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1470" y="207" width="14" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="3"/>
+<rect x="220" y="258" width="1340" height="38" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="6"/>
+<rect x="290" y="316" width="100" height="30" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="15"/>
+<rect x="328" y="331" width="10" height="10" fill="#d9730d" stroke="none" stroke-width="0" rx="2"/>
+<rect x="342" y="325" width="10" height="16" fill="#f0b37a" stroke="none" stroke-width="0" rx="2"/>
+<rect x="570" y="316" width="100" height="30" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="15"/>
+<rect x="608" y="323" width="10" height="18" fill="#d9730d" stroke="none" stroke-width="0" rx="2"/>
+<rect x="622" y="333" width="10" height="8" fill="#f0b37a" stroke="none" stroke-width="0" rx="2"/>
+<rect x="850" y="316" width="100" height="30" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="15"/>
+<rect x="888" y="319" width="10" height="22" fill="#d9730d" stroke="none" stroke-width="0" rx="2"/>
+<rect x="902" y="321" width="10" height="20" fill="#f0b37a" stroke="none" stroke-width="0" rx="2"/>
+<rect x="1130" y="316" width="100" height="30" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="15"/>
+<rect x="1168" y="327" width="10" height="14" fill="#d9730d" stroke="none" stroke-width="0" rx="2"/>
+<rect x="1182" y="329" width="10" height="12" fill="#f0b37a" stroke="none" stroke-width="0" rx="2"/>
+<rect x="1410" y="316" width="100" height="30" fill="#fdf1e4" stroke="#d9730d" stroke-width="2" rx="15"/>
+<rect x="1448" y="333" width="10" height="8" fill="#d9730d" stroke="none" stroke-width="0" rx="2"/>
+<rect x="1462" y="323" width="10" height="18" fill="#f0b37a" stroke="none" stroke-width="0" rx="2"/>
+<text x="40" y="163" font-family="system-ui, sans-serif" font-size="15" font-weight="600" fill="#b45f0b" text-anchor="start" >原曲（MIDI）</text>
+<text x="40" y="212" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#b45f0b" text-anchor="start" >PatchEncoder</text>
+<text x="40" y="227" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >パッチごとに要約4本</text>
+<text x="40" y="275" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#b45f0b" text-anchor="start" >SongEncoder</text>
+<text x="40" y="285" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >曲全体を双方向に</text>
+<text x="40" y="330" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#b45f0b" text-anchor="start" >Planner</text>
+<text x="40" y="346" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >強弱・密度を予測</text>
+<text x="40" y="464" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#174a94" text-anchor="start" >Global</text>
+<text x="40" y="479" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >パッチ間 · 過去のみ</text>
+<text x="40" y="549" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#174a94" text-anchor="start" >Local</text>
+<text x="40" y="564" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >パッチ内のトークン</text>
+<text x="40" y="611" font-family="system-ui, sans-serif" font-size="15" font-weight="600" fill="#174a94" text-anchor="start" >ピアノ出力</text>
+<text x="40" y="652" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="15" font-weight="400" fill="#174a94" text-anchor="start" >PatchSummarizer</text>
+<text x="40" y="665" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >パッチ → 1ベクトル</text>
+<text x="812" y="410" font-family="system-ui, sans-serif" font-size="12" font-weight="600" fill="#b45f0b" text-anchor="end" >Cross-Attn</text>
+<text x="812" y="426" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#b45f0b" text-anchor="end" >SongEncoder ±4 パッチ</text>
+<text x="906" y="410" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#b45f0b" text-anchor="start" >強弱・密度</text>
+<text x="906" y="426" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#b45f0b" text-anchor="start" >（条件として加算）</text>
+<text x="1038" y="410" font-family="system-ui, sans-serif" font-size="12" font-weight="600" fill="#b45f0b" text-anchor="start" >Cross-Attn</text>
+<text x="1038" y="426" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#b45f0b" text-anchor="start" >原曲の音符 ±1パッチ</text>
+<text x="640" y="689" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#5b6170" text-anchor="start" >前パッチの要約</text>
+<rect x="220" y="440" width="220" height="52" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<text x="330" y="471" font-family="ui-monospace, monospace" font-size="18" fill="#174a94" text-anchor="middle">h<tspan baseline-shift="sub" font-size="12">−2</tspan></text>
+<rect x="250" y="526" width="160" height="50" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="290" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="316" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="342" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<text x="306" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="332" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="358" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<rect x="368" y="545" width="12" height="12" fill="#ffffff" stroke="#1d5fbf" stroke-width="1.5" rx="2" stroke-dasharray="3 2"/>
+<rect x="234" y="597" width="36" height="20" fill="#2b3040" stroke="none" stroke-width="0" rx="3"/>
+<text x="252.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#ffffff" text-anchor="middle" >TIME</text>
+<rect x="273" y="597" width="43" height="20" fill="#f1d6f5" stroke="none" stroke-width="0" rx="3"/>
+<text x="294.5" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >PITCH</text>
+<rect x="319" y="597" width="30" height="20" fill="#d6e6f8" stroke="none" stroke-width="0" rx="3"/>
+<text x="334.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >DUR</text>
+<rect x="352" y="597" width="30" height="20" fill="#f8e7b8" stroke="none" stroke-width="0" rx="3"/>
+<text x="367.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >VEL</text>
+<text x="390" y="612" font-family="system-ui, sans-serif" font-size="11" font-weight="400" fill="#5b6170" text-anchor="middle" >…</text>
+<rect x="398" y="597" width="30" height="20" fill="#ffffff" stroke="#8a8f9c" stroke-width="1" rx="3"/>
+<text x="413" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="400" fill="#3d4250" text-anchor="middle" >EOP</text>
+<rect x="270" y="638" width="120" height="32" fill="#ffffff" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="323" y="647" width="14" height="14" fill="#1d5fbf" stroke="none" stroke-width="0" rx="3"/>
+<rect x="500" y="440" width="220" height="52" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<text x="610" y="471" font-family="ui-monospace, monospace" font-size="18" fill="#174a94" text-anchor="middle">h<tspan baseline-shift="sub" font-size="12">−1</tspan></text>
+<rect x="530" y="526" width="160" height="50" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="570" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="596" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="622" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<text x="586" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="612" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="638" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<rect x="648" y="545" width="12" height="12" fill="#ffffff" stroke="#1d5fbf" stroke-width="1.5" rx="2" stroke-dasharray="3 2"/>
+<rect x="514" y="597" width="36" height="20" fill="#2b3040" stroke="none" stroke-width="0" rx="3"/>
+<text x="532.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#ffffff" text-anchor="middle" >TIME</text>
+<rect x="553" y="597" width="43" height="20" fill="#f1d6f5" stroke="none" stroke-width="0" rx="3"/>
+<text x="574.5" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >PITCH</text>
+<rect x="599" y="597" width="30" height="20" fill="#d6e6f8" stroke="none" stroke-width="0" rx="3"/>
+<text x="614.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >DUR</text>
+<rect x="632" y="597" width="30" height="20" fill="#f8e7b8" stroke="none" stroke-width="0" rx="3"/>
+<text x="647.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >VEL</text>
+<text x="670" y="612" font-family="system-ui, sans-serif" font-size="11" font-weight="400" fill="#5b6170" text-anchor="middle" >…</text>
+<rect x="678" y="597" width="30" height="20" fill="#ffffff" stroke="#8a8f9c" stroke-width="1" rx="3"/>
+<text x="693" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="400" fill="#3d4250" text-anchor="middle" >EOP</text>
+<rect x="550" y="638" width="120" height="32" fill="#ffffff" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="603" y="647" width="14" height="14" fill="#1d5fbf" stroke="none" stroke-width="0" rx="3"/>
+<rect x="780" y="440" width="220" height="52" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<text x="890" y="471" font-family="ui-monospace, monospace" font-size="18" fill="#174a94" text-anchor="middle">h<tspan baseline-shift="sub" font-size="12">p</tspan></text>
+<rect x="810" y="526" width="160" height="50" fill="#eaf1fb" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="850" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="876" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<rect x="902" y="545" width="12" height="12" fill="#1d5fbf" stroke="none" stroke-width="0" rx="2"/>
+<text x="866" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="892" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<text x="918" y="556" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#1d5fbf" text-anchor="middle" >›</text>
+<rect x="928" y="545" width="12" height="12" fill="#ffffff" stroke="#1d5fbf" stroke-width="1.5" rx="2" stroke-dasharray="3 2"/>
+<rect x="794" y="597" width="36" height="20" fill="#2b3040" stroke="none" stroke-width="0" rx="3"/>
+<text x="812.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#ffffff" text-anchor="middle" >TIME</text>
+<rect x="833" y="597" width="43" height="20" fill="#f1d6f5" stroke="none" stroke-width="0" rx="3"/>
+<text x="854.5" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >PITCH</text>
+<rect x="879" y="597" width="30" height="20" fill="#d6e6f8" stroke="none" stroke-width="0" rx="3"/>
+<text x="894.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >DUR</text>
+<rect x="912" y="597" width="30" height="20" fill="#f8e7b8" stroke="none" stroke-width="0" rx="3"/>
+<text x="927.0" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1f2328" text-anchor="middle" >VEL</text>
+<text x="950" y="612" font-family="system-ui, sans-serif" font-size="11" font-weight="400" fill="#5b6170" text-anchor="middle" >…</text>
+<rect x="958" y="597" width="30" height="20" fill="#ffffff" stroke="#8a8f9c" stroke-width="1" rx="3"/>
+<text x="973" y="611" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="400" fill="#3d4250" text-anchor="middle" >EOP</text>
+<rect x="830" y="638" width="120" height="32" fill="#ffffff" stroke="#1d5fbf" stroke-width="2" rx="6"/>
+<rect x="883" y="647" width="14" height="14" fill="#1d5fbf" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1060" y="440" width="220" height="52" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<text x="1170" y="471" font-family="ui-monospace, monospace" font-size="18" fill="#c9ccd4" text-anchor="middle">h<tspan baseline-shift="sub" font-size="12">p+1</tspan></text>
+<rect x="1090" y="526" width="160" height="50" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<rect x="1110" y="638" width="120" height="32" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<rect x="1163" y="647" width="14" height="14" fill="#e3e5ea" stroke="none" stroke-width="0" rx="3"/>
+<rect x="1340" y="440" width="220" height="52" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<text x="1450" y="471" font-family="ui-monospace, monospace" font-size="18" fill="#c9ccd4" text-anchor="middle">h<tspan baseline-shift="sub" font-size="12">p+2</tspan></text>
+<rect x="1370" y="526" width="160" height="50" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<rect x="1390" y="638" width="120" height="32" fill="#ffffff" stroke="#c9ccd4" stroke-width="2" rx="6" stroke-dasharray="5 4"/>
+<rect x="1443" y="647" width="14" height="14" fill="#e3e5ea" stroke="none" stroke-width="0" rx="3"/>
+</svg>
