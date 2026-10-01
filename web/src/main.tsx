@@ -4,6 +4,8 @@ import { createRoot } from "react-dom/client";
 import { api } from "./api";
 import { useLang, useT } from "./i18n";
 import { Icon } from "./components/Icon";
+import { NewSongDialog } from "./components/NewSong";
+import { SongSwitcher } from "./components/SongSwitcher";
 import { shortModel } from "./components/Takes";
 import { Library } from "./pages/Library";
 import { Studio } from "./pages/Studio";
@@ -28,6 +30,7 @@ function App() {
   const qc = useQueryClient();
   const t = useT();
   const [lang, setLang] = useLang();
+  const [newSong, setNewSong] = useState(false);
   const config = useQuery({ queryKey: ["config"], queryFn: api.config, refetchInterval: 5000 });
   const match = path.match(/^\/p\/([^/]+)/);
   const pid = match ? decodeURIComponent(match[1]) : null;
@@ -52,8 +55,14 @@ function App() {
         {pid && (
           <>
             <span className="crumb-sep">/</span>
-            <button className="link crumb" onClick={() => navigate("/")}>
-              {t.songs}
+            <SongSwitcher
+              pid={pid}
+              onSelect={(id) => navigate(`/p/${encodeURIComponent(id)}`)}
+              onNew={() => setNewSong(true)}
+              onAll={() => navigate("/")}
+            />
+            <button className="btn small new-song-btn" onClick={() => setNewSong(true)}>
+              <Icon name="plus" size={14} /> {t.newSong}
             </button>
           </>
         )}
@@ -103,6 +112,16 @@ function App() {
           <Library config={config.data} navigate={navigate} />
         )}
       </main>
+      {newSong && config.data && (
+        <NewSongDialog
+          config={config.data}
+          onClose={() => setNewSong(false)}
+          onCreated={(id) => {
+            setNewSong(false);
+            navigate(`/p/${encodeURIComponent(id)}`);
+          }}
+        />
+      )}
     </div>
   );
 }
