@@ -1469,3 +1469,55 @@ input[type="range"]:disabled {
   color: #ffe9a3;
   font-size: 13px;
 }
+
+/* よく使う演奏者 */
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+.preset {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+  overflow: hidden;
+}
+button.preset {
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.preset > button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 4px 4px 4px 12px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.preset > .preset-remove {
+  display: inline-grid;
+  place-items: center;
+  padding: 4px 8px 4px 4px;
+  color: var(--text-3);
+}
+.preset > .preset-remove:hover {
+  color: var(--danger);
+}
+.preset:hover {
+  border-color: #3d3d4a;
+}
+.preset.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.preset.add {
+  display: inline-flex;
+  gap: 4px;
+  border-style: dashed;
+}
