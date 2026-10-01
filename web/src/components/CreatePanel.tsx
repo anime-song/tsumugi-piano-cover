@@ -1,8 +1,31 @@
 // 左の「作る」欄。設定はブラウザに覚えておき (曲をまたいで共通)、テイクの「設定を使う」で戻せる
+import { useState } from "react";
 import type { Config, ContinueFrom, Params, Take } from "../api";
 import { useT } from "../i18n";
 import { CHANNEL_CFG, GROUPS, LENGTHS, formatTime, formatValue, type SliderDef } from "../params";
 import { Icon } from "./Icon";
+
+// よく使う演奏者の番号 (テンプレート)。ブラウザに覚え、最初はこの 2 人
+const PERFORMERS_KEY = "cover-studio:performers";
+const DEFAULT_PERFORMERS = [532, 142];
+
+function loadPerformers(): number[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PERFORMERS_KEY) ?? "null");
+    if (Array.isArray(saved) && saved.every((n) => Number.isInteger(n) && n > 0)) return saved;
+  } catch {
+    // 覚えておけない環境では最初の 2 人
+  }
+  return DEFAULT_PERFORMERS;
+}
+
+function savePerformers(list: number[]) {
+  try {
+    localStorage.setItem(PERFORMERS_KEY, JSON.stringify(list));
+  } catch {
+    // 覚えておけなくても選べる
+  }
+}
 
 export type Draft = {
   params: Params;
@@ -27,6 +50,11 @@ type Props = {
 export function CreatePanel(props: Props) {
   const { config, draft, onChange, disabled } = props;
   const t = useT();
+  const [performers, setPerformersState] = useState(loadPerformers);
+  const setPerformers = (list: number[]) => {
+    setPerformersState(list);
+    savePerformers(list);
+  };
   const defaults = config.defaults;
   const params = draft.params;
   const set = (patch: Partial<Params>) => onChange({ ...draft, params: { ...params, ...patch } });
@@ -165,6 +193,33 @@ export function CreatePanel(props: Props) {
 
         <section className="group">
           <div className="group-title">{t.performer}</div>
+          <div className="presets">
+            <button className={`preset ${params.channel === 0 ? "on" : ""}`} onClick={() => set({ channel: 0 })}>
+              {t.notSpecified}
+            </button>
+            {performers.map((n) => (
+              <span key={n} className={`preset ${params.channel === n ? "on" : ""}`}>
+                <button onClick={() => set({ channel: n })}>#{n}</button>
+                <button
+                  className="preset-remove"
+                  title={t.removePerformer(n)}
+                  aria-label={t.removePerformer(n)}
+                  onClick={() => setPerformers(performers.filter((x) => x !== n))}
+                >
+                  <Icon name="close" size={11} />
+                </button>
+              </span>
+            ))}
+            {params.channel > 0 && !performers.includes(params.channel) && (
+              <button
+                className="preset add"
+                onClick={() => setPerformers([...performers, params.channel])}
+                title={t.addPerformerHelp}
+              >
+                <Icon name="plus" size={12} /> {t.addPerformer(params.channel)}
+              </button>
+            )}
+          </div>
           <div className="field inline">
             <label htmlFor="channel">{t.performerNumber}</label>
             <input
