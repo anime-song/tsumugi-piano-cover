@@ -4,7 +4,8 @@ python -m cover_studio
 python -m cover_studio --root D:/covers --port 8080 --no-browser --device cpu
 python -m cover_studio --hub-repo anime-song/tsumugi-piano-cover --checkpoints-dir ""   # 公開した重みだけを使う
 
-画面は web/ を npm run build したもの (cover_studio/static)。ないときは API の説明 (/docs) を開く。
+画面は web/ を npm run build したもの (cover_studio/static)。ないときは GitHub の Release からビルド済みのものを取ってくる
+(cover_studio.web)。それも取れなければ API の説明 (/docs) を開く。
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ from pathlib import Path
 
 from piano_ar.hub import HF_REPO
 
-from .app import STATIC_DIR, create_app
+from .app import create_app
 from .engine import REPO_ROOT, Engine, TsumugiSetup, find_models
+from .web import ensure_web
 
 
 def _optional_dir(value: str) -> Path | None:
@@ -53,6 +55,9 @@ def main(argv=None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--no-web-download", action="store_true", help="画面 (web/ のビルド) が無くても GitHub から取ってこない"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 
@@ -67,8 +72,8 @@ def main(argv=None) -> None:
     else:
         print("tsumugi が見つかりません。採譜は使えません (採譜済みの MIDI を音源と一緒に入れれば生成はできます)")
     print("モデル: " + (", ".join(m.label for m in models) or "なし"))
-    if not (STATIC_DIR / "index.html").exists():
-        print("画面がまだビルドされていません: cd web && npm install && npm run build")
+    if not args.no_web_download:
+        ensure_web()  # 無ければ GitHub の Release からビルド済みのものを取ってくる (Node.js が要らない)
 
     app = create_app(args.root, Engine(models, args.device, tsumugi))
     if not args.no_browser:

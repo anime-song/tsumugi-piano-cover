@@ -1,0 +1,53 @@
+name: web
+
+# 画面 (web/) をビルドし、main では Release「web-latest」に web-dist.zip として置く。
+# Node.js の無い環境 (Colab など) では python -m cover_studio がこれを取ってくる (cover_studio/web.py)
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/web.yml"]
+  pull_request:
+    paths: ["web/**", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # Release の作成・更新
+
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+      - name: web-dist.zip にまとめる
+        working-directory: cover_studio/static
+        run: |
+          echo "$GITHUB_SHA" > BUILD_COMMIT
+          zip -r "$RUNNER_TEMP/web-dist.zip" .
+
+      - name: Release「web-latest」に置く
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="main (${GITHUB_SHA::7}) の web/ を GitHub Actions でビルドした画面です。python -m cover_studio が自動で取得します。"
+          if gh release view web-latest > /dev/null 2>&1; then
+            gh release edit web-latest --notes "$notes"
+          else
+            gh release create web-latest --prerelease --title "画面 (web/ のビルド)" --notes "$notes"
+          fi
+          gh release upload web-latest "$RUNNER_TEMP/web-dist.zip" --clobber
