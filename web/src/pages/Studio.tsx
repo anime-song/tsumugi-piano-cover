@@ -306,47 +306,50 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
             </div>
           )}
 
-          <div className="takes-head">
-            <h2>{t.takes}</h2>
-            <div className="segmented small">
-              <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
-                {t.all} {takes.length}
-              </button>
-              <button className={filter === "favorite" ? "on" : ""} onClick={() => setFilter("favorite")}>
-                ★ {takes.filter((x) => x.favorite).length}
-              </button>
-            </div>
-          </div>
-          <div className="takes">
-            {shown.length === 0 && (
-              <div className="empty-takes muted">
-                {data.source
-                  ? filter === "favorite"
-                    ? t.noFavorites
-                    : t.emptyTakes
-                  : t.waitTranscribe}
+          {/* 巻物 (ピアノロール) は固定したまま、この下のテイク一覧だけを独立スクロールさせる */}
+          <div className="takes-scroll">
+            <div className="takes-head">
+              <h2>{t.takes}</h2>
+              <div className="segmented small">
+                <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
+                  {t.all} {takes.length}
+                </button>
+                <button className={filter === "favorite" ? "on" : ""} onClick={() => setFilter("favorite")}>
+                  ★ {takes.filter((x) => x.favorite).length}
+                </button>
               </div>
-            )}
-            {shown.map((take) => {
-              const cf = take.continue_from;
-              const base = cf ? takeById.get(cf.take) : undefined;
-              return (
-                <TakeCard
-                  key={take.id}
-                  take={take}
-                  defaults={config.defaults}
-                  selected={take.id === selected}
-                  playing={take.id === selected && player.playing}
-                  continueLabel={cf ? t.continueChip(base ? takeLabel(base, t) : cf.take, formatTime(cf.seconds)) : null}
-                  onSelect={() => setSelected(take.id)}
-                  onPlay={() => playTake(take)}
-                  onFavorite={() => updateTake(take, { favorite: !take.favorite })}
-                  onReuse={() => reuse(take)}
-                  onCancel={() => take.job && run(async () => (await api.cancelJob(take.job!), refresh()))}
-                  onDelete={() => deleteTake(take)}
-                />
-              );
-            })}
+            </div>
+            <div className="takes">
+              {shown.length === 0 && (
+                <div className="empty-takes muted">
+                  {data.source
+                    ? filter === "favorite"
+                      ? t.noFavorites
+                      : t.emptyTakes
+                    : t.waitTranscribe}
+                </div>
+              )}
+              {shown.map((take) => {
+                const cf = take.continue_from;
+                const base = cf ? takeById.get(cf.take) : undefined;
+                return (
+                  <TakeCard
+                    key={take.id}
+                    take={take}
+                    defaults={config.defaults}
+                    selected={take.id === selected}
+                    playing={take.id === selected && player.playing}
+                    continueLabel={cf ? t.continueChip(base ? takeLabel(base, t) : cf.take, formatTime(cf.seconds)) : null}
+                    onSelect={() => setSelected(take.id)}
+                    onPlay={() => playTake(take)}
+                    onFavorite={() => updateTake(take, { favorite: !take.favorite })}
+                    onReuse={() => reuse(take)}
+                    onCancel={() => take.job && run(async () => (await api.cancelJob(take.job!), refresh()))}
+                    onDelete={() => deleteTake(take)}
+                  />
+                );
+              })}
+            </div>
           </div>
         </section>
 
