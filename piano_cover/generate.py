@@ -11,6 +11,7 @@ Planner のあるモデルは、原曲から予測した強弱と音の多さの
 編曲の性質も条件にしたモデル (piano_cover.arrangement) は、--fill (合いの手・オブリの量) / --above (メロディの上に
 音を重ねる割合) / --span (音域の広さ) で、Planner の予測を全カバーでの標準偏差の単位でずらせる
 (0 で予測のまま、+0.5 前後で合いの手の多い演奏者くらい)。--no-arrangement でその条件を外す。
+--planner で、Planner だけを学習し直した重み (piano_cover.train_planner の出力) に差し替えられる。
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--source", required=True, help="原曲の MIDI (tsumugi の merged)")
+    parser.add_argument("--planner", default=None, help="Planner の重みを差し替える (piano_cover.train_planner の出力)")
     parser.add_argument("--out-dir", default="outputs/piano_cover")
     parser.add_argument("--seconds", type=float, default=None, help="生成する長さ。省略で原曲の最後まで")
     parser.add_argument("--num-samples", type=int, default=1)
@@ -77,6 +79,10 @@ def main() -> None:
         ModelConfig.from_dict(checkpoint["model_config"]), cover_config, tokenizer, checkpoint["source_vocab_size"]
     ).to(device)
     model.load_state_dict(checkpoint["model"])
+    if args.planner is not None:
+        if model.planner is None:
+            raise SystemExit(f"{args.checkpoint} には Planner がないので --planner は使えない")
+        model.planner.load_state_dict(torch.load(args.planner, map_location="cpu", weights_only=False)["planner"])
     model.eval()
 
     channel = 0
