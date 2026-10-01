@@ -163,7 +163,9 @@ class Block(nn.Module):
         cache_k, cache_v = cache
         cache_k.index_copy_(2, step, k.to(cache_k.dtype))
         cache_v.index_copy_(2, step, v.to(cache_v.dtype))
-        attn = F.scaled_dot_product_attention(q, cache_k.to(v.dtype), cache_v.to(v.dtype), attn_mask=key_valid)
+        # CPU の SDPA は 1 次元のマスクを受け付けないので [1, 1, 1, L] にする (GPU はそのままで CUDA Graph の形を変えない)
+        mask = key_valid if key_valid.is_cuda else key_valid.view(1, 1, 1, -1)
+        attn = F.scaled_dot_product_attention(q, cache_k.to(v.dtype), cache_v.to(v.dtype), attn_mask=mask)
         x = x + self.attn_out(attn.transpose(1, 2).reshape(batch, 1, dim))
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + self.down(F.silu(gate) * up)
@@ -487,6 +489,14 @@ class PianoARModel(nn.Module):
     # ------------------------------------------------------------------
     # 生成
     # ------------------------------------------------------------------
+    @classmethod
+    def from_pretrained(cls, name_or_path: str = "", **kwargs) -> PianoARModel:
+        """推論用の重み (piano_ar.export の出力のフォルダか Hugging Face の repository) を読む。
+        model.tokenizer と model.context_patches (generate に渡す文脈の長さ) も付く。kwargs は piano_ar.hub.load_pretrained_ar"""
+        from .hub import HF_REPO, load_pretrained_ar
+
+        return load_pretrained_ar(name_or_path or HF_REPO, **kwargs)
+
     @torch.no_grad()
     def generate(
         self,
@@ -505,6 +515,7 @@ class PianoARModel(nn.Module):
         time_bias: Tensor | None = None,
         end_after: int = 0,
         dynamics: Tensor | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -516,6 +527,7 @@ class PianoARModel(nn.Module):
         (_bias_time。原曲の onset に出力の onset を寄せるときに使う)。
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
         dynamics [num_patches, C] はパッチごとの強さと音の多さなどの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
+        progress(終わったパッチ数, num_patches) はパッチを 1 つ生成するたびに呼ぶ (UI の進み具合。例外を投げれば止まる)。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -602,6 +614,8 @@ class PianoARModel(nn.Module):
                 pedal_states[i] = pedal_down[i]
                 done[i] = song_end[i]
             summaries.append(self.summarize_patches(sequence).repeat(rows // num_samples, 1))
+            if progress is not None:
+                progress(p + 1, num_patches)
         return patches
 
 
