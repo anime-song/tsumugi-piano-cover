@@ -269,7 +269,9 @@ class Engine:
         progress: Callable[[float | None, str], None],
         should_stop: Callable[[], bool],
         log: Callable[[str], None],
+        live: Callable[[str, dict], None] | None = None,
     ) -> None:
+        """live(種類, 中身) には worker が流す途中経過 (確定したノートなど。tsumugi_worker.emit) を渡す"""
         if self.tsumugi is None:
             raise RuntimeError("tsumugi が見つかりません (--tsumugi-dir で場所を指定してください)")
         audio = project.audio_path
@@ -324,7 +326,14 @@ class Engine:
         assert process.stdout is not None
         for line in process.stdout:  # tqdm の \r も行の区切りになる
             line = line.rstrip()
-            if line:
+            if line.startswith("@@"):
+                kind, _, payload = line[2:].partition(" ")
+                if live is not None:
+                    try:
+                        live(kind, json.loads(payload))
+                    except json.JSONDecodeError:
+                        pass
+            elif line:
                 log(line)
                 progress(None, line[-120:])
         code = process.wait()

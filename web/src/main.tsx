@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { api } from "./api";
+import { API_VERSION, api } from "./api";
 import { useLang, useT } from "./i18n";
 import { Icon } from "./components/Icon";
 import { NewSongDialog } from "./components/NewSong";
@@ -99,6 +99,7 @@ function App() {
           {t.language}
         </button>
       </header>
+      {config.data && config.data.api_version !== API_VERSION && <div className="stale-banner">{t.staleServer}</div>}
       <main className="content">
         {config.isError ? (
           <div className="empty-state">

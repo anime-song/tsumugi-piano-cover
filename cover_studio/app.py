@@ -25,10 +25,12 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .engine import Engine
-from .jobs import Job, Runner
+from .jobs import Job, LiveTranscription, Runner
 from .project import Project, projects, safe_name
 
 STATIC_DIR = Path(__file__).parent / "static"
+# API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
+API_VERSION = 2
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 
@@ -77,7 +79,13 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
         if job.kind == "transcribe":
             p.update(transcribe={"state": "running", "error": None})
-            engine.transcribe(p, progress, job._stop.is_set, job.add_log)
+            live = job._live = LiveTranscription()
+
+            def log(line: str) -> None:
+                job.add_log(line)
+                live.on_log(line)
+
+            engine.transcribe(p, progress, job._stop.is_set, log, live.on_live)
         else:
             engine.generate(p, job.takes, progress, job._stop.is_set, job.add_log)
 
@@ -181,6 +189,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             **engine.describe(),
             "defaults": asdict(CoverParams()),
             "busy": any(j.active for j in runner.jobs()),
+            "api_version": API_VERSION,
         }
 
     @app.post("/api/engine/unload")
@@ -244,6 +253,15 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             raise HTTPException(409, "採譜は実行中です")
         submit_transcribe(p)
         return detail(p)
+
+    @app.get("/api/projects/{pid}/transcribe/live")
+    def transcribe_live(pid: str, since: int = 0):
+        """採譜中に確定したノート (since 番目から後ろ) とステムごとの進み具合。採譜していなければ空"""
+        open_project(pid)
+        job = next((j for j in runner.jobs(pid) if j.kind == "transcribe"), None)
+        if job is None or job._live is None:
+            return {"seq": 0, "events": [], "stems": [], "stage": None, "active": bool(job and job.active)}
+        return {**job._live.since(since), "active": job.active}
 
     @app.put("/api/projects/{pid}/source")
     def upload_source(pid: str, midi: Annotated[UploadFile, File()]):

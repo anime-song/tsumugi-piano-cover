@@ -22,6 +22,61 @@ MAX_LOG_LINES = 300
 KEEP_FINISHED = 200
 
 
+# 採譜の段階をログの行から見分ける (tsumugi の出力の書き出し)
+_STAGES = (
+    ("Separating stems", "separate"),
+    ("Transcribing stem", "transcribe"),
+    ("Refin", "refine"),
+    ("elocity", "velocity"),
+    ("beat, chord", "beat"),
+)
+
+
+class LiveTranscription:
+    """採譜中に worker から届くノートと進み具合。events は届いた順の [id, stem, start, end, pitch, final] で、
+    画面は since (前回までに受け取った数) から後ろだけを取りに来る。同じ id は伸びていく途中のノートの更新"""
+
+    def __init__(self) -> None:
+        self.events: list[list] = []
+        self.stems: dict[str, dict] = {}  # ステム名 -> {"duration", "pos", "done"} (届いた順)
+        self.stage: str | None = None
+        self._lock = threading.Lock()
+
+    def _stem(self, name: str) -> dict:
+        return self.stems.setdefault(name, {"duration": 0.0, "pos": 0.0, "done": False})
+
+    def on_live(self, kind: str, data: dict) -> None:
+        with self._lock:
+            stem = str(data.get("stem", ""))
+            if kind == "stem":
+                self.stems[stem] = {"duration": float(data.get("duration", 0.0)), "pos": 0.0, "done": False}
+                self.stage = "transcribe"
+            elif kind == "notes":
+                info = self._stem(stem)
+                info["pos"] = max(info["pos"], float(data.get("pos", 0.0)))
+                for note_id, start, end, pitch, final in data.get("notes", []):
+                    self.events.append([note_id, stem, start, end, pitch, final])
+            elif kind == "stem_done":
+                info = self._stem(stem)
+                info["done"], info["pos"] = True, info["duration"]
+
+    def on_log(self, line: str) -> None:
+        for prefix, stage in _STAGES:
+            if prefix in line:
+                self.stage = stage
+                return
+
+    def since(self, start: int) -> dict:
+        with self._lock:
+            start = max(0, min(start, len(self.events)))
+            return {
+                "seq": len(self.events),
+                "events": self.events[start:],
+                "stems": [{"stem": name, **info} for name, info in self.stems.items()],
+                "stage": self.stage,
+            }
+
+
 @dataclass
 class Job:
     id: str
@@ -38,6 +93,8 @@ class Job:
     finished: str | None = None
     _stop: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     _ended: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    # 採譜の途中経過 (LiveTranscription)。大きいので to_dict には入れず、別の API で差分だけ返す
+    _live: LiveTranscription | None = field(default=None, repr=False, compare=False)
 
     @property
     def active(self) -> bool:
