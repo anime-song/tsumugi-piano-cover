@@ -26,6 +26,9 @@ export type ModelEntry = {
   num_channels: number | null;
 };
 
+// cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
+export const API_VERSION = 2;
+
 export type Config = {
   models: ModelEntry[];
   loaded: string | null;
@@ -33,6 +36,7 @@ export type Config = {
   tsumugi: boolean;
   defaults: Params;
   busy: boolean;
+  api_version?: number;
 };
 
 export type TakeState = "queued" | "running" | "done" | "error" | "cancelled";
@@ -108,6 +112,16 @@ export type SourceView = {
 export type CoverNote = [number, number, number, number, number];
 export type CoverView = { duration: number; notes: CoverNote[]; pedals: [number, number][] };
 
+export type LiveStem = { stem: string; duration: number; pos: number; done: boolean };
+export type LiveTranscriptionData = {
+  seq: number;
+  // [id, stem, start 秒, end 秒, pitch, final (0/1)]
+  events: [string, string, number, number, number, number][];
+  stems: LiveStem[];
+  stage: string | null;
+  active: boolean;
+};
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -150,6 +164,8 @@ export const api = {
   renameProject: (pid: string, title: string) => request<ProjectDetail>(p(pid), json("PATCH", { title })),
   deleteProject: (pid: string) => request<void>(p(pid), { method: "DELETE" }),
   transcribe: (pid: string) => request<ProjectDetail>(`${p(pid)}/transcribe`, { method: "POST" }),
+  transcribeLive: (pid: string, since: number) =>
+    request<LiveTranscriptionData>(`${p(pid)}/transcribe/live?since=${since}`),
   uploadSource: (pid: string, file: File) => {
     const form = new FormData();
     form.append("midi", file);

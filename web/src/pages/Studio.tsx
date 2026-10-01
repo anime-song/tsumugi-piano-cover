@@ -4,12 +4,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, urls, type Config, type ContinueFrom, type ProjectDetail, type Take } from "../api";
 import { CreatePanel, takeLabel, type Draft } from "../components/CreatePanel";
 import { Icon } from "../components/Icon";
+import { LiveTranscription } from "../components/LiveTranscription";
 import { PianoRoll } from "../components/PianoRoll";
 import { PlayerBar, usePlayerState } from "../components/PlayerBar";
 import { TakeCard, TakeDetail } from "../components/Takes";
 import { progressText, useT } from "../i18n";
 import { formatTime } from "../params";
-import { downloadCoverWav, getPlayer } from "../player";
+import { downloadCoverWav, getPlayer, type Player } from "../player";
 
 function loadDraft(pid: string, config: Config): Draft {
   const fallback: Draft = { params: { ...config.defaults }, model: null, count: 2, seedLocked: false, seed: null };
@@ -249,7 +250,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           )}
 
           {!data.source ? (
-            <TranscribePanel project={data} pid={pid} onChange={refresh} onError={setError} />
+            <TranscribePanel project={data} pid={pid} player={player} onChange={refresh} onError={setError} />
           ) : (
             <div className="roll-card">
               <div className="roll-head">
@@ -423,11 +424,13 @@ function SourceUpload({
 function TranscribePanel({
   project,
   pid,
+  player,
   onChange,
   onError,
 }: {
   project: ProjectDetail;
   pid: string;
+  player: Player;
   onChange: (d?: ProjectDetail) => void;
   onError: (m: string) => void;
 }) {
@@ -482,11 +485,15 @@ function TranscribePanel({
           )
         )}
       </div>
-      {tr?.message && active && <div className="transcribe-msg mono small">{progressText(t, tr.message)}</div>}
+      {tr?.message && active && !tr.message.startsWith("@@") && <div className="transcribe-msg mono small">{progressText(t, tr.message)}</div>}
+      {tr?.job && <LiveTranscription pid={pid} player={player} active={active} />}
       {tr?.log && tr.log.length > 0 && (
-        <pre className="log" ref={logRef}>
-          {tr.log.join("\n")}
-        </pre>
+        <details className="log-box" open={tr.state === "error"}>
+          <summary className="muted small">{t.showLog}</summary>
+          <pre className="log" ref={logRef}>
+            {tr.log.filter((line) => !line.startsWith("@@")).join("\n")}
+          </pre>
+        </details>
       )}
     </div>
   );

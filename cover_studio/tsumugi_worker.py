@@ -7,15 +7,70 @@ tsumugi は依存 (ステム分離など) が多いので、このリポジト�
 
 設定はカバーモデルの学習に使った原曲の MIDI と同じ (ステム分離 → 採譜 → 楽器の再判定 → マージ → ベロシティ →
 ビート・コード・キー)。違う設定の MIDI では原曲エンコーダが学習で見たものと変わってしまう。
+
+採譜中は、確定したノートを "@@notes {json}" の行で stdout に流す (tsumugi の streaming。UI がピアノロールに描く)。
+ステムの始まりと終わりは "@@stem {json}" / "@@stem_done {json}"。楽器の再判定・ベロシティの前の値なので、最終の MIDI とは
+楽器とベロシティが違う。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
+
+
+def emit(kind: str, data: dict) -> None:
+    print(f"@@{kind} {json.dumps(data, separators=(',', ':'))}", flush=True)
+
+
+def stream_notes(infer_stem) -> None:
+    """ステムごとの採譜 (infer.run_inference) に tsumugi の StreamingNoteEmitter をつなぎ、確定したノートを流す。
+    run_stem_separated_transcription はこのフックを通さないので、呼び出す側の関数を包む。採譜の結果そのものは変えない"""
+    try:
+        from instrument_agnostic_amt.streaming import StreamingNoteEmitter
+    except ImportError:  # streaming のない古い tsumugi では流さない (採譜はできる)
+        return
+    infer = infer_stem.infer
+    original_run, original_resolve = infer.run_inference, infer_stem.resolve_stem_model_type
+    current = {"stem": None}
+
+    def resolve_stem_model_type(stem_name):
+        current["stem"] = stem_name  # この直後に、そのステムの run_inference が呼ばれる
+        return original_resolve(stem_name)
+
+    def run_inference(*args, **kwargs):
+        stem = current["stem"] or "stem"
+        sample_rate = int(kwargs["model_config"].sample_rate)
+        emit("stem", {"stem": stem, "duration": round(kwargs["waveform"].shape[-1] / sample_rate, 3)})
+        if "drum" in stem.lower():  # ドラムは音高がないので描かない
+            result = original_run(*args, **kwargs)
+            emit("stem_done", {"stem": stem})
+            return result
+        state = {"emitter": None}
+
+        def send(events, position):
+            notes = [[e.id, e.start, e.end, e.pitch, int(e.final)] for e in events]
+            emit("notes", {"stem": stem, "pos": round(position, 3), "notes": notes})
+
+        def on_window(stitcher, window_start_sample):
+            if state["emitter"] is None:
+                state["emitter"] = StreamingNoteEmitter(
+                    stitcher, stem=stem, sample_rate=sample_rate, instrument_label=str
+                )
+            send(state["emitter"].on_window(window_start_sample), window_start_sample / sample_rate)
+
+        result = original_run(*args, on_window_consumed=on_window, **kwargs)
+        if state["emitter"] is not None:
+            send(state["emitter"].finish(), kwargs["waveform"].shape[-1] / sample_rate)
+        emit("stem_done", {"stem": stem})
+        return result
+
+    infer.run_inference = run_inference
+    infer_stem.resolve_stem_model_type = resolve_stem_model_type
 
 
 def main() -> None:
@@ -54,6 +109,7 @@ def main() -> None:
         free, total = torch.cuda.mem_get_info()
         torch.cuda.set_per_process_memory_fraction(free * args.gpu_memory_limit / total)
         print(f"VRAM の上限 {free * args.gpu_memory_limit / 1e9:.1f}GB", flush=True)
+    stream_notes(infer_stem)
 
     try:
         result = infer_stem.run_stem_separated_transcription(
