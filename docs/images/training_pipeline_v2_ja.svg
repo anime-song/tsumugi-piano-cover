@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="530" viewBox="0 0 1080 530" role="img" aria-labelledby="title desc" xml:lang="ja">
+<title id="title">Training Pipeline v2 — 学習パイプライン</title>
+<desc id="desc">事前学習からカバー学習へのモデルフロー</desc>
+<defs><marker id="orangeArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#d9730d"/></marker></defs>
+<rect x="0" y="0" width="1080" height="530" fill="#ffffff" stroke="none" stroke-width="1"/>
+<rect x="32" y="36" width="268" height="424" fill="#fdf6ee" stroke="#e9c9a6" stroke-width="1.5" rx="14"/>
+<rect x="428" y="36" width="604" height="424" fill="#f2f6fc" stroke="#b9cdea" stroke-width="1.5" rx="14"/>
+<rect x="56" y="54" width="68" height="24" fill="#d9730d" stroke="none" stroke-width="0" rx="4"/>
+<text x="90" y="70" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="12" font-weight="500" fill="#ffffff" text-anchor="middle">STAGE 1</text>
+<text x="136" y="70" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="16" font-weight="700" fill="#1f1f1d" text-anchor="start">事前学習</text>
+<rect x="452" y="54" width="68" height="24" fill="#1d5fbf" stroke="none" stroke-width="0" rx="4"/>
+<text x="486" y="70" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="12" font-weight="500" fill="#ffffff" text-anchor="middle">STAGE 2</text>
+<text x="532" y="70" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="16" font-weight="700" fill="#1f1f1d" text-anchor="start">カバー学習</text>
+<g><line x1="166" y1="172" x2="166" y2="198" stroke="#8a8883" stroke-width="1.5" stroke-linecap="round"/><polygon points="161.5,197 166,204 170.5,197" fill="#8a8883"/></g>
+<g><line x1="166" y1="328" x2="166" y2="354" stroke="#8a8883" stroke-width="1.5" stroke-linecap="round"/><polygon points="161.5,353 166,360 170.5,353" fill="#8a8883"/></g>
+<g><line x1="562" y1="172" x2="562" y2="198" stroke="#8a8883" stroke-width="1.5" stroke-linecap="round"/><polygon points="557.5,197 562,204 566.5,197" fill="#8a8883"/></g>
+<g><line x1="562" y1="328" x2="562" y2="354" stroke="#8a8883" stroke-width="1.5" stroke-linecap="round"/><polygon points="557.5,353 562,360 566.5,353" fill="#8a8883"/></g>
+<g><line x1="908" y1="172" x2="908" y2="198" stroke="#8a8883" stroke-width="1.5" stroke-linecap="round"/><polygon points="903.5,197 908,204 912.5,197" fill="#8a8883"/></g>
+<line x1="276" y1="266" x2="440" y2="266" stroke="#d9730d" stroke-width="2.5" marker-end="url(#orangeArrow)"/>
+<line x1="808" y1="267" x2="686" y2="267" stroke="#1d5fbf" stroke-width="2"/>
+<polygon points="688,261 676,267 688,273" fill="#1d5fbf"/>
+<rect x="56" y="92" width="220" height="76" fill="#ffffff" stroke="#c9c7c1" stroke-width="1.5" rx="8"/>
+<text x="166" y="134" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="14" font-weight="500" fill="#1f1f1d" text-anchor="middle">ピアノ演奏 MIDI</text>
+<rect x="56" y="208" width="220" height="116" fill="#fbe3c8" stroke="#d9730d" stroke-width="2" rx="10"/>
+<g transform="translate(99 242)"><path d="M8 0 C10 5 14 6 13 11 C13 15 10 17 7 17 C3 17 1 14 1 11 C1 8 4 7 4 3 C6 5 7 7 7 9 C9 7 9 3 8 0Z" fill="#e36a2c"/><path d="M7 8 C9 10 10 11 9 14 C8 16 5 16 4 14 C3 12 5 10 7 8Z" fill="#ffc35c"/></g>
+<text x="180" y="255" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="15" font-weight="700" fill="#1f1f1d" text-anchor="middle">Piano AR モデル</text>
+<text x="166" y="283" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="400" fill="#8a5a25" text-anchor="middle">Global + Local decoder</text>
+<rect x="56" y="364" width="220" height="72" fill="#ffffff" stroke="#c9c7c1" stroke-width="1.5" rx="8" stroke-dasharray="5 4"/>
+<text x="166" y="406" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="14" font-weight="500" fill="#1f1f1d" text-anchor="middle">次トークン予測</text>
+<text x="364" y="244" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="500" fill="#1f1f1d" text-anchor="middle">重みで初期化</text>
+<text x="364" y="293" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="11" font-weight="400" fill="#6b6a66" text-anchor="middle">事前学習の重み</text>
+<rect x="452" y="92" width="220" height="76" fill="#ffffff" stroke="#c9c7c1" stroke-width="1.5" rx="8"/>
+<text x="562" y="134" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="14" font-weight="500" fill="#1f1f1d" text-anchor="middle">ピアノカバー MIDI</text>
+<rect x="452" y="208" width="220" height="116" fill="#ecebe8" stroke="#d9730d" stroke-width="2" rx="10"/>
+<g transform="translate(489 239)" fill="none" stroke="#667d9e" stroke-width="1.4" stroke-linecap="round"><path d="M7 0 V14 M0.94 3.5 L13.06 10.5 M0.94 10.5 L13.06 3.5 M7 0 L5 2 M7 0 L9 2 M7 14 L5 12 M7 14 L9 12 M0.94 3.5 L3.5 3.6 M0.94 3.5 L1.7 6 M13.06 10.5 L10.5 10.4 M13.06 10.5 L12.3 8 M0.94 10.5 L3.5 10.4 M0.94 10.5 L1.7 8 M13.06 3.5 L10.5 3.6 M13.06 3.5 L12.3 6"/></g>
+<text x="576" y="251" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="15" font-weight="700" fill="#1f1f1d" text-anchor="middle">Piano AR デコーダ</text>
+<text x="562" y="272" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="400" fill="#55534e" text-anchor="middle">事前学習済み</text>
+<text x="562" y="292" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="400" fill="#6b6a66" text-anchor="middle">Global + Local decoder</text>
+<rect x="452" y="364" width="220" height="72" fill="#ffffff" stroke="#c9c7c1" stroke-width="1.5" rx="8" stroke-dasharray="5 4"/>
+<text x="562" y="406" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="14" font-weight="500" fill="#1f1f1d" text-anchor="middle">ピアノカバー</text>
+<rect x="808" y="92" width="200" height="76" fill="#ffffff" stroke="#c9c7c1" stroke-width="1.5" rx="8"/>
+<text x="908" y="119" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="14" font-weight="500" fill="#1f1f1d" text-anchor="middle">原曲</text>
+<text x="908" y="137" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="11" font-weight="400" fill="#6b6a66" text-anchor="middle">音・拍・コード・キー</text>
+<rect x="808" y="208" width="200" height="116" fill="#d3e2f7" stroke="#1d5fbf" stroke-width="2" rx="10"/>
+<g transform="translate(845 243)"><path d="M8 0 C10 5 14 6 13 11 C13 15 10 17 7 17 C3 17 1 14 1 11 C1 8 4 7 4 3 C6 5 7 7 7 9 C9 7 9 3 8 0Z" fill="#e36a2c"/><path d="M7 8 C9 10 10 11 9 14 C8 16 5 16 4 14 C3 12 5 10 7 8Z" fill="#ffc35c"/></g>
+<text x="919" y="256" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="15" font-weight="700" fill="#1f1f1d" text-anchor="middle">原曲エンコーダ</text>
+<text x="908" y="282" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="11" font-weight="400" fill="#334a6b" text-anchor="middle">MIDI特徴量</text>
+<rect x="684" y="234" width="112" height="24" fill="#d3e2f7" stroke="#1d5fbf" stroke-width="2" rx="12"/>
+<g transform="translate(694 237)"><path d="M8 0 C10 5 14 6 13 11 C13 15 10 17 7 17 C3 17 1 14 1 11 C1 8 4 7 4 3 C6 5 7 7 7 9 C9 7 9 3 8 0Z" fill="#e36a2c"/><path d="M7 8 C9 10 10 11 9 14 C8 16 5 16 4 14 C3 12 5 10 7 8Z" fill="#ffc35c"/></g>
+<text x="748" y="253" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="11" font-weight="500" fill="#1d3f75" text-anchor="middle">cross-attn</text>
+<rect x="694" y="284" width="92" height="20" fill="#1d5fbf" stroke="none" stroke-width="0" rx="3"/>
+<text x="740" y="298" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace" font-size="10.5" font-weight="500" fill="#ffffff" text-anchor="middle">gate = 0 init</text>
+<text x="684" y="361" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="11" font-weight="400" fill="#1f1f1d" text-anchor="start">ゲートを0で初期化：学習開始時は</text>
+<text x="684" y="378" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="11" font-weight="400" fill="#1f1f1d" text-anchor="start">事前学習モデルと同じ出力</text>
+<rect x="56" y="484" width="22" height="14" fill="#fbe3c8" stroke="#d9730d" stroke-width="2" rx="3"/>
+<text x="86" y="497" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="400" fill="#1f1f1d" text-anchor="start">Stage 1 の重み</text>
+<rect x="234" y="484" width="22" height="14" fill="#d3e2f7" stroke="#1d5fbf" stroke-width="2" rx="3"/>
+<text x="264" y="497" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="400" fill="#1f1f1d" text-anchor="start">新規追加</text>
+<g transform="translate(383 482)"><path d="M8 0 C10 5 14 6 13 11 C13 15 10 17 7 17 C3 17 1 14 1 11 C1 8 4 7 4 3 C6 5 7 7 7 9 C9 7 9 3 8 0Z" fill="#e36a2c"/><path d="M7 8 C9 10 10 11 9 14 C8 16 5 16 4 14 C3 12 5 10 7 8Z" fill="#ffc35c"/></g>
+<text x="403" y="497" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="400" fill="#1f1f1d" text-anchor="start">学習</text>
+<g transform="translate(496 483)" fill="none" stroke="#667d9e" stroke-width="1.4" stroke-linecap="round"><path d="M7 0 V14 M0.94 3.5 L13.06 10.5 M0.94 10.5 L13.06 3.5 M7 0 L5 2 M7 0 L9 2 M7 14 L5 12 M7 14 L9 12 M0.94 3.5 L3.5 3.6 M0.94 3.5 L1.7 6 M13.06 10.5 L10.5 10.4 M13.06 10.5 L12.3 8 M0.94 10.5 L3.5 10.4 M0.94 10.5 L1.7 8 M13.06 3.5 L10.5 3.6 M13.06 3.5 L12.3 6"/></g>
+<text x="516" y="497" font-family="system-ui, 'Noto Sans JP', sans-serif" font-size="12" font-weight="400" fill="#1f1f1d" text-anchor="start">凍結 または 低学習率</text>
+</svg>
