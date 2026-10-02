@@ -59,7 +59,7 @@ def generate(
     channels = torch.zeros(num_samples, dtype=torch.long, device=device)
     patches: list[list[list[int]]] = [[] for _ in range(num_samples)]
     summaries: list[torch.Tensor] = []
-    open_slurs = [0] * num_samples
+    open_slurs = [(0, 0)] * num_samples  # 段ごとの開いているスラーの数
     done = [False] * num_samples
 
     for p in range(num_measures):
@@ -95,7 +95,7 @@ def generate(
             if done[i]:
                 continue
             patches[i].append([t for t in sequence[i].tolist() if t != PAD])
-            open_slurs[i] = g.open_slurs
+            open_slurs[i] = tuple(g.open_slurs)
             done[i] = g.song_end
         summaries.append(model.summarize_patches(sequence))
     return patches

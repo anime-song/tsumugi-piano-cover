@@ -5,7 +5,8 @@
 - 同じ位置の指示 (音部記号・オクターブ記号・スイング・強弱など) は番号の昇順で 1 つずつ、塊より前。状態を変えない指示は出さない
 - メトロノーム記号は基準の音符の直後に数値。1 つの位置に 1 つだけ (番号の昇順なので自然にそうなる)
 - 塊は段・声部の順 (同じ声部は装飾音が先)。声部の中で前の音が鳴っている間は次の塊を始めない。音は小節からはみ出さない
-- 和音の音高は昇順。スラーの終わりは開いているスラーがあるときだけ
+- 和音の音高は昇順。スラーの終わりは同じ段に開いているスラーがあるときだけ (段をまたぐスラーは出さない。学習データでは
+  スラーの 0.4% だが、モデルが開いていない段で閉じると score.pair_slurs が段をまたぐ対にしてしまうため)
 - 1 小節のトークン数の上限を超えない (残りが少ないと新しい位置や塊を始めない)
 - 複縦線 (DOUBLE_BAR) は小節の終わりの直前で、後は EOM だけ (曲の最後の小節は終止線なので付けない)
 """
@@ -73,9 +74,11 @@ _VOCABS: dict[int, _Vocab] = {}
 
 
 class ScoreGrammar:
-    """1 小節分の生成の状態。open_slurs は前の小節までに開いて閉じていないスラーの数"""
+    """1 小節分の生成の状態。open_slurs は前の小節までに開いて閉じていないスラーの数 (段ごと)"""
 
-    def __init__(self, tokenizer: ScoreTokenizer, open_slurs: int = 0, banned: torch.Tensor | None = None) -> None:
+    def __init__(
+        self, tokenizer: ScoreTokenizer, open_slurs: tuple[int, int] = (0, 0), banned: torch.Tensor | None = None
+    ) -> None:
         """banned [vocab] は出さないトークン (学習データに一度も出てこないものなど)。
         それを除くと出せるトークンがなくなる場面では除かない"""
         self.tok = tokenizer
@@ -84,7 +87,7 @@ class ScoreGrammar:
             _VOCABS[id(tokenizer)] = _Vocab(tokenizer)
         self.v = _VOCABS[id(tokenizer)]
         self.limit = tokenizer.config.max_patch_tokens
-        self.open_slurs = open_slurs
+        self.open_slurs = list(open_slurs)
         self.count = 0
         self.stage = "mtime"
         self.finished = False
@@ -180,7 +183,7 @@ class ScoreGrammar:
             if remaining > 1:  # 音高の分を残す
                 if self.stops == 0 and self.starts == 0 and self.last_art < v.first_tremolo:
                     mask[v.art[v.art > self.last_art]] = True
-                if self.starts == 0 and self.stops < self.open_slurs:
+                if self.starts == 0 and self.stops < self.open_slurs[self._staff() - 1]:
                     mask[SLUR_STOP] = True
                 if self.starts < MAX_SLUR_STARTS:
                     mask[SLUR_START] = True
@@ -331,8 +334,17 @@ class ScoreGrammar:
         elif token == GLISS:
             self.stage = "after_gliss"
 
+    def _staff(self) -> int:
+        return self.tok.values[self.sv][0]
+
     def _close_group(self) -> None:
         if not self.grace:
             self.busy[self.sv] = self.position + self.duration
-        self.open_slurs += self.starts - self.stops
+        # 終わりは同じ段のスラーから閉じる。プロンプトの小節 (学習データ) には段をまたぐスラーもあるので、
+        # 足りない分は score.pair_slurs と同じくもう一方の段のものを閉じる
+        own = self._staff() - 1
+        closed = min(self.stops, self.open_slurs[own])
+        self.open_slurs[own] -= closed
+        self.open_slurs[1 - own] = max(0, self.open_slurs[1 - own] - (self.stops - closed))
+        self.open_slurs[own] += self.starts
         self.stage = "items"
