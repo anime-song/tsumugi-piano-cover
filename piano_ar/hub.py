@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -20,6 +21,8 @@ HF_REPO = "anime-song/tsumugi-piano-cover"
 CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "model.safetensors"
 FORMAT_VERSION = 1
+# 公開用の演奏者の番号 → 学習時の番号 (data/metadata/ は gitignore 下)
+CHANNEL_ORDER = Path("data/metadata/public_channel_order.json")
 
 
 def save_pretrained(model: nn.Module, out_dir: str | Path, config: dict) -> Path:
@@ -32,6 +35,29 @@ def save_pretrained(model: nn.Module, out_dir: str | Path, config: dict) -> Path
     config = {"format_version": FORMAT_VERSION, **config}
     (out / CONFIG_NAME).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return out
+
+
+def shuffle_channels(embedding: nn.Embedding, order_path: str | Path = CHANNEL_ORDER) -> None:
+    """演奏者の埋め込みの行を公開用の番号の順に並べ替える (0 = 指定なし はそのまま)。
+
+    学習時の番号は channel_index.json の追加順で、古い一覧が git の履歴に残っているので、そのまま公開すると
+    番号からチャンネルが分かる。並べ替えの表 (公開番号 → 学習時の番号) は order_path に置いて公開しない。
+    なければ作り、あれば使い回すので、piano_ar と piano_cover で同じ番号が同じ演奏者を指す。
+    """
+    path = Path(order_path)
+    num_channels = embedding.num_embeddings
+    if path.exists():
+        order = json.loads(path.read_text(encoding="utf-8"))
+        if len(order) != num_channels:
+            raise ValueError(f"{path} は演奏者 {len(order) - 1} 人分ですが、モデルは {num_channels - 1} 人分です")
+    else:
+        rest = list(range(1, num_channels))
+        random.SystemRandom().shuffle(rest)
+        order = [0, *rest]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(order) + "\n", encoding="utf-8")
+    with torch.no_grad():
+        embedding.weight.copy_(embedding.weight[torch.tensor(order)])
 
 
 def resolve_pretrained(name_or_path: str | Path, subfolder: str | None = None, revision: str | None = None) -> Path:

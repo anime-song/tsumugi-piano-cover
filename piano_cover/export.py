@@ -4,13 +4,16 @@ python -m piano_cover.export --checkpoint checkpoints/piano_cover_v4/best.pt --o
 python -m piano_cover.export --checkpoint ... --planner checkpoints/piano_cover_v4/planner.pt --out ...
 
 出力は config.json と model.safetensors だけ。optimizer の状態・学習の設定 (args)・演奏者の一覧 (channel_index) は
-入れない。--planner を渡すと、Planner を学習し直した重みに差し替えてから書き出す。
+入れない。演奏者の番号は piano_ar.export と同じ表 (--channel-order) で並べ替える。
+--planner を渡すと、Planner を学習し直した重みに差し替えてから書き出す。
 piano_ar の重み (python -m piano_ar.export) と同じ repository の piano_ar/ と piano_cover/ に置く想定。
 """
 
 from __future__ import annotations
 
 import argparse
+
+from piano_ar.hub import CHANNEL_ORDER, shuffle_channels
 
 from .hub import export_cover, load_cover_checkpoint
 
@@ -20,9 +23,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--planner", default=None, help="Planner を差し替える (piano_cover.train_planner の出力)")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--channel-order", default=str(CHANNEL_ORDER), help="公開用の演奏者の番号の表 (なければ作る)")
     args = parser.parse_args()
 
     model = load_cover_checkpoint(args.checkpoint, args.planner)
+    shuffle_channels(model.decoder.channel_embedding, args.channel_order)
     out = export_cover(model, args.out)
     print(f"{out}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M パラメーター")
 
