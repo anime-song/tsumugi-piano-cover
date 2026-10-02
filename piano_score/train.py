@@ -106,6 +106,66 @@ def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device) -> d
     return {key: value / max(count, 1) for key, value in sums.items()}
 
 
+# 各小節の MTIME の後に必ずこの順で並ぶ小節ヘッダのトークン
+HEADER_FIELDS = ("ts", "key", "clef1", "clef2")
+
+
+@torch.no_grad()
+def header_change_stats(model: PianoARModel, loader: DataLoader, device: torch.device) -> dict[str, float]:
+    """小節ヘッダ (拍子・調・音部記号) を、前の小節から変わる所と同じ所に分けて測る。
+
+    平均の損失では、ほとんどを占める「前の小節と同じ」所に隠れて、変わる所を学べているかが見えないため。
+    change_ratio は「変わる」確率 (1 - 前の小節と同じトークンの確率) の合計 / 実際に変わった回数。
+    1 を大きく下回っていくなら、前の小節を写す方へ偏っている。
+    ヘッダの予測に要るのは Local の先頭の数トークンだけなので、Local は小節全体ではなくそこまで通す。
+    compile のグラフを増やさないよう、通常の実行で通す (forward の記憶と同じ理由)。
+    """
+    model.eval()
+    H = len(HEADER_FIELDS)
+    # 変わる所の損失・正解数・回数・「変わる」確率の合計、同じ所の損失・回数
+    sums = torch.zeros(6, H, dtype=torch.float64, device=device)
+    for batch in loader:
+        batch = to_device(batch, device)
+        tokens, valid = batch["tokens"], batch["patch_valid"]
+        patches = tokens[valid]
+        patches = patches[:, : int((patches != PAD).sum(-1).max())]
+        with (
+            torch.compiler.set_stance("force_eager"),
+            torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"),
+        ):
+            summarized = model.summarize_patches(patches)
+            summaries = summarized.new_zeros(*valid.shape, summarized.shape[-1])
+            summaries[valid] = summarized
+            context = model.global_forward(summaries, batch["song_start"], batch["pedal_state"], batch["channel"])
+            # local_forward の出力の k 番目がトークン k の予測。ヘッダはトークン 1..H
+            logits = model.local_forward(patches[:, : 1 + H], context[valid])[:, 1 : 1 + H]
+        log_probs = logits.new_zeros(*valid.shape, H, logits.shape[-1], dtype=torch.float32)
+        log_probs[valid] = logits.float().log_softmax(-1)
+
+        target = tokens[:, :, 1 : 1 + H]
+        current, previous, log_probs = target[:, 1:], target[:, :-1], log_probs[:, 1:]
+        pair = (valid[:, 1:] & valid[:, :-1])[..., None]
+        changed = (current != previous) & pair
+        same = (current == previous) & pair
+        loss = -log_probs.gather(-1, current[..., None])[..., 0]
+        hit = log_probs.argmax(-1) == current
+        p_change = 1 - log_probs.gather(-1, previous[..., None])[..., 0].exp()
+        for row, (value, mask) in enumerate(
+            [(loss, changed), (hit, changed), (changed, changed), (p_change, pair), (loss, same), (same, same)]
+        ):
+            sums[row] += (value.double() * mask).sum((0, 1))
+    model.train()
+
+    stats: dict[str, float] = {}
+    for h, field in enumerate(HEADER_FIELDS):
+        change_loss, change_hit, changes, expected, same_loss, sames = sums[:, h].tolist()
+        stats[f"header_{field}/loss_change"] = change_loss / max(changes, 1)
+        stats[f"header_{field}/acc_change"] = change_hit / max(changes, 1)
+        stats[f"header_{field}/change_ratio"] = expected / max(changes, 1)
+        stats[f"header_{field}/loss_same"] = same_loss / max(sames, 1)
+    return stats
+
+
 def sample_evaluation(
     model: PianoARModel,
     tokenizer: ScoreTokenizer,
@@ -333,9 +393,18 @@ def main() -> None:
             val = evaluate(model, val_loader, device)
             if len(val_rare):
                 val["loss_rare_meter"] = evaluate(model, val_rare_loader, device)["loss"]
+            val.update(header_change_stats(model, val_loader, device))
             print(
                 f"[val] step {step} loss {val['loss']:.4f} {format_losses(val)}"
                 + (f" (珍しい拍子・変拍子 {val['loss_rare_meter']:.4f})" if "loss_rare_meter" in val else "")
+            )
+            print(
+                "[val] ヘッダが変わる所 (損失 / 正解率 / 見積もり÷実際) "
+                + " ".join(
+                    f"{f} {val[f'header_{f}/loss_change']:.2f}/{val[f'header_{f}/acc_change']:.0%}"
+                    f"/{val[f'header_{f}/change_ratio']:.2f}"
+                    for f in HEADER_FIELDS
+                )
             )
             if wandb_run:
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=step)
