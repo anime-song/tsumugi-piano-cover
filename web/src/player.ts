@@ -1,7 +1,7 @@
 // 原曲の音源とカバー (ピアノの音源で鳴らす) を同じ時計で再生する。
 // カバーは原曲の時間軸の上に生成しているので、同じ秒で並べればそのまま重なる。
 // テイクを切り替えても再生位置はそのままなので、同じ所を聴き比べられる。
-import { CacheStorage, SplendidGrandPiano, renderOffline, type Smplr } from "smplr";
+import { CacheStorage, Scheduler, SplendidGrandPiano, audioBufferToWav16, renderOffline, type Smplr } from "smplr";
 import type { CoverNote } from "./api";
 
 const LOOKAHEAD = 0.3; // 何秒先までの音を予約するか
@@ -305,16 +305,37 @@ function lowerBound(notes: CoverNote[], time: number): number {
 
 let instance: Player | null = null;
 export function getPlayer(): Player {
-  instance ??= new Player();
+  if (!instance) {
+    instance = new Player();
+    // 紹介動画の録画用 (URL に ?record を付けたときだけ)。外から再生位置を決めて 1 コマずつ撮り、音は別に書き出す
+    if (new URLSearchParams(window.location.search).has("record")) {
+      (window as unknown as { coverStudio: object }).coverStudio = {
+        player: instance,
+        // start〜end 秒だけを 16 bit の WAV にして base64 で返す (全曲だと受け渡しが重い)
+        renderWav: async (start: number, end: number) => {
+          const full = (await renderCover(instance!.notes)).audioBuffer;
+          const from = Math.floor(start * full.sampleRate);
+          const length = Math.min(full.length, Math.floor(end * full.sampleRate)) - from;
+          const part = new AudioBuffer({ length, numberOfChannels: full.numberOfChannels, sampleRate: full.sampleRate });
+          for (let c = 0; c < full.numberOfChannels; c++) {
+            part.copyToChannel(full.getChannelData(c).subarray(from, from + length), c);
+          }
+          return blobToBase64(audioBufferToWav16(part));
+        },
+      };
+    }
+  }
   return instance;
 }
 
-/** カバーをピアノの音源で WAV に書き出す (ブラウザの中で、実時間より速く作る) */
-export async function downloadCoverWav(notes: CoverNote[], filename: string) {
+async function renderCover(notes: CoverNote[]) {
   const end = notes.reduce((m, n) => Math.max(m, n[4]), 0);
   const result = await renderOffline(
     async (ctx) => {
-      const piano = SplendidGrandPiano(ctx, { storage: new CacheStorage("cover-studio-piano") });
+      // smplr は既定では 200ms より先の音をタイマーで順に流すが、オフラインの書き出しは実時間より速く進むので
+      // タイマーが追いつかずに音が抜ける。曲の長さ全体を先読みにして、すべての音をその場で予約する
+      const scheduler = Scheduler(ctx, { lookaheadMs: (end + 10) * 1000 });
+      const piano = SplendidGrandPiano(ctx, { storage: new CacheStorage("cover-studio-piano"), scheduler });
       await piano.ready;
       for (const n of notes) {
         piano.start({ note: n[2], velocity: n[3], time: n[0], duration: Math.max(0.05, n[4] - n[0]) });
@@ -322,5 +343,30 @@ export async function downloadCoverWav(notes: CoverNote[], filename: string) {
     },
     { duration: end + 2, sampleRate: 44100 },
   );
-  result.downloadWav16(filename);
+  // 音が重なると 0 dB を超えて 16 bit の WAV で音割れするので、ピークが -1 dB に収まるよう全体を下げる
+  const buffer = result.audioBuffer;
+  let peak = 0;
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    for (const v of buffer.getChannelData(c)) peak = Math.max(peak, Math.abs(v));
+  }
+  const limit = 0.89;
+  if (peak > limit) {
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      const data = buffer.getChannelData(c);
+      for (let i = 0; i < data.length; i++) data[i] *= limit / peak;
+    }
+  }
+  return result;
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+/** カバーをピアノの音源で WAV に書き出す (ブラウザの中で、実時間より速く作る) */
+export async function downloadCoverWav(notes: CoverNote[], filename: string) {
+  (await renderCover(notes)).downloadWav16(filename);
 }
