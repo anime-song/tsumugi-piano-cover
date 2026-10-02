@@ -93,7 +93,8 @@ export function NewSongForm({ config, onCreated }: { config: Config; onCreated: 
             <div className="files">
               {audio && (
                 <span className="chip">
-                  <Icon name="music" size={13} /> {audio.name}
+                  <Icon name="music" size={13} />
+                  <span className="chip-name">{audio.name}</span>
                   <button onClick={() => setAudio(null)} aria-label={t.remove}>
                     <Icon name="close" size={12} />
                   </button>
@@ -101,7 +102,8 @@ export function NewSongForm({ config, onCreated }: { config: Config; onCreated: 
               )}
               {midi && (
                 <span className="chip">
-                  <Icon name="layers" size={13} /> {midi.name}
+                  <Icon name="layers" size={13} />
+                  <span className="chip-name">{midi.name}</span>
                   <button onClick={() => setMidi(null)} aria-label={t.remove}>
                     <Icon name="close" size={12} />
                   </button>

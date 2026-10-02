@@ -15,6 +15,12 @@ import { downloadCoverWav, getPlayer, type Player } from "../player";
 // 「作る」欄の設定は曲をまたいで同じものを使う (別の曲へ移っても、変えた設定のまま続けられる)
 const DRAFT_KEY = "cover-studio:draft";
 
+// 携帯では 3 つの欄をタブで切り替える。
+// 幅のしきい値は styles.css の @media (max-width: 820px) と揃えること
+type Tab = "create" | "play" | "detail";
+const PHONE_MAX_WIDTH = 820;
+const isPhone = () => window.matchMedia(`(max-width: ${PHONE_MAX_WIDTH}px)`).matches;
+
 function loadDraft(pid: string, config: Config): Draft {
   const fallback: Draft = { params: { ...config.defaults }, model: null, count: 2, seedLocked: false, seed: null };
   try {
@@ -61,6 +67,9 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "favorite">("all");
   const [showSource, setShowSource] = useState(true);
+  const [tab, setTab] = useState<Tab>("play");
+  // 携帯で巻物をたたむかどうか (広い画面では styles.css がボタンごと隠す)
+  const [rollOpen, setRollOpen] = useState(true);
   const [continueFrom, setContinueFrom] = useState<ContinueFrom | null>(null);
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
@@ -137,6 +146,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
       refresh(detail);
       setContinueFrom(null);
       setError(null);
+      // 携帯では、作り始めたら演奏の面へ移して進み具合を見せる
+      if (isPhone()) setTab("play");
       void qc.invalidateQueries({ queryKey: ["config"] });
     },
     onError: (e) => setError(e instanceof Error ? e.message : String(e)),
@@ -156,6 +167,9 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
     });
   const reuse = (take: Take) => {
     setDraft({ ...draft, params: { ...config.defaults, ...take.params }, model: take.model.id, seed: take.seed });
+    // 携帯では「作る」が別のタブなので、設定を読み込んだことが見えるように移る
+    // (続きを作り直す onContinue も reuse を通るので、ここで一緒に面倒を見る)
+    if (isPhone()) setTab("create");
   };
   const playTake = (take: Take) => {
     if (selected === take.id) player.toggle();
@@ -221,7 +235,28 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
 
   return (
     <>
-      <div className="studio">
+      {/* 携帯だけに出る切り替え (広い画面では styles.css が .tabs を隠す) */}
+      <nav className="tabs" role="tablist" aria-label={t.viewSwitch}>
+        {(
+          [
+            ["create", t.tabCreate],
+            ["play", t.tabPlay],
+            ["detail", t.tabDetail],
+          ] as [Tab, string][]
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            className={tab === id ? "on" : ""}
+            onClick={() => setTab(id)}
+          >
+            {label}
+            {id === "play" && takes.length > 0 && <span className="count">{takes.length}</span>}
+          </button>
+        ))}
+      </nav>
+      <div className="studio" data-tab={tab}>
         <CreatePanel
           config={config}
           draft={draft}
@@ -234,9 +269,10 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           disabled={disabledReason}
         />
 
-        <section className="center">
+        {/* has-roll: 巻物があるときだけ、巻物を固定して一覧だけをスクロールさせる */}
+        <section className={`center ${data.source ? "has-roll" : ""}`}>
           <div className="song-head">
-            <div>
+            <div className="song-title-block">
               <h1>{data.title}</h1>
               <div className="muted small">
                 {data.audio ?? t.noAudio} · {t.sourceMidi}:{" "}
@@ -262,12 +298,24 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           {!data.source ? (
             <TranscribePanel project={data} pid={pid} player={player} onChange={refresh} onError={setError} />
           ) : (
-            <div className="roll-card">
+            <div className={`roll-card ${rollOpen ? "" : "collapsed"}`}>
               <div className="roll-head">
                 <span className="roll-title">
-                  {selectedTake ? takeLabel(selectedTake, t) : t.sourceMidiTitle}
+                  <span className="roll-title-text">
+                    {selectedTake ? takeLabel(selectedTake, t) : t.sourceMidiTitle}
+                  </span>
                   <span className="spinner small" style={{ visibility: takeView.isFetching ? "visible" : "hidden" }} />
                 </span>
+                {/* 携帯だけに出る巻物の開閉 (広い画面では styles.css が隠す) */}
+                <button
+                  className={`roll-toggle ${rollOpen ? "open" : ""}`}
+                  onClick={() => setRollOpen(!rollOpen)}
+                  aria-expanded={rollOpen}
+                  title={rollOpen ? t.rollCollapse : t.rollExpand}
+                >
+                  <Icon name="chevron" size={14} />
+                  {rollOpen ? t.rollCollapse : t.rollExpand}
+                </button>
                 <div className="legend">
                   <label className="check">
                     <input type="checkbox" checked={showSource} onChange={(e) => setShowSource(e.target.checked)} />
@@ -293,7 +341,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                 continueAt={continueFrom?.seconds ?? null}
               />
               <div className="roll-hint muted small">
-                {t.rollHint}
+                <span className="roll-hint-text">{t.rollHint}</span>
                 {player.loop && (
                   <>
                     {" · "}
@@ -306,47 +354,54 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
             </div>
           )}
 
-          <div className="takes-head">
-            <h2>{t.takes}</h2>
-            <div className="segmented small">
-              <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
-                {t.all} {takes.length}
-              </button>
-              <button className={filter === "favorite" ? "on" : ""} onClick={() => setFilter("favorite")}>
-                ★ {takes.filter((x) => x.favorite).length}
-              </button>
-            </div>
-          </div>
-          <div className="takes">
-            {shown.length === 0 && (
-              <div className="empty-takes muted">
-                {data.source
-                  ? filter === "favorite"
-                    ? t.noFavorites
-                    : t.emptyTakes
-                  : t.waitTranscribe}
+          {/* 巻物 (ピアノロール) は固定したまま、この下のテイク一覧だけを独立スクロールさせる */}
+          <div className="takes-scroll">
+            <div className="takes-head">
+              <h2>{t.takes}</h2>
+              <div className="segmented small">
+                <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
+                  {t.all} {takes.length}
+                </button>
+                <button className={filter === "favorite" ? "on" : ""} onClick={() => setFilter("favorite")}>
+                  ★ {takes.filter((x) => x.favorite).length}
+                </button>
               </div>
-            )}
-            {shown.map((take) => {
-              const cf = take.continue_from;
-              const base = cf ? takeById.get(cf.take) : undefined;
-              return (
-                <TakeCard
-                  key={take.id}
-                  take={take}
-                  defaults={config.defaults}
-                  selected={take.id === selected}
-                  playing={take.id === selected && player.playing}
-                  continueLabel={cf ? t.continueChip(base ? takeLabel(base, t) : cf.take, formatTime(cf.seconds)) : null}
-                  onSelect={() => setSelected(take.id)}
-                  onPlay={() => playTake(take)}
-                  onFavorite={() => updateTake(take, { favorite: !take.favorite })}
-                  onReuse={() => reuse(take)}
-                  onCancel={() => take.job && run(async () => (await api.cancelJob(take.job!), refresh()))}
-                  onDelete={() => deleteTake(take)}
-                />
-              );
-            })}
+            </div>
+            <div className="takes">
+              {shown.length === 0 && (
+                <div className="empty-takes muted">
+                  {data.source
+                    ? filter === "favorite"
+                      ? t.noFavorites
+                      : t.emptyTakes
+                    : t.waitTranscribe}
+                </div>
+              )}
+              {shown.map((take) => {
+                const cf = take.continue_from;
+                const base = cf ? takeById.get(cf.take) : undefined;
+                return (
+                  <TakeCard
+                    key={take.id}
+                    take={take}
+                    defaults={config.defaults}
+                    selected={take.id === selected}
+                    playing={take.id === selected && player.playing}
+                    continueLabel={cf ? t.continueChip(base ? takeLabel(base, t) : cf.take, formatTime(cf.seconds)) : null}
+                    onSelect={() => {
+                      setSelected(take.id);
+                      // 携帯では選んだら詳細へ (広い画面ではタブ自体が出ないので何も変わらない)
+                      if (isPhone()) setTab("detail");
+                    }}
+                    onPlay={() => playTake(take)}
+                    onFavorite={() => updateTake(take, { favorite: !take.favorite })}
+                    onReuse={() => reuse(take)}
+                    onCancel={() => take.job && run(async () => (await api.cancelJob(take.job!), refresh()))}
+                    onDelete={() => deleteTake(take)}
+                  />
+                );
+              })}
+            </div>
           </div>
         </section>
 

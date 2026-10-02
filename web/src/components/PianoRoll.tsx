@@ -245,7 +245,8 @@ export function PianoRoll({ player, cover, source, showSource, continueAt, heigh
     <div className="roll">
       <canvas
         ref={canvasRef}
-        style={{ height }}
+        // 高さは CSS 変数 --roll-h で上書きできる (携帯では少し低くする)
+        style={{ height: `var(--roll-h, ${height}px)` }}
         onPointerDown={(e) => {
           (e.target as HTMLElement).setPointerCapture(e.pointerId);
           drag.current = { x: e.clientX, t: timeAt(e.clientX), moved: false };
@@ -270,6 +271,12 @@ export function PianoRoll({ player, cover, source, showSource, continueAt, heigh
           } else if (player.loop) {
             player.seek(player.loop[0]);
           }
+        }}
+        // 指で頁を送り始めると pointercancel になる。押しっぱなしの状態を捨て、
+        // 途中まで引いてしまった短いループも消す
+        onPointerCancel={() => {
+          drag.current = null;
+          if (player.loop && player.loop[1] - player.loop[0] < 0.5) player.setLoop(null);
         }}
       />
       <div className="roll-zoom">
