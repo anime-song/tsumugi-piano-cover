@@ -7,7 +7,7 @@ import { Icon } from "./Icon";
 
 // よく使う演奏者の番号 (テンプレート)。ブラウザに覚え、最初はこの 2 人
 const PERFORMERS_KEY = "cover-studio:performers";
-const DEFAULT_PERFORMERS = [532, 142];
+const DEFAULT_PERFORMERS = [227, 1088];
 
 function loadPerformers(): number[] {
   try {
