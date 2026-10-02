@@ -15,9 +15,11 @@ import { downloadCoverWav, getPlayer, type Player } from "../player";
 // 「作る」欄の設定は曲をまたいで同じものを使う (別の曲へ移っても、変えた設定のまま続けられる)
 const DRAFT_KEY = "cover-studio:draft";
 
-// 携帯では 3 つの欄をタブで切り替える (styles.css の .tabs / .studio[data-tab] と対)
+// 携帯では 3 つの欄をタブで切り替える。
+// 幅のしきい値は styles.css の @media (max-width: 820px) と揃えること
 type Tab = "create" | "play" | "detail";
-const isPhone = () => window.matchMedia("(max-width: 820px)").matches;
+const PHONE_MAX_WIDTH = 820;
+const isPhone = () => window.matchMedia(`(max-width: ${PHONE_MAX_WIDTH}px)`).matches;
 
 function loadDraft(pid: string, config: Config): Draft {
   const fallback: Draft = { params: { ...config.defaults }, model: null, count: 2, seedLocked: false, seed: null };
@@ -165,6 +167,9 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
     });
   const reuse = (take: Take) => {
     setDraft({ ...draft, params: { ...config.defaults, ...take.params }, model: take.model.id, seed: take.seed });
+    // 携帯では「作る」が別のタブなので、設定を読み込んだことが見えるように移る
+    // (続きを作り直す onContinue も reuse を通るので、ここで一緒に面倒を見る)
+    if (isPhone()) setTab("create");
   };
   const playTake = (take: Take) => {
     if (selected === take.id) player.toggle();
@@ -264,7 +269,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           disabled={disabledReason}
         />
 
-        <section className="center">
+        {/* has-roll: 巻物があるときだけ、巻物を固定して一覧だけをスクロールさせる */}
+        <section className={`center ${data.source ? "has-roll" : ""}`}>
           <div className="song-head">
             <div className="song-title-block">
               <h1>{data.title}</h1>
