@@ -428,6 +428,8 @@ def main() -> None:
             print("[reference] " + " ".join(f"{k} {v:.2f}" for k, v in reference.items()))
 
     def save(path: Path) -> None:
+        # 書き込みの途中で止まっても前のチェックポイントが残るよう、別名に書いてから置き換える
+        partial = path.with_name(path.name + ".partial")
         torch.save(
             {
                 "model": model.state_dict(),
@@ -440,8 +442,9 @@ def main() -> None:
                 "wandb_id": wandb_run.id if wandb_run else None,
                 "best_val_loss": best_val_loss,
             },
-            path,
+            partial,
         )
+        partial.replace(path)
 
     # 再開時は、サンプラーが作る曲の並びのうち済んだ分を読み飛ばさずに新しい乱数で続ける
     loader_iter = iter(train_loader)
