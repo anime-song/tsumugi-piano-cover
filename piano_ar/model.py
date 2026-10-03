@@ -449,9 +449,12 @@ class PianoARModel(nn.Module):
         summarized = summarize(flat, buckets)
         summaries = summarized.new_zeros(*valid.shape, self.config.dim)
         if memory.any():
-            # 記憶は compile しない通常の実行で通す。勾配なしの呼び出しで compile のグラフが増えると、gradient checkpointing の
-            # 再計算が forward と別のグラフを選んで失敗する (pytorch/pytorch#166926)
-            with torch.no_grad(), torch.compiler.set_stance("force_eager"):
+            # gradient checkpointing を使うときは、記憶は compile しない通常の実行で通す。勾配なしの呼び出しで compile のグラフが
+            # 増えると、checkpointing の再計算が forward と別のグラフを選んで失敗する (pytorch/pytorch#166926)。
+            # checkpointing なしならこの問題はなく、記憶は損失を取るパッチの 3 倍あるので、compile したブロックで通すと
+            # 1 更新が約 1.5 倍速くなる (4070 Ti、microbatch 4)
+            stance = "force_eager" if self.patch_summarizer.gradient_checkpointing else "default"
+            with torch.no_grad(), torch.compiler.set_stance(stance):
                 patches = tokens[memory]
                 summaries[memory] = summarize(patches, length_buckets(patches)).to(summaries.dtype)
         summaries[patch_loss] = summarized
