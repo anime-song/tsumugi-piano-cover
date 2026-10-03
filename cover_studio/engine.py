@@ -215,6 +215,7 @@ class Engine:
         from piano_ar.evaluation import events_end_frame
         from piano_ar.tokenizer import KIND, KIND_NOTE
         from piano_cover.generate import CoverParams, generate_covers
+        from piano_cover.metadata import copy_metadata
 
         with self._lock:
             first = project.take(take_ids[0])
@@ -254,6 +255,9 @@ class Engine:
         for take_id, cover in zip(take_ids, covers):
             d = project.take_dir(take_id)
             tokenizer.events_to_midi(cover.events, d / "cover.mid")
+            # 原曲のテンポ・拍子・調・コードマーカーを写す (ないと既定の 120 bpm で開かれる)
+            if project.has_source:
+                copy_metadata(project.source_path, d / "cover.mid")
             (d / "patches.json").write_text(json.dumps(cover.patches), encoding="utf-8")
             notes = int((cover.events[:, KIND] == KIND_NOTE).sum()) if len(cover.events) else 0
             project.update_take(
