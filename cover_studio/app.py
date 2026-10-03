@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import shutil
 import uuid
@@ -28,6 +29,8 @@ from .engine import Engine
 from .jobs import Job, LiveTranscription, Runner
 from .project import Project, projects, safe_name
 from .web import STATIC_DIR
+
+log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
 API_VERSION = 2
@@ -356,6 +359,14 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         path = p.take_midi(tid)
         if not path.is_file():
             raise HTTPException(404, "まだ生成していません")
+        # 以前に生成したテイクはメタデータなしで保存されているので、取り出すときに写す
+        if p.has_source:
+            try:
+                from piano_cover.metadata import copy_metadata
+
+                copy_metadata(p.source_path, path)
+            except Exception:  # 写せなくても、中身 (音) は返す
+                log.exception("cover.mid にメタデータを写せませんでした: %s", path)
         name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
         return FileResponse(path, media_type="audio/midi", headers={"Content-Disposition": _attachment(name)})
 
