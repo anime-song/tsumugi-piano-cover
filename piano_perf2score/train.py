@@ -5,6 +5,8 @@
 楽譜のキャッシュは piano_score.prepare --visible-only で作ったもの (見えない音符と cue サイズの音符を除いたもの)。
 合成演奏は DataLoader のワーカーの中で窓ごとに描き出す (piano_perf2score.render)。
 途中から再開する場合は --resume checkpoints/piano_perf2score/latest.pt。検証の損失が最良になったら best.pt にも保存する。
+モデルに部品を足したときは --init-from で重みだけを読み (足した部品は初期値のまま)、step と wandb の run を引き継ぐ。
+optimizer の状態は作り直すので、--rewarmup-steps の間は学習率を 0 から上げ直す。
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", default="checkpoints/piano_score_pretrain/step98000.pt")
     parser.add_argument("--out-dir", default="checkpoints/piano_perf2score")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--init-from", default=None, help="重みだけを読んで続ける (足した部品は初期値。optimizer は作り直す)")
+    parser.add_argument("--rewarmup-steps", type=int, default=500, help="--init-from のあとに学習率を上げ直すステップ数")
     parser.add_argument("--window-measures", type=int, default=32)
     parser.add_argument("--context-measures", type=int, default=2, help="窓の前に演奏を描き出す小節数")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -110,6 +114,9 @@ def gate_values(model: Perf2ScoreModel) -> dict[str, float]:
     for name, blocks in (("global", model.global_cross), ("local", model.local_cross)):
         attn = [abs(float(torch.tanh(b.attn_gate.detach()))) for b in blocks]
         logs[f"gate/{name}_attn"] = sum(attn) / max(len(attn), 1)
+    if model.onset_head is not None:
+        # OnsetHead の query の大きさ (0 なら打鍵の量をまったく足していない)
+        logs["gate/onset_query"] = float(model.onset_head.query.weight.detach().norm())
     return logs
 
 
@@ -191,6 +198,16 @@ def main() -> None:
         step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
         print(f"{args.resume} の step {step} から再開")
+    restart_step = None
+    if args.init_from:
+        checkpoint = torch.load(args.init_from, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+        if unexpected:
+            raise SystemExit(f"チェックポイントにあってモデルにない重み: {unexpected}")
+        step = restart_step = checkpoint["step"]
+        best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+        added = sorted({".".join(name.split(".")[:2]) for name in missing})
+        print(f"{args.init_from} の step {step} の重みから続ける (初期値のままの部品: {added})")
     if args.compile:
         if not sys.flags.utf8_mode:
             raise SystemExit("--compile には PYTHONUTF8=1 か python -X utf8 が必要です")
@@ -240,6 +257,8 @@ def main() -> None:
     last_log = time.time()
     while step < args.steps:
         scale = lr_at(step, args) / args.lr
+        if restart_step is not None:
+            scale *= min(1.0, (step - restart_step + 1) / max(args.rewarmup_steps, 1))
         for group in optimizer.param_groups:
             group["lr"] = args.lr * scale * group["lr_scale"]
         for _ in range(args.grad_accum):

@@ -28,6 +28,7 @@ from piano_ar.model import Block, CrossBlock, CrossHook, PianoARModel, Transform
 from piano_score.tokenizer import MLEN, ScoreTokenizer
 
 from .data import PATCH_FRAMES, PerformanceVocab
+from .onset_head import ScoreOnsetHead, frac_positions, row_channels
 
 CHUNK_TOKENS = 16384  # 演奏のパッチエンコーダに一度に通すトークン数の上限
 
@@ -46,6 +47,15 @@ class Perf2ScoreConfig:
     # Local が見る範囲 (基準の時刻からのフレーム数)。遅い曲の長い小節 (4/4 で ♩=40 なら 6 秒) まで入るように
     local_back: int = 100
     local_ahead: int = 1100
+    # ScoreOnsetHead (位置のトークンに、対応する時刻の近くの打鍵の量を足す) の幅。0 なら使わない
+    onset_head_dim: int = 64
+
+
+def perf2score_config(values: dict) -> Perf2ScoreConfig:
+    """チェックポイントに保存した設定から作る。OnsetHead を足す前のチェックポイント (onset_head_dim がない) は使わない設定にする"""
+    values = dict(values)
+    values.setdefault("onset_head_dim", 0)
+    return Perf2ScoreConfig(**values)
 
 
 @dataclass
@@ -56,6 +66,7 @@ class PerformanceMemory:
     rows: Tensor  # [B, S, R, D] 各行のベクトル
     row_onset: Tensor  # [B, S, R] フレーム
     row_valid: Tensor  # [B, S, R]
+    row_channels: Tensor  # [B, S, R, C] 打鍵の種類 (onset_head.CHANNELS)
 
 
 class Perf2ScoreModel(nn.Module):
@@ -90,6 +101,13 @@ class Perf2ScoreModel(nn.Module):
 
         self.global_cross = nn.ModuleList(make_cross() for _ in self.global_cross_blocks)
         self.local_cross = nn.ModuleList(make_cross() for _ in self.local_cross_blocks)
+        self.onset_head = None
+        if config.onset_head_dim:
+            self.onset_head = ScoreOnsetHead(
+                model_config.dim, config.onset_head_dim, tokenizer, config.local_back, config.local_ahead
+            )
+            self.onset_head.apply(PianoARModel._init_weights)
+            nn.init.zeros_(self.onset_head.query.weight)
         self.gradient_checkpointing = False
 
         for module in (self.row_embedding, self.row_onset, self.latent_slot, self.patch_encoder, self.song_encoder,
@@ -180,11 +198,18 @@ class Perf2ScoreModel(nn.Module):
         song_valid = patch_valid.repeat_interleave(K, dim=1)
         key_valid = song_valid | ~song_valid.any(dim=1, keepdim=True)
         song = self.song_encoder(x, key_valid, positions=song_pos)
-        return PerformanceMemory(song, song_pos, song_valid, rows, onset.float(), row_valid)
+        channels = row_channels(features, self.vocab)
+        return PerformanceMemory(song, song_pos, song_valid, rows, onset.float(), row_valid, channels)
 
     def local_memory(self, memory: PerformanceMemory, song: Tensor, ref: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """小節ごとに、基準の時刻 ref [N] (フレーム) の前後のパッチの行を並べる。(行 [N, P*R, D], 位置 [N, P*R], 有効)。
         位置は ref からの相対のフレーム (RoPE の角度を小さく保つ)"""
+        return self.local_window(memory, song, ref)[:3]
+
+    def local_window(
+        self, memory: PerformanceMemory, song: Tensor, ref: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """local_memory に打鍵の種類 [N, P*R, C] を足したもの"""
         c = self.config
         S = memory.rows.shape[1]
         first = torch.div(ref - c.local_back, PATCH_FRAMES, rounding_mode="floor").long()
@@ -197,7 +222,8 @@ class Perf2ScoreModel(nn.Module):
         pos = memory.row_onset[song[:, None], safe] - ref[:, None, None]
         valid = memory.row_valid[song[:, None], safe] & inside[..., None]
         valid &= (pos >= -c.local_back) & (pos <= c.local_ahead)
-        return rows.reshape(n, -1, rows.shape[-1]), pos.reshape(n, -1), valid.reshape(n, -1)
+        channels = memory.row_channels[song[:, None], safe].reshape(n, -1, memory.row_channels.shape[-1])
+        return rows.reshape(n, -1, rows.shape[-1]), pos.reshape(n, -1), valid.reshape(n, -1), channels
 
     def query_times(self, prefix: Tensor, ref: Tensor, start: Tensor, spq: Tensor) -> Tensor:
         """Local の各入力位置 (BOS + prefix) で見る演奏の時刻 (ref からの相対フレーム) [N, T+1]"""
@@ -239,7 +265,10 @@ class _TrainingCondition:
         delta = memory.song_pos[:, None, :] - self.global_pos[:, :, None]
         self.global_mask = (delta >= -c.global_back) & (delta <= c.global_ahead) & memory.song_valid[:, None, :]
         # Local: 有効な小節を並べた順
-        self.song_of = valid.nonzero()[:, 0]
+        index = valid.nonzero()
+        self.song_of = index[:, 0]
+        # 曲の最初の小節 (MTIME が「最初の音から小節線までさかのぼる秒数」になる)
+        self.first = (index[:, 1] == 0) & (batch["song_start"][self.song_of] == 1)
         self.ref = batch["measure_ref"][valid]
         self.start = batch["measure_start"][valid]
         self.spq = batch["measure_spq"][valid]
@@ -270,5 +299,14 @@ class _TrainingCondition:
 
         return hook
 
-    def local_output(self, index: Tensor, prefix: Tensor) -> None:
-        return None
+    def local_output(self, index: Tensor, prefix: Tensor):
+        head = self.model.onset_head
+        if head is None:
+            return None
+        ref, start, spq = self.ref[index], self.start[index], self.spq[index]
+        _, pos, valid, channels = self.model.local_window(self.memory, self.song_of[index], ref)
+        smoothed = head.smoothed(pos, valid, channels)
+        mtime, beat = head.candidates(smoothed, start - ref, spq, self.first[index])
+        n, t, beat_value = frac_positions(prefix, self.model.beat_value)
+        frac = head.frac_candidates(smoothed[n], (start - ref)[n], spq[n], beat_value) if len(n) else None
+        return lambda h, logits: head(h, logits, mtime, beat, frac, (n, t))

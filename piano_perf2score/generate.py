@@ -28,7 +28,7 @@ from piano_score.musicxml import write_musicxml
 from piano_score.tokenizer import EOS, PAD, ScoreTokenizer
 
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
-from .model import Perf2ScoreConfig, Perf2ScoreModel
+from .model import Perf2ScoreModel, perf2score_config
 from .render import Performance, measure_qpm, render
 
 PEDAL_THRESHOLD = 64
@@ -40,7 +40,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[Perf2ScoreM
     config["fraction_denominators"] = tuple(config["fraction_denominators"])
     tokenizer = ScoreTokenizer(ScoreTokenizerConfig(**config))
     model = Perf2ScoreModel(
-        ModelConfig.from_dict(checkpoint["model_config"]), Perf2ScoreConfig(**checkpoint["perf2score_config"]), tokenizer
+        ModelConfig.from_dict(checkpoint["model_config"]), perf2score_config(checkpoint["perf2score_config"]), tokenizer
     )
     model.load_state_dict(checkpoint["model"])
     return model.to(device).eval(), tokenizer, checkpoint
@@ -155,7 +155,19 @@ class _StepCondition:
         return block.attend(x, onset[:, None], tensors[f"k{n}"], tensors[f"v{n}"], tensors["mask"])
 
     def step_output(self, tensors: dict, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        return logits
+        """ScoreOnsetHead: MTIME を予測する位置では MTIME の候補、それ以降は BEAT の候補、拍の直後の行では FRAC の候補"""
+        head = self.model.onset_head
+        if head is None:
+            return logits
+        frac_rows = tensors.get("head_frac_rows")
+        where = None
+        if frac_rows is not None:
+            n = frac_rows.nonzero().squeeze(1)
+            where = (n, torch.zeros_like(n))
+        return head(
+            h, logits, tensors.get("head_mtime"), tensors.get("head_beat"),
+            tensors["head_frac"][where[0]] if where is not None else None, where,
+        ).to(logits.dtype)  # fmt: skip
 
 
 def _decode(
@@ -229,7 +241,15 @@ def _decode(
 
         context = decoder.global_forward(stacked, song_start, pedal, channel, global_hook)[:, -1]
         ref_t = torch.tensor(ref, device=device)
-        tensors = condition.tensors(*model.local_memory(memory, rows_index, ref_t))
+        rows_memory, k_pos, valid, channels = model.local_window(memory, rows_index, ref_t)
+        tensors = condition.tensors(rows_memory, k_pos, valid)
+        head = model.onset_head
+        if head is not None:
+            smoothed = head.smoothed(k_pos, valid, channels)
+            first_rows = torch.full((R,), p == 0, device=device)
+            tensors["head_mtime"], _ = head.candidates(
+                smoothed, torch.zeros(R, device=device), torch.ones(R, device=device), first_rows
+            )
 
         grammars = [ScoreGrammar(tokenizer, open_slurs[r], banned) for r in range(R)]
         for r in range(R):
@@ -244,6 +264,17 @@ def _decode(
         for s in range(L):
             # 各行のクエリの時刻 (学習の Perf2ScoreModel.query_times と同じ。MTIME を予測する位置は 0)
             q = [0.0 if s == 0 else start[r] - ref[r] + float(grammars[r].position or 0) * spq[r] for r in range(R)]
+            if head is not None and s > 0:
+                # 拍のトークンの直後の行 (小節の長さの拍は除く) は、その拍のあとの FRAC の候補を足す
+                after_beat = [g.stage == "after_beat" and not g.finished for g in grammars]
+                tensors.pop("head_frac_rows", None)
+                if any(after_beat):
+                    relative = torch.tensor([start[r] - ref[r] for r in range(R)], device=device)
+                    beats = torch.tensor([float(g.beat) for g in grammars], device=device)
+                    tensors["head_frac"] = head.frac_candidates(
+                        smoothed, relative, torch.tensor(spq, device=device), beats
+                    )
+                    tensors["head_frac_rows"] = torch.tensor(after_beat, device=device)
             logits = decoder.local_step(
                 token, step, context, cache, torch.tensor(q, device=device), condition, tensors
             ).float()
@@ -263,6 +294,13 @@ def _decode(
                     start[r] = -value if p == 0 else ref[r] + value
                     if p > 0:
                         spq[r] = (start[r] - ref[r]) / max(lengths[r][-1], 1e-3)
+            if head is not None and s == 0:
+                # MTIME が決まったので、BEAT の候補をこの小節の開始と 4 分音符の長さから作る
+                tensors.pop("head_mtime", None)
+                relative = torch.tensor([start[r] - ref[r] for r in range(R)], device=device)
+                _, tensors["head_beat"] = head.candidates(
+                    smoothed, relative, torch.tensor(spq, device=device), first_rows
+                )
             sequence[:, s] = torch.where(inactive, PAD, next_token)
             token = next_token
             step += 1
@@ -350,7 +388,7 @@ def main() -> None:
             performance = render(
                 reference, np.random.default_rng(song), qpm=measure_qpm(reference, cache.song_seconds(song)[: n + 1])
             )
-            patches = run(performance, n + 4)
+            patches = run(performance, 4 * n)  # 拍子を短く読むと小節が増えるので多めに
             name = f"val{k}_{cache.ids[song]}"
             write_musicxml(reference, out_dir / f"{name}_reference.musicxml")
             write_musicxml(tokenizer.decode(patches)[0], out_dir / f"{name}_generated.musicxml")
