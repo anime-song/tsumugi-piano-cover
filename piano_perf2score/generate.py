@@ -104,6 +104,7 @@ def transcribe(
     banned: torch.Tensor | None = None,
     first_qpm: float | None = None,
     search_seconds: float = 10.0,
+    mtime_candidates: int = 1,
 ) -> list[list[int]]:
     """演奏から楽譜を生成して、小節ごとのトークン列を返す。
 
@@ -115,7 +116,10 @@ def transcribe(
     batch = {k: v.to(device) for k, v in performance_batch(performance).items()}
     memory = model.encode_performance(batch)
     end_frame = float(performance.notes[:, 0].max() * FRAMES_PER_SECOND) if len(performance.notes) else 0.0
-    common = {"memory": memory, "end_frame": end_frame, "context_measures": context_measures, "banned": banned}
+    common = {
+        "memory": memory, "end_frame": end_frame, "context_measures": context_measures, "banned": banned,
+        "mtime_candidates": mtime_candidates,
+    }  # fmt: skip
     if first_qpm is None:
         scores = {}
         for qpm in SEARCH_TEMPOS:
@@ -145,6 +149,7 @@ def _decode(
     temperature: float,
     top_p: float,
     banned: torch.Tensor | None,
+    mtime_candidates: int = 1,
 ) -> tuple[list[list[int]], float, float]:
     """小節を 1 つずつ生成する。(小節ごとのトークン列, 選んだトークンの対数尤度の和, 生成した小節が覆う時間 (フレーム))。
     stop_frame を渡すと、そこより後に始まる小節の手前で止める"""
@@ -186,34 +191,55 @@ def _decode(
         ref_t = torch.tensor([ref], device=device)
         rows, k_pos, valid = model.local_memory(memory, song, ref_t)
         mask = valid[:, None, :]
-        grammar = ScoreGrammar(tokenizer, open_slurs, banned)
-        sequence = torch.zeros(1, 0, dtype=torch.long, device=device)
-        start = torch.tensor([ref], device=device)
-        spq = torch.tensor([first_spq], device=device)
-        measure_logprob = 0.0
-        while not grammar.finished:
+
+        def measure(first_token: int | None):
+            """小節 p を生成する。first_token を渡すと MTIME をそれにする。(トークン列, 文法, 開始, 4 分音符の長さ, 対数尤度)"""
+            grammar = ScoreGrammar(tokenizer, open_slurs, banned)
+            sequence = torch.zeros(1, 0, dtype=torch.long, device=device)
+            start = torch.tensor([ref], device=device)
+            spq = torch.tensor([first_spq], device=device)
+            logprob = 0.0
+            while not grammar.finished:
+                logits = local_logits(sequence, start, spq)
+                allowed = grammar.allowed().to(device)[None]
+                logits = logits.masked_fill(~allowed, float("-inf"))
+                if first_token is not None and sequence.shape[1] == 0:
+                    token = torch.tensor([first_token], device=device)
+                else:
+                    token = _sample(logits, temperature, top_p)
+                logprob += float(logits.log_softmax(-1)[0, token])
+                grammar.update(int(token))
+                sequence = torch.cat((sequence, token[:, None]), dim=1)
+                if sequence.shape[1] == 1:
+                    # MTIME から小節の開始と 4 分音符の長さの見積もりを決める (学習の data.py と同じ)
+                    value = float(mtime_values[int(token) - mtime_first])
+                    start_value = -value if p == 0 else ref + value
+                    start = torch.tensor([start_value], device=device)
+                    if p > 0:
+                        spq = torch.tensor([(start_value - ref) / max(lengths[-1], 1e-3)], device=device)
+            return sequence, grammar, start, logprob
+
+        def local_logits(sequence: torch.Tensor, start: torch.Tensor, spq: torch.Tensor) -> torch.Tensor:
             q_pos = model.query_times(sequence, ref_t, start, spq)
 
-            def local_hook(i: int, x: torch.Tensor, q_pos: torch.Tensor = q_pos) -> torch.Tensor:
+            def local_hook(i: int, x: torch.Tensor) -> torch.Tensor:
                 if i not in model.local_cross_blocks:
                     return x
                 block = model.local_cross[model.local_cross_blocks.index(i)]
                 return block(x, q_pos, rows, k_pos, mask)
 
-            logits = decoder.local_forward(sequence, context, local_hook)[:, -1].float()
-            allowed = grammar.allowed().to(device)[None]
-            logits = logits.masked_fill(~allowed, float("-inf"))
-            token = _sample(logits, temperature, top_p)
-            measure_logprob += float(logits.log_softmax(-1)[0, token])
-            grammar.update(int(token))
-            sequence = torch.cat((sequence, token[:, None]), dim=1)
-            if sequence.shape[1] == 1:
-                # MTIME から小節の開始と 4 分音符の長さの見積もりを決める (学習の data.py と同じ)
-                value = float(mtime_values[int(token) - mtime_first])
-                start_value = -value if p == 0 else ref + value
-                start = torch.tensor([start_value], device=device)
-                if p > 0:
-                    spq = torch.tensor([(start_value - ref) / max(lengths[-1], 1e-3)], device=device)
+            return decoder.local_forward(sequence, context, local_hook)[:, -1].float()
+
+        if mtime_candidates > 1:
+            # MTIME の候補ごとに小節を生成し、小節全体の対数尤度がいちばん高いものを選ぶ。MTIME を誤ると
+            # 4 分音符の長さの見積もりもずれて小節の中身が演奏と合わなくなるので、中身の尤度で MTIME を確かめられる
+            empty = torch.zeros(1, 0, dtype=torch.long, device=device)
+            first_logits = local_logits(empty, torch.tensor([ref], device=device), torch.tensor([first_spq], device=device))
+            candidates = first_logits[0, mtime_first : mtime_first + len(mtime_values)].topk(mtime_candidates).indices
+            results = [measure(mtime_first + int(k)) for k in candidates]
+            sequence, grammar, start, measure_logprob = max(results, key=lambda r: r[3])
+        else:
+            sequence, grammar, start, measure_logprob = measure(None)
         tokens = [t for t in sequence[0].tolist() if t != PAD]
         measure_start = float(start)
         if p > 0:
@@ -250,13 +276,15 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--first-qpm", type=float, default=None, help="最初の小節のテンポ (省略でモデルに選ばせる)")
+    parser.add_argument("--mtime-candidates", type=int, default=1, help="小節ごとに試す MTIME の候補の数 (1 で試さない)")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device)
     model, tokenizer, checkpoint = load_checkpoint(args.checkpoint, device)
     banned = unseen_tokens(checkpoint["token_counts"], tokenizer) if checkpoint.get("token_counts") is not None else None
-    options = {"temperature": args.temperature, "top_p": args.top_p, "banned": banned, "first_qpm": args.first_qpm}
+    options = {"temperature": args.temperature, "top_p": args.top_p, "banned": banned, "first_qpm": args.first_qpm,
+               "mtime_candidates": args.mtime_candidates}
 
     def run(performance: Performance, max_measures: int) -> list[list[int]]:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):

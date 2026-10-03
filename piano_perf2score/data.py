@@ -35,6 +35,10 @@ FRAMES_PER_SECOND = 100
 PATCH_FRAMES = 200  # 2 秒
 DEFAULT_SPQ = 0.5 * FRAMES_PER_SECOND  # 4 分音符 = 120
 FIRST_SPQ_NOISE = 0.1  # 曲の最初の小節の 4 分音符の長さにかけるずれ (対数の標準偏差、学習だけ)
+# テンポの記述のない楽譜 (prepare.py が ♩=120 として時刻を見積もったもの、全体の約 26%) に選ぶテンポ。
+# メトロノーム記号のある楽譜のテンポの分布 (中央値 ♩=102、対数の標準偏差 0.33) に合わせる。120 のままだと
+# 学習の演奏のテンポが 120 に集まり、モデルが音の間隔だけで音価を決める (遅い曲の 16 分を 8 分で書く) ようになる
+UNMARKED_TEMPO = (102.0, 0.33, 40.0, 220.0)  # 中央値・対数の標準偏差・下限・上限
 
 
 class PerformanceVocab:
@@ -137,6 +141,7 @@ class SynthWindowDataset(Dataset):
         self.songs = np.flatnonzero(~cache.is_val if self.train else cache.is_val) if songs is None else songs
         self.mtime_first = self.tokenizer.ids[("mtime", 0)]
         self.key_first = self.tokenizer.ids[("key", -7)]
+        self.is_metronome = np.array([kind == "metro_unit" for kind in self.tokenizer.kinds])
         self._tables: dict = {}
 
     def __len__(self) -> int:
@@ -160,6 +165,9 @@ class SynthWindowDataset(Dataset):
                 bodies = self._transpose(bodies, shift)
         measures, _ = self.tokenizer.decode([[self.mtime_first, *b.tolist()] for b in bodies])
         qpm = measure_qpm(measures, self.cache.song_seconds(song)[first : last + 1])
+        if np.all(np.abs(qpm - 120.0) < 0.5) and not any(self.is_metronome[b].any() for b in bodies):
+            median, sigma, low, high = UNMARKED_TEMPO
+            qpm = np.full_like(qpm, float(np.clip(median * math.exp(rng.normal(0.0, sigma)), low, high)))
         performance = render(measures, rng, self.render_config, qpm)
 
         # MTIME: 描き出した小節線の時刻から。窓の外 (前の文脈) の分も通して求めて、窓の分だけ使う
