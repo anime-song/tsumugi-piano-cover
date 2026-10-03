@@ -3,6 +3,9 @@ torch==2.13.0+cu130
 numpy
 symusic
 wandb
+# 学習中の生成サンプルを wandb に送るとき (wandb.Audio と wandb.Image) に要る
+soundfile
+pillow
 # torch.compile 用 (torch 2.13 は triton 3.7 系)
 triton-windows>=3.7,<3.8; sys_platform == "win32"
 # 推論用の重みの読み書き (piano_ar.hub)
