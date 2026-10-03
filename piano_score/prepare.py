@@ -31,11 +31,11 @@ from .musicxml import ScoreError, parse_xml, read_musicxml, score_title
 from .tokenizer import ScoreTokenizer
 
 
-def _load(path: str) -> tuple[list[np.ndarray], np.ndarray, str] | str:
+def _load(path: str, visible_only: bool = False) -> tuple[list[np.ndarray], np.ndarray, str] | str:
     tokenizer = ScoreTokenizer()
     try:
         root = parse_xml(path)
-        measures = read_musicxml(root)
+        measures = read_musicxml(root, visible_only=visible_only)
         seconds = tokenizer.nominal_starts(measures)
         patches = tokenizer.encode(measures, seconds)
     except ScoreError as e:
@@ -55,6 +55,11 @@ def main() -> None:
     parser.add_argument("--min-measures", type=int, default=4, help="これより小節の少ない曲は使わない")
     parser.add_argument("--limit", type=int, default=0, help="動作確認用に先頭から何曲だけ使うか (0 なら全部)")
     parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument(
+        "--visible-only",
+        action="store_true",
+        help="見えない音符と cue サイズの音符を除く (合成演奏と組にする 2 段目のデータ。musicxml._hidden_note)",
+    )
     args = parser.parse_args()
 
     tokenizer = ScoreTokenizer()
@@ -69,7 +74,8 @@ def main() -> None:
     titles: dict[str, str] = {}
     errors: Counter = Counter()
     with ProcessPoolExecutor(args.workers) as pool:
-        results = pool.map(_load, [str(Path(args.dir) / n) for n in names], chunksize=64)
+        paths = [str(Path(args.dir) / n) for n in names]
+        results = pool.map(_load, paths, [args.visible_only] * len(paths), chunksize=64)
         for i, (name, result) in enumerate(zip(names, results), 1):
             if isinstance(result, str):
                 errors[result] += 1
@@ -102,6 +108,7 @@ def main() -> None:
     lengths = np.asarray(token_lengths)
     meta = {
         "tokenizer": asdict(tokenizer.config),
+        "visible_only": args.visible_only,
         "vocab_size": tokenizer.vocab_size,
         "songs": len(ids),
         "val_songs": int(is_val.sum()),

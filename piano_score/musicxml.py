@@ -223,6 +223,15 @@ def _snap(value: Fraction, divisions: int) -> Fraction:
     return value
 
 
+def _hidden_note(note: ET.Element) -> bool:
+    """楽譜に見えない音符 (再生のためだけに隠して書いたもの) と cue サイズの音符 (オッシアや省いてよい音)。
+    どちらも弾く音ではないので、演奏と組にする楽譜 (合成演奏・ATEPP / ASAP) では除く"""
+    if note.get("print-object") == "no" or note.find("cue") is not None:
+        return True
+    note_type = note.find("type")
+    return note_type is not None and note_type.get("size") == "cue"
+
+
 def _duration(note: ET.Element, grace: ET.Element | None) -> Duration | None:
     """音符の種類・付点・連符・装飾音から音価を作る。種類が書かれていない (小節全体の休符など) なら None"""
     note_type = note.findtext("type")
@@ -237,7 +246,7 @@ def _duration(note: ET.Element, grace: ET.Element | None) -> Duration | None:
 
 
 def _parse_part(
-    part: ET.Element, part_index: int, staff_offset: int, raw_measures: list[_RawMeasure]
+    part: ET.Element, part_index: int, staff_offset: int, raw_measures: list[_RawMeasure], visible_only: bool = False
 ) -> list[_RawGroup]:
     groups: list[_RawGroup] = []
     divisions = 1
@@ -343,6 +352,10 @@ def _parse_part(
                 is_chord = el.find("chord") is not None
                 grace = el.find("grace")
                 is_rest = el.find("rest") is not None
+                if visible_only and not is_rest and _hidden_note(el):
+                    if is_chord:
+                        continue  # 和音の中の 1 音だけを除く
+                    is_rest = True  # 位置は休符として進める
                 length = Fraction(int(el.findtext("duration") or 0), divisions)
                 voice = el.findtext("voice") or "1"
                 duration = _duration(el, grace)
@@ -502,8 +515,9 @@ def score_title(root: ET.Element) -> str:
     return max(credits)[1] if credits else ""
 
 
-def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[Measure]:
-    """MusicXML (パスか読み込み済みの要素) を読む。unfold=True なら反復記号を展開した演奏順の小節にする"""
+def read_musicxml(source: str | Path | ET.Element, unfold: bool = True, visible_only: bool = False) -> list[Measure]:
+    """MusicXML (パスか読み込み済みの要素) を読む。unfold=True なら反復記号を展開した演奏順の小節にする。
+    visible_only=True なら、見えない音符と cue サイズの音符 (_hidden_note) を休符として読む"""
     root = source if isinstance(source, ET.Element) else parse_xml(source)
     if root.tag != "score-partwise":
         raise ScoreError(f"{root.tag} には対応していない")
@@ -523,7 +537,7 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True) -> list[
         raise ScoreError("小節がない")
     raw_groups: list[_RawGroup] = []
     for index, (part, offset) in enumerate(zip(parts, offsets)):
-        raw_groups += _parse_part(part, index, offset, raw_measures)
+        raw_groups += _parse_part(part, index, offset, raw_measures, visible_only)
     raw_groups = [g for g in map(lambda g: _clean_group(g, raw_measures[g.measure].length), raw_groups) if g]
 
     # 声部: MuseScore の決まり (1〜4 は上段、5〜8 は下段) で本来の段を決め、段の中で 1 から振り直す。
