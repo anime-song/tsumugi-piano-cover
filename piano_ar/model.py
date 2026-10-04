@@ -9,6 +9,8 @@ Global の入力は生成済みパッチの中身そのものなので、Local �
 
 from __future__ import annotations
 
+import functools
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -100,6 +102,17 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
+@functools.cache
+def flash_varlen_available() -> bool:
+    """パッキングで attention に dropout をかけるのに使う、flash attention の可変長版があるか。
+    Linux 版の torch と Ampere 以降の GPU にはある。Windows 版の torch (2.13) にはない"""
+    return (
+        torch.cuda.is_available()
+        and torch.backends.cuda.is_flash_attention_available()
+        and torch.cuda.get_device_capability() >= (8, 0)
+    )
+
+
 def prepare_block_compile(recompile_limit: int = 64) -> None:
     """ブロック単位の torch.compile の前に、作り直しの上限を上げて、使うグラフの順番を固定する。
 
@@ -153,20 +166,30 @@ class Block(nn.Module):
         q, k = _apply_rope(q, *rope), _apply_rope(k, *rope)
         dropout = self.dropout if self.training else 0.0
         if cu_seqlens is not None:
-            # SDPA の memory-efficient attention の本体を、系列の区切り (cu_seqlens) つきで直接呼ぶ。
-            # 入力は [B, T, H, head_dim] の並び。nested tensor 経由の SDPA は compile の backward で失敗する (torch 2.13)。
-            # 連続でない入力を渡すと、compile したときの backward の勾配の並びが合わずに失敗するので contiguous にする
-            attn = torch.ops.aten._efficient_attention_forward(
-                *(t.transpose(1, 2).contiguous() for t in (q, k, v)),
-                None,
-                cu_seqlens,
-                cu_seqlens,
-                max_length,
-                max_length,
-                dropout,
-                1 if causal else 0,  # 1: 系列ごとの因果マスク (左上揃え)
-                compute_log_sumexp=torch.is_grad_enabled() and q.requires_grad,
-            )[0]
+            # SDPA の中身の attention を、系列の区切り (cu_seqlens) つきで直接呼ぶ。nested tensor 経由の SDPA は
+            # compile の backward で失敗する (torch 2.13)。連続でない入力を渡すと、compile したときの backward の勾配の並びが
+            # 合わずに失敗するので contiguous にする。
+            # dropout をかけるときは flash attention の可変長版を使う。memory-efficient attention の可変長版は、dropout の
+            # マスクが全ヘッド・全系列で同じになり (torch 2.13 で確認)、学習時の損失が 1.79 -> 2.08 に上がった
+            q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))  # [B, T, H, head_dim]
+            if dropout > 0:
+                attn = torch.ops.aten._flash_attention_forward(
+                    q[0], k[0], v[0], cu_seqlens, cu_seqlens, max_length, max_length, dropout, causal, False
+                )[0]
+            else:
+                attn = torch.ops.aten._efficient_attention_forward(
+                    q,
+                    k,
+                    v,
+                    None,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_length,
+                    max_length,
+                    0.0,
+                    1 if causal else 0,  # 1: 系列ごとの因果マスク (左上揃え)
+                    compute_log_sumexp=torch.is_grad_enabled() and q.requires_grad,
+                )[0]
             x = x + self.residual_dropout(self.attn_out(attn.reshape(batch, length, dim)))
         else:
             # 因果マスクとパディングマスクを同時に使う場面はない (因果側は右詰めのパディングで結果に影響しない)
@@ -491,6 +514,10 @@ class PianoARModel(nn.Module):
         packed = num_length_buckets == 0
         if packed and condition is not None:
             raise ValueError("パッキング (num_length_buckets=0) は条件 (cross-attention) のない学習でだけ使える")
+        if packed and self.training and self.config.dropout > 0 and not flash_varlen_available():
+            # memory-efficient attention の可変長版は dropout のマスクが正しくないので (Block.forward)、塊 4 つに戻す
+            warnings.warn("flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2)
+            packed, num_length_buckets = False, 4
         tokens = batch["tokens"]
         valid = batch["patch_valid"]
         patch_loss = batch["patch_loss"] & valid if "patch_loss" in batch else valid
