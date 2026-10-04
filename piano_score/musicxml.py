@@ -12,6 +12,7 @@ import copy
 import math
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -503,10 +504,21 @@ def _clean_group(group: _RawGroup, length: Fraction) -> _RawGroup | None:
 
 
 def parse_xml(path: str | Path) -> ET.Element:
+    """MusicXML を読む。圧縮された .mxl (zip の中の META-INF/container.xml が本体を指す) も読める
+    (拡張子が .mxl でも zip でなければ、そのまま XML として読む)"""
     try:
+        if str(path).lower().endswith(".mxl") and zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                container = ET.fromstring(archive.read("META-INF/container.xml"))
+                rootfile = container.find(".//rootfile")
+                if rootfile is None:
+                    raise ScoreError(".mxl の本体が見つからない")
+                return ET.fromstring(archive.read(rootfile.get("full-path")))
         return ET.parse(path).getroot()
     except ET.ParseError as e:
         raise ScoreError(f"XML として読めない: {e}")
+    except (zipfile.BadZipFile, KeyError) as e:
+        raise ScoreError(f".mxl として読めない: {e}")
 
 
 def score_title(root: ET.Element) -> str:
