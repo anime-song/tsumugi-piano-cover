@@ -338,8 +338,8 @@ class PairCache(ScoreCache):
         config["fraction_denominators"] = tuple(config["fraction_denominators"])
         self.tokenizer_config = ScoreTokenizerConfig(**config)
         self._tokens = None
-        self.notes = np.load(self.cache_dir / "notes.npy")
-        self.pedal = np.load(self.cache_dir / "pedal.npy")
+        self._notes: np.ndarray | None = None
+        self._pedal: np.ndarray | None = None
 
     def song_starts(self, song: int) -> np.ndarray:
         """各小節の開始時刻 (秒、演奏の最初の音 = 0)"""
@@ -350,9 +350,18 @@ class PairCache(ScoreCache):
         return self.lengths[self.measure_offsets[song] : self.measure_offsets[song + 1]].astype(np.float64)
 
     def performance(self, song: int) -> tuple[np.ndarray, np.ndarray]:
-        notes = self.notes[self.note_offsets[song] : self.note_offsets[song + 1]].astype(np.float64)
-        pedal = self.pedal[self.pedal_offsets[song] : self.pedal_offsets[song + 1]].astype(np.float64)
+        # 演奏の音は大きい (PERiScoPe で約 1.5GB) ので、DataLoader の各ワーカーで遅延して mmap で開く
+        if self._notes is None:
+            self._notes = np.load(self.cache_dir / "notes.npy", mmap_mode="r")
+            self._pedal = np.load(self.cache_dir / "pedal.npy", mmap_mode="r")
+        notes = np.asarray(self._notes[self.note_offsets[song] : self.note_offsets[song + 1]], dtype=np.float64)
+        pedal = np.asarray(self._pedal[self.pedal_offsets[song] : self.pedal_offsets[song + 1]], dtype=np.float64)
         return notes, pedal
+
+    def __getstate__(self) -> dict:
+        state = super().__getstate__()
+        state["_notes"] = state["_pedal"] = None
+        return state
 
 
 class RealWindowDataset(SynthWindowDataset):
