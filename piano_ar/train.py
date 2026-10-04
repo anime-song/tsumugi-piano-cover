@@ -81,7 +81,12 @@ def build_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-grad-checkpoint", action="store_true", help="gradient checkpointing を切る (速いがメモリを大きく使う)"
     )
-    parser.add_argument("--length-buckets", type=int, default=8, help="パッチを長さ順に何個の塊に分けて処理するか")
+    parser.add_argument(
+        "--length-buckets",
+        type=int,
+        default=8,
+        help="パッチを長さ順に何個の塊に分けて処理するか。0 でパディングせずに 1 本につなげて通す (パッキング、速い)",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
