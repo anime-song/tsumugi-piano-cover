@@ -347,6 +347,10 @@ def main() -> None:
     parser.add_argument("--val-songs", type=int, default=0, help="検証曲を合成演奏にして楽譜に戻す曲数")
     parser.add_argument("--val-measures", type=int, default=16, help="--val-songs で使う冒頭の小節数")
     parser.add_argument("--cache-dir", default="data/piano_score/synth")
+    parser.add_argument("--true-tempo", action="store_true", help="--val-songs で、最初の小節の本当のテンポを渡す")
+    parser.add_argument(
+        "--val-real-cache", default=None, help="実演奏の組のキャッシュ (asap.py)。渡すと --val-songs はその検証の組を使う"
+    )
     parser.add_argument("--out-dir", default="outputs/perf2score")
     parser.add_argument("--max-measures", type=int, default=1000)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -360,9 +364,10 @@ def main() -> None:
     banned = unseen_tokens(checkpoint["token_counts"], tokenizer) if checkpoint.get("token_counts") is not None else None
     options = {"temperature": args.temperature, "top_p": args.top_p, "banned": banned, "first_qpm": args.first_qpm}
 
-    def run(performance: Performance, max_measures: int) -> list[list[int]]:
+    def run(performance: Performance, max_measures: int, first_qpm: float | None = None) -> list[list[int]]:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            return transcribe(model, tokenizer, performance, max_measures=max_measures, **options)
+            given = {"first_qpm": first_qpm} if first_qpm is not None else {}
+            return transcribe(model, tokenizer, performance, max_measures=max_measures, **(options | given))
 
     if args.midi:
         patches = run(read_performance(args.midi), args.max_measures)
@@ -372,24 +377,18 @@ def main() -> None:
     if args.val_songs:
         import pretty_midi
 
-        from piano_score.data import ScoreCache
-
-        from .data import SynthWindowDataset
-
-        cache = ScoreCache(args.cache_dir)
-        dataset = SynthWindowDataset(cache, split="val", window_measures=args.val_measures, context_measures=0)
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        for k in range(args.val_songs):
-            song = int(dataset.songs[k])
-            n = min(cache.num_measures(song), args.val_measures)
-            bodies = cache.measure_tokens(song, 0, n)
-            reference, _ = tokenizer.decode([[tokenizer.ids[("mtime", 0)], *b.tolist()] for b in bodies])
-            performance = render(
-                reference, np.random.default_rng(song), qpm=measure_qpm(reference, cache.song_seconds(song)[: n + 1])
-            )
-            patches = run(performance, 4 * n)  # 拍子を短く読むと小節が増えるので多めに
-            name = f"val{k}_{cache.ids[song]}"
+        items = real_val_items(args) if args.val_real_cache else synth_val_items(args)
+        for k, (song_id, reference, performance) in enumerate(items):
+            n = len(reference)
+            first_qpm = None
+            if args.true_tempo and len(performance.measure_starts) > 1:
+                # 最初の小節の本当のテンポを渡す (テンポの選び方と、その後の採譜の良し悪しを分けて見る)
+                span = float(performance.measure_starts[1] - performance.measure_starts[0])
+                first_qpm = 60.0 * float(reference[0].length) / max(span, 1e-3)
+            patches = run(performance, 4 * n, first_qpm)  # 拍子を短く読むと小節が増えるので多めに
+            name = f"val{k}_{song_id}"
             write_musicxml(reference, out_dir / f"{name}_reference.musicxml")
             write_musicxml(tokenizer.decode(patches)[0], out_dir / f"{name}_generated.musicxml")
             midi = pretty_midi.PrettyMIDI()
@@ -401,6 +400,49 @@ def main() -> None:
             midi.instruments.append(piano)
             midi.write(str(out_dir / f"{name}.mid"))
             print(f"{name}: 元 {n} 小節 / 生成 {len(patches)} 小節")
+
+
+def synth_val_items(args: argparse.Namespace):
+    """合成演奏の検証曲: (名前, 冒頭 val_measures 小節の楽譜, それを描き出した演奏)"""
+    from piano_score.data import ScoreCache
+
+    from .data import SynthWindowDataset
+
+    cache = ScoreCache(args.cache_dir)
+    tokenizer = ScoreTokenizer(cache.tokenizer_config)
+    dataset = SynthWindowDataset(cache, split="val", window_measures=args.val_measures, context_measures=0)
+    for k in range(min(args.val_songs, len(dataset))):
+        song = int(dataset.songs[k])
+        n = min(cache.num_measures(song), args.val_measures)
+        bodies = cache.measure_tokens(song, 0, n)
+        reference, _ = tokenizer.decode([[tokenizer.ids[("mtime", 0)], *b.tolist()] for b in bodies])
+        performance = render(
+            reference, np.random.default_rng(song), qpm=measure_qpm(reference, cache.song_seconds(song)[: n + 1])
+        )
+        yield str(cache.ids[song]), reference, performance
+
+
+def real_val_items(args: argparse.Namespace):
+    """実演奏の検証の組: (名前, 冒頭 val_measures 小節の楽譜, その小節までの演奏)。
+    曲が偏らないよう、曲ごとに 1 つずつ順に選ぶ"""
+    from .data import SEGMENT_MARGIN, PairCache, pedal_between
+
+    cache = PairCache(args.val_real_cache)
+    tokenizer = ScoreTokenizer(cache.tokenizer_config)
+    by_piece: dict[str, list[int]] = {}
+    for song in np.flatnonzero(cache.is_val):
+        by_piece.setdefault(str(cache.pieces[song]), []).append(int(song))
+    order = [songs[i] for i in range(max(map(len, by_piece.values()))) for songs in by_piece.values() if i < len(songs)]
+    for song in order[: args.val_songs]:
+        n = min(cache.num_measures(song), args.val_measures)
+        bodies = cache.measure_tokens(song, 0, n)
+        reference, _ = tokenizer.decode([[tokenizer.ids[("mtime", 0)], *b.tolist()] for b in bodies])
+        starts = cache.song_starts(song)
+        end = starts[n] - SEGMENT_MARGIN if n < len(starts) else np.inf
+        notes, pedal = cache.performance(song)
+        performance = Performance(notes[notes[:, 0] < end], pedal_between(pedal, -np.inf, end), starts[:n])
+        song_id = str(cache.ids[song]).replace(".mid", "").replace("/", "_").replace("#", "_")
+        yield song_id, reference, performance
 
 
 if __name__ == "__main__":
