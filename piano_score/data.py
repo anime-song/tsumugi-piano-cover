@@ -213,6 +213,12 @@ def make_sampler(
 
     rare_meter_weight > 1 なら、珍しい拍子か変拍子を含む曲 (rare_meter_songs) をその倍率だけ選ばれやすくする。
     """
+    weights = sampler_weights(dataset, rare_meter_weight)
+    return WeightedRandomSampler(torch.from_numpy(weights), num_samples=num_samples, replacement=True)
+
+
+def sampler_weights(dataset: ScoreWindowDataset, rare_meter_weight: float = 1.0) -> np.ndarray:
+    """make_sampler の曲ごとの重み [len(dataset)]"""
     offsets = dataset.cache.measure_offsets
     weights = (offsets[dataset.songs + 1] - offsets[dataset.songs]).astype(np.float64)
     if rare_meter_weight != 1.0:
@@ -220,4 +226,4 @@ def make_sampler(
         before = weights[rare].sum() / weights.sum()
         weights[rare] *= rare_meter_weight
         print(f"珍しい拍子・変拍子の曲 {rare.mean():.1%}: 選ばれる割合 {before:.1%} -> {weights[rare].sum() / weights.sum():.1%}")
-    return WeightedRandomSampler(torch.from_numpy(weights), num_samples=num_samples, replacement=True)
+    return weights

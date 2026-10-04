@@ -15,17 +15,28 @@ MTIME の正解は描き出した小節線の時刻から作る (演奏の最初
 曲の最初の小節には前の小節がないので、4 分音符の長さはその小節の本当の長さから求め、学習ではずらす (FIRST_SPQ_NOISE)。
 生成ではいくつかのテンポを試して、モデルがいちばん確からしいとするものを選ぶ (generate.transcribe)。
 固定のテンポ (♩=120) を仮定すると、遅い曲を倍の速さの音価で書く (16 分を 8 分で、小節を半分の長さで) 誤りになるため。
+
+小節の基準のずれ (RefNoise、学習だけ): 生成では前の小節の開始を自分で決めるので、一度ずれると次の小節の基準もずれる。
+学習では基準がいつも正しいので、そこから戻ることを学ばない。そこで一部の小節で基準 (前の小節の開始) をわざとずらし、
+MTIME の正解をずらした基準から測り直す (本当の小節線に戻る値にする)。4 分音符の長さの見積もりも、ずれた基準から求める。
+
+3 段目 (実演奏): PairCache (asap.py が作るキャッシュ) と RealWindowDataset。演奏は描き出さずに、キャッシュの演奏から
+窓の前 context_measures 小節〜窓の 1 小節後の分を切り出す。小節の開始時刻はキャッシュの注釈から。
 """
 
 from __future__ import annotations
 
+import json
 import math
 import random
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from piano_score.config import ScoreTokenizerConfig
 from piano_score.data import ScoreAugmentConfig, ScoreCache
 from piano_score.tokenizer import PAD, ScoreTokenizer
 
@@ -108,6 +119,103 @@ def patch_rows(
     return out_features, out_onset, valid
 
 
+@dataclass(frozen=True)
+class RefNoise:
+    """小節の基準のずれ。prob の割合の小節で、前の小節の開始を「前の小節の長さ x N(0, sigma)」(±limit で切る) だけずらす"""
+
+    prob: float = 0.15
+    sigma: float = 0.15
+    limit: float = 0.4
+
+
+def measure_times(
+    tokenizer: ScoreTokenizer, starts: np.ndarray, noisy: np.ndarray | None = None, noise: RefNoise | None = None
+) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """各小節の本当の開始時刻 (秒、最初の音 = 0) -> (MTIME のビン, 戻した開始時刻 (フレーム), 基準の時刻 (フレーム))。
+
+    tokenizer.mtime_bins と同じく前の小節は丸めた後の時刻から測る。noisy [M] (bool) の小節は、基準を noise だけずらし、
+    MTIME はずらした基準から本当の開始までにする"""
+    values = tokenizer.mtime_values
+    bins: list[int] = []
+    decoded = np.zeros(len(starts))
+    ref = np.zeros(len(starts))
+    for k, start in enumerate(starts):
+        if k == 0:
+            b = tokenizer.mtime_bin(max(-float(start), 0.0))
+            decoded[k] = -values[b]
+        else:
+            ref[k] = decoded[k - 1]
+            if noisy is not None and noisy[k] and noise is not None:
+                span = float(starts[k] - starts[k - 1])
+                ref[k] += span * float(np.clip(random.gauss(0.0, noise.sigma), -noise.limit, noise.limit))
+            b = tokenizer.mtime_bin(max(float(start) - ref[k], 0.0))
+            decoded[k] = ref[k] + values[b]
+        bins.append(b)
+    return bins, decoded * FRAMES_PER_SECOND, ref * FRAMES_PER_SECOND
+
+
+def make_item(
+    tokenizer: ScoreTokenizer,
+    vocab: PerformanceVocab,
+    bodies: list[np.ndarray],
+    lengths: np.ndarray,
+    performance: Performance,
+    *,
+    start: int,
+    stop: int,
+    first: int,
+    window_measures: int,
+    max_rows: int,
+    train: bool,
+    noise: RefNoise | None,
+) -> dict[str, torch.Tensor]:
+    """窓の前の文脈 first..start-1・窓 start..stop-1・その後ろの小節のトークン列 (bodies、MTIME なし) と、それを弾いた演奏
+    (measure_starts は bodies と同じ小節の並び) から、学習の 1 件を作る"""
+    W = window_measures
+    window = range(start - first, stop - first)
+    noisy = None
+    if noise is not None and train and noise.prob > 0:
+        # DataLoader のワーカーごとに種が変わるのは random の方なので、numpy の乱数は使わない
+        noisy = np.zeros(len(bodies), dtype=bool)
+        noisy[list(window)] = [random.random() < noise.prob for _ in window]
+    bins, decoded, ref_all = measure_times(tokenizer, performance.measure_starts, noisy, noise)
+    ref = np.array([ref_all[k] for k in window])
+    spq = np.array([(decoded[k] - ref_all[k]) / lengths[k - 1] if k > 0 else DEFAULT_SPQ for k in window])
+    if start == 0 and len(decoded) > 1:
+        spq[0] = (decoded[1] - decoded[0]) / lengths[0]
+        if train:
+            spq[0] *= math.exp(random.gauss(0.0, FIRST_SPQ_NOISE))
+
+    L = tokenizer.config.max_patch_tokens
+    mtime_first = tokenizer.ids[("mtime", 0)]
+    tokens = np.full((W, L), PAD, dtype=np.int64)
+    for i, k in enumerate(window):
+        sequence = np.concatenate([[mtime_first + bins[k]], bodies[k]])
+        if len(sequence) > L:
+            sequence = np.concatenate([sequence[: L - 1], sequence[-1:]])
+        tokens[i, : len(sequence)] = sequence
+    patch_valid = np.zeros(W, dtype=bool)
+    patch_valid[: stop - start] = True
+
+    features, onset = vocab.rows(performance)
+    end_frame = int(onset.max()) + 1 if len(onset) else 1
+    perf_features, perf_onset, perf_valid = patch_rows(features, onset, max_rows, end_frame)
+    pad = W - len(window)
+    return {
+        "tokens": torch.from_numpy(tokens),
+        "patch_valid": torch.from_numpy(patch_valid),
+        "pedal_state": torch.zeros(W, dtype=torch.long),
+        "channel": torch.tensor(0),
+        "song_start": torch.tensor(int(start == 0)),
+        "measure_ref": torch.from_numpy(np.pad(ref, (0, pad))).float(),
+        "measure_start": torch.from_numpy(np.pad(decoded[list(window)], (0, pad))).float(),
+        "measure_spq": torch.from_numpy(np.pad(spq, (0, pad), constant_values=DEFAULT_SPQ)).float(),
+        "perf_features": torch.from_numpy(perf_features),
+        "perf_onset": torch.from_numpy(perf_onset),
+        "perf_valid": torch.from_numpy(perf_valid),
+    }
+
+
 class SynthWindowDataset(Dataset):
     """楽譜の窓と、その場で描き出した合成演奏の組。
 
@@ -127,11 +235,13 @@ class SynthWindowDataset(Dataset):
         song_start_prob: float = 0.2,
         max_rows: int = 160,
         songs: np.ndarray | None = None,
+        ref_noise: RefNoise | None = None,
     ) -> None:
         self.cache = cache
         self.tokenizer = ScoreTokenizer(cache.tokenizer_config)
         self.window_measures = window_measures
         self.context_measures = context_measures
+        self.ref_noise = ref_noise
         self.render_config = render_config
         self.train = split == "train"
         self.augment = augment if self.train else None
@@ -171,44 +281,11 @@ class SynthWindowDataset(Dataset):
         performance = render(measures, rng, self.render_config, qpm)
 
         # MTIME: 描き出した小節線の時刻から。窓の外 (前の文脈) の分も通して求めて、窓の分だけ使う
-        bins = self.tokenizer.mtime_bins(performance.measure_starts)
-        decoded = self.tokenizer.decode_starts(bins) * FRAMES_PER_SECOND
         lengths = np.array([float(m.length) for m in measures])
-        window = range(start - first, stop - first)
-        ref = np.array([decoded[k - 1] if k > 0 else 0.0 for k in window])
-        spq = np.array([(decoded[k] - decoded[k - 1]) / lengths[k - 1] if k > 0 else DEFAULT_SPQ for k in window])
-        if start == 0 and len(decoded) > 1:
-            spq[0] = (decoded[1] - decoded[0]) / lengths[0]
-            if self.train:
-                spq[0] *= math.exp(random.gauss(0.0, FIRST_SPQ_NOISE))
-
-        L = self.tokenizer.config.max_patch_tokens
-        tokens = np.full((W, L), PAD, dtype=np.int64)
-        for i, k in enumerate(window):
-            sequence = np.concatenate([[self.mtime_first + bins[k]], bodies[k]])
-            if len(sequence) > L:
-                sequence = np.concatenate([sequence[: L - 1], sequence[-1:]])
-            tokens[i, : len(sequence)] = sequence
-        patch_valid = np.zeros(W, dtype=bool)
-        patch_valid[: stop - start] = True
-
-        features, onset = self.vocab.rows(performance)
-        end_frame = int(onset.max()) + 1 if len(onset) else 1
-        perf_features, perf_onset, perf_valid = patch_rows(features, onset, self.max_rows, end_frame)
-        pad = W - len(window)
-        return {
-            "tokens": torch.from_numpy(tokens),
-            "patch_valid": torch.from_numpy(patch_valid),
-            "pedal_state": torch.zeros(W, dtype=torch.long),
-            "channel": torch.tensor(0),
-            "song_start": torch.tensor(int(start == 0)),
-            "measure_ref": torch.from_numpy(np.pad(ref, (0, pad))).float(),
-            "measure_start": torch.from_numpy(np.pad(decoded[list(window)], (0, pad))).float(),
-            "measure_spq": torch.from_numpy(np.pad(spq, (0, pad), constant_values=DEFAULT_SPQ)).float(),
-            "perf_features": torch.from_numpy(perf_features),
-            "perf_onset": torch.from_numpy(perf_onset),
-            "perf_valid": torch.from_numpy(perf_valid),
-        }
+        return make_item(
+            self.tokenizer, self.vocab, bodies, lengths, performance, start=start, stop=stop, first=first,
+            window_measures=W, max_rows=self.max_rows, train=self.train, noise=self.ref_noise,
+        )  # fmt: skip
 
     def _transpose(self, measures: list[np.ndarray], shift: int) -> list[np.ndarray]:
         """piano_score.data.ScoreWindowDataset._transpose と同じ。綴れない音や 88 鍵の外に出る音があれば移調しない"""
@@ -224,6 +301,114 @@ class SynthWindowDataset(Dataset):
         if any((m < 0).any() for m in moved):
             return measures
         return moved
+
+
+SEGMENT_MARGIN = 0.1  # 窓の頭の小節線より前に始まる音 (装飾音・ずれ) も、この秒数までは窓の演奏に入れる
+
+
+def pedal_between(pedal: np.ndarray, t0: float, t1: float) -> np.ndarray:
+    """t0..t1 のペダルの踏み・離し [K, 2]。t0 で踏んだままなら、t0 に踏む行を足す"""
+    if not len(pedal):
+        return np.zeros((0, 2))
+    before = pedal[pedal[:, 0] < t0]
+    inside = pedal[(pedal[:, 0] >= t0) & (pedal[:, 0] < t1)]
+    if len(before) and before[-1, 1] > 0 and np.isfinite(t0):
+        inside = np.concatenate([[[t0, 1.0]], inside])
+    return np.asarray(inside, dtype=np.float64).reshape(-1, 2)
+
+
+class PairCache(ScoreCache):
+    """実演奏と楽譜の組のキャッシュ (asap.py が作るもの)。楽譜の側は ScoreCache と同じ読み方 (measure_tokens など)"""
+
+    def __init__(self, cache_dir: str | Path) -> None:
+        self.cache_dir = Path(cache_dir)
+        songs = np.load(self.cache_dir / "songs.npz")
+        self.measure_offsets = songs["measure_offsets"]
+        self.note_offsets = songs["note_offsets"]
+        self.pedal_offsets = songs["pedal_offsets"]
+        self.ids = songs["ids"]
+        self.pieces = songs["pieces"]
+        self.is_val = songs["is_val"]
+        measures = np.load(self.cache_dir / "measures.npz")
+        self.token_offsets = measures["token_offsets"]
+        self.starts = measures["starts"]
+        self.lengths = measures["lengths"]
+        self.meta = json.loads((self.cache_dir / "meta.json").read_text(encoding="utf-8"))
+        config = dict(self.meta["tokenizer"])
+        config["fraction_denominators"] = tuple(config["fraction_denominators"])
+        self.tokenizer_config = ScoreTokenizerConfig(**config)
+        self._tokens = None
+        self.notes = np.load(self.cache_dir / "notes.npy")
+        self.pedal = np.load(self.cache_dir / "pedal.npy")
+
+    def song_starts(self, song: int) -> np.ndarray:
+        """各小節の開始時刻 (秒、演奏の最初の音 = 0)"""
+        return self.starts[self.measure_offsets[song] : self.measure_offsets[song + 1]].astype(np.float64)
+
+    def song_lengths(self, song: int) -> np.ndarray:
+        """各小節の長さ (4 分音符単位)"""
+        return self.lengths[self.measure_offsets[song] : self.measure_offsets[song + 1]].astype(np.float64)
+
+    def performance(self, song: int) -> tuple[np.ndarray, np.ndarray]:
+        notes = self.notes[self.note_offsets[song] : self.note_offsets[song + 1]].astype(np.float64)
+        pedal = self.pedal[self.pedal_offsets[song] : self.pedal_offsets[song + 1]].astype(np.float64)
+        return notes, pedal
+
+
+class RealWindowDataset(SynthWindowDataset):
+    """実演奏と楽譜の組の窓。窓の取り方・移調は SynthWindowDataset と同じで、演奏は描き出さずにキャッシュから切り出す。
+
+    学習では演奏全体の速さも tempo_range (倍率、対数で一様) で変える (メトロノーム記号の数値も合わせて変える)"""
+
+    def __init__(self, cache: PairCache, *, tempo_range: tuple[float, float] = (0.85, 1.18), **kwargs) -> None:
+        super().__init__(cache, **kwargs)
+        self.tempo_range = tempo_range
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        cache: PairCache = self.cache  # type: ignore[assignment]
+        song = int(self.songs[index])
+        num_measures = cache.num_measures(song)
+        W = self.window_measures
+        song_start = not self.train or random.random() < self.song_start_prob
+        start = 0 if song_start else random.randint(0, max(0, num_measures - W // 2))
+        stop = min(num_measures, start + W)
+        first = max(0, start - self.context_measures)
+        last = min(num_measures, stop + 1)  # 窓の後の 1 小節も演奏に入れる
+
+        starts = cache.song_starts(song)
+        notes, pedal = cache.performance(song)
+        t0 = starts[first] - SEGMENT_MARGIN if first > 0 else -np.inf
+        t1 = starts[last] - SEGMENT_MARGIN if last < num_measures else np.inf
+        inside = (notes[:, 0] >= t0) & (notes[:, 0] < t1)
+        notes = notes[inside]
+        origin = float(notes[:, 0].min()) if len(notes) else float(starts[first])
+        notes[:, :2] -= origin
+        pedal = pedal_between(pedal, t0, t1)
+        pedal[:, 0] -= origin
+        measure_starts = starts[first:last] - origin
+
+        bodies = cache.measure_tokens(song, first, last)
+        if self.train:
+            low, high = self.tempo_range
+            factor = math.exp(random.uniform(math.log(low), math.log(high)))
+            if factor != 1.0:
+                notes[:, :2] *= factor
+                pedal[:, 0] *= factor
+                measure_starts = measure_starts * factor
+                bodies = [self.tokenizer.scale_metronome(b, factor) for b in bodies]
+        if self.augment is not None and self.augment.transpose > 0:
+            shift = random.randint(-self.augment.transpose, self.augment.transpose)
+            pitches = notes[:, 2] + shift
+            if shift and len(notes) and pitches.min() >= 21 and pitches.max() <= 108:
+                moved = self._transpose(bodies, shift)
+                if moved is not bodies:  # 楽譜を移調できたときだけ演奏も移調する
+                    bodies, notes[:, 2] = moved, pitches
+        lengths = cache.song_lengths(song)[first:last]
+        performance = Performance(notes, pedal, measure_starts)
+        return make_item(
+            self.tokenizer, self.vocab, bodies, lengths, performance, start=start, stop=stop, first=first,
+            window_measures=W, max_rows=self.max_rows, train=self.train, noise=self.ref_noise,
+        )  # fmt: skip
 
 
 def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
