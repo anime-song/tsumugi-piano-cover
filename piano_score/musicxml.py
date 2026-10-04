@@ -523,9 +523,12 @@ def score_title(root: ET.Element) -> str:
     return max(credits)[1] if credits else ""
 
 
-def read_musicxml(source: str | Path | ET.Element, unfold: bool = True, visible_only: bool = False) -> list[Measure]:
+def read_musicxml(
+    source: str | Path | ET.Element, unfold: bool = True, visible_only: bool = False, order: list[int] | None = None
+) -> list[Measure]:
     """MusicXML (パスか読み込み済みの要素) を読む。unfold=True なら反復記号を展開した演奏順の小節にする。
-    visible_only=True なら、見えない音符と cue サイズの音符 (_hidden_note) を休符として読む"""
+    visible_only=True なら、見えない音符と cue サイズの音符 (_hidden_note) を休符として読む。
+    order (MusicXML の小節の並びの番号、0 から) を渡すと、反復記号の代わりにその順に並べる (実際の演奏が弾いた順など)"""
     root = source if isinstance(source, ET.Element) else parse_xml(source)
     if root.tag != "score-partwise":
         raise ScoreError(f"{root.tag} には対応していない")
@@ -654,11 +657,11 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True, visible_
 
     for measure in measures:
         _check_voices(measure)
-    if unfold:
+    if unfold or order is not None:
         # 2 回目以降に出てくる小節は別のものにする (スラーの後始末で塊ごとに数を変えるため)
         seen: set[int] = set()
         unfolded = []
-        for i in _unfold(raw_measures):
+        for i in _unfold(raw_measures) if order is None else order:
             unfolded.append(copy.deepcopy(measures[i]) if i in seen else measures[i])
             seen.add(i)
         measures = unfolded
