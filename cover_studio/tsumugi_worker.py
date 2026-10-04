@@ -73,6 +73,66 @@ def stream_notes(infer_stem) -> None:
     infer_stem.resolve_stem_model_type = resolve_stem_model_type
 
 
+def stream_separation(infer_stem) -> None:
+    """ステム分離の進み具合を "@@progress {json}" の行で流す。
+
+    run_stem_separated_transcription は分離モデルを直接呼ぶので、_separate_one_file を包んで
+    モデルの forward が呼ばれた回数 (分離し終えた塊の数) を数える。塊の総数は stem_splitter の
+    切り方と同じ計算で先に出しておく (tsumugi の streaming.pipeline と同じやり方)。
+    分離モデルを外から包めない tsumugi では何もしない (採譜はできる)。
+    """
+    original = getattr(infer_stem, "_separate_one_file", None)
+    if original is None:
+        return
+    import math
+
+    import torch
+
+    try:
+        import soundfile as sf
+    except ImportError:  # 音の長さが読めないので進み具合は出せない
+        return
+
+    def batch_count(path, sep_config) -> int:
+        info = sf.info(str(path))
+        total = int(info.frames)
+        if int(info.samplerate) != int(sep_config.target_sample_rate):
+            total = int(round(total * int(sep_config.target_sample_rate) / int(info.samplerate)))
+        chunk = int(sep_config.chunk_size)
+        hop = int(sep_config.hop_size) if sep_config.hop_size else chunk // 2
+        if total <= chunk:
+            padded = chunk
+        else:
+            padded = math.ceil((total - chunk) / hop) * hop + chunk
+        starts = len(range(0, padded - chunk + 1, hop))
+        return max(1, math.ceil(starts / max(1, int(sep_config.batch_size))))
+
+    class CountingSeparator(torch.nn.Module):
+        """分離モデルを包んで、塊を 1 つ処理するごとに進み具合を流す"""
+
+        def __init__(self, inner: torch.nn.Module, total: int) -> None:
+            super().__init__()
+            self.inner = inner
+            self.total = total
+            self.done = 0
+
+        def forward(self, batch):  # type: ignore[override]
+            output = self.inner(batch)
+            self.done += 1
+            emit("progress", {"stage": "separate", "done": self.done, "total": self.total})
+            return output
+
+    def separate_one_file(prepared, stem_dir, sep_config, sep_model, device, dtype):
+        try:
+            total = batch_count(prepared, sep_config)
+        except Exception:  # 塊の数が分からないときは進み具合なしで今まで通り分離する
+            return original(prepared, stem_dir, sep_config, sep_model, device, dtype)
+        emit("progress", {"stage": "separate", "done": 0, "total": total})
+        return original(prepared, stem_dir, sep_config, CountingSeparator(sep_model, total), device, dtype)
+
+    infer_stem._separate_one_file = separate_one_file
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tsumugi-dir", required=True, help="tsumugi のリポジトリ (チェックポイントもここに置かれる)")
@@ -109,6 +169,7 @@ def main() -> None:
         free, total = torch.cuda.mem_get_info()
         torch.cuda.set_per_process_memory_fraction(free * args.gpu_memory_limit / total)
         print(f"VRAM の上限 {free * args.gpu_memory_limit / 1e9:.1f}GB", flush=True)
+    stream_separation(infer_stem)
     stream_notes(infer_stem)
 
     try:

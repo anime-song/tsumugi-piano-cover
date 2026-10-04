@@ -1923,6 +1923,27 @@ input[type="range"]:disabled {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+/* 今の段階の進み具合 (塊の数)。数字が動いても幅が変わらないように tabular-nums */
+.live-stage-count {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.live-bar {
+  height: 4px;
+  margin: -4px 0 10px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.live-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
 .live-roll {
   display: block;
   width: 100%;

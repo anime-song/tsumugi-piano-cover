@@ -1,7 +1,7 @@
 // 採譜中に確定したノートを、曲全体のピアノロールに順に描く。ステムは 1 つずつ左から右へ採譜されていく。
 // 原曲の音源を再生していれば再生位置も出し、クリックでそこへ移る
 import { useEffect, useRef, useState } from "react";
-import { ApiError, api, type LiveStem } from "../api";
+import { ApiError, api, type LiveProgress, type LiveStem } from "../api";
 import { useT } from "../i18n";
 import type { Player } from "../player";
 import { CANVAS_FONT } from "./PianoRoll";
@@ -25,6 +25,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   const seq = useRef(0);
   const [stems, setStems] = useState<LiveStem[]>([]);
   const [stage, setStage] = useState<string | null>(null);
+  const [progress, setProgress] = useState<LiveProgress | null>(null);
   const [unsupported, setUnsupported] = useState(false);
   const stemsRef = useRef<LiveStem[]>([]);
   stemsRef.current = stems;
@@ -43,6 +44,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
         seq.current = live.seq;
         setStems(live.stems);
         setStage(live.stage);
+        setProgress(live.progress);
         if (!live.active && !active) return;
       } catch (e) {
         // 古いサーバ (この API がない) なら出さない。それ以外は一時的なものとして次で取り直す
@@ -141,10 +143,21 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
           return (
             <span key={s} className={`live-stage ${state}`}>
               {stageNames[s]}
+              {/* 今の段階に進み具合があれば、塊の数も出す (ステム分離が長いので) */}
+              {i === index && progress && progress.total > 0 && (
+                <span className="live-stage-count">
+                  {progress.done}/{progress.total}
+                </span>
+              )}
             </span>
           );
         })}
       </div>
+      {progress && progress.total > 0 && (
+        <div className="live-bar" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.done}>
+          <i style={{ width: `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` }} />
+        </div>
+      )}
       <canvas
         ref={canvasRef}
         className="live-roll"
