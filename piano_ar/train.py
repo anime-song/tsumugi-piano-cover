@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader
 
 from .config import ModelConfig
@@ -189,13 +191,13 @@ def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str,
 
 
 @torch.no_grad()
-def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device) -> dict[str, float]:
+def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device, length_buckets: int = 8) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
     count = 0
     for batch in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            output = model(to_device(batch, device))
+            output = model(to_device(batch, device), length_buckets)
         tokens = int(output["tokens"])
         for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS]):
             sums[key] = sums.get(key, 0.0) + float(output[key]) * tokens
@@ -432,24 +434,41 @@ def main() -> None:
             wandb_run.summary.update({f"reference_stats/{k}": v for k, v in reference.items()})
             print("[reference] " + " ".join(f"{k} {v:.2f}" for k, v in reference.items()))
 
+    saver: threading.Thread | None = None
+
+    def wait_for_save() -> None:
+        if saver is not None:
+            saver.join()
+
     def save(path: Path) -> None:
-        # 書き込みの途中で止まっても前のチェックポイントが残るよう、別名に書いてから置き換える
-        partial = path.with_name(path.name + ".partial")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "model_config": asdict(model_config),
-                "tokenizer_config": asdict(cache.tokenizer_config),
-                "channel_index": cache.meta.get("channel_index"),
-                "args": vars(args),
-                "wandb_id": wandb_run.id if wandb_run else None,
-                "best_val_loss": best_val_loss,
-            },
-            partial,
-        )
-        partial.replace(path)
+        """重みと optimizer の状態を CPU に写してから、ファイルへの書き込み (2.5GB、ネットワークのディスクだと数秒以上) は
+        別スレッドで行い、学習を止める時間を写す分 (1 秒弱) だけにする。書き込みは同時に 1 つまで"""
+        nonlocal saver
+
+        def to_cpu(value):
+            return value.detach().to("cpu", copy=True) if isinstance(value, torch.Tensor) else value
+
+        state = {
+            "model": tree_map(to_cpu, model.state_dict()),
+            "optimizer": tree_map(to_cpu, optimizer.state_dict()),
+            "step": step,
+            "model_config": asdict(model_config),
+            "tokenizer_config": asdict(cache.tokenizer_config),
+            "channel_index": cache.meta.get("channel_index"),
+            "args": vars(args),
+            "wandb_id": wandb_run.id if wandb_run else None,
+            "best_val_loss": best_val_loss,
+        }
+
+        def write() -> None:
+            # 書き込みの途中で止まっても前のチェックポイントが残るよう、別名に書いてから置き換える
+            partial = path.with_name(path.name + ".partial")
+            torch.save(state, partial)
+            partial.replace(path)
+
+        wait_for_save()
+        saver = threading.Thread(target=write)
+        saver.start()
 
     # 再開時は、サンプラーが作る曲の並びのうち済んだ分を読み飛ばさずに新しい乱数で続ける
     loader_iter = iter(train_loader)
@@ -493,8 +512,8 @@ def main() -> None:
             running, running_tokens, last_log = {}, 0, time.time()
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
-            val = evaluate(model, val_loader, device)
-            extra = {name: evaluate(model, loader, device) for name, loader in long_loaders.items()}
+            val = evaluate(model, val_loader, device, args.length_buckets)
+            extra = {name: evaluate(model, loader, device, args.length_buckets) for name, loader in long_loaders.items()}
             long = {name: result["loss"] for name, result in extra.items()}
             print(
                 f"[val] step {step} loss {val['loss']:.4f} "
@@ -525,6 +544,7 @@ def main() -> None:
 
         if step % args.save_every == 0 or step == args.steps:
             save(out_dir / "latest.pt")
+    wait_for_save()
     if wandb_run:
         wandb_run.finish()
 
