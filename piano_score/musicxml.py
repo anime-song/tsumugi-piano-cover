@@ -241,7 +241,15 @@ def _duration(note: ET.Element, grace: ET.Element | None) -> Duration | None:
     tuplet = None
     if modification is not None:
         tuplet = (int(modification.findtext("actual-notes")), int(modification.findtext("normal-notes")))
+        if tuplet[0] == tuplet[1]:
+            tuplet = None  # 6:6 や 4:4 (書き出しのソフトによる見かけだけの連符) はふつうの音符
+        elif tuplet not in TUPLETS:
+            # 8:12 -> 2:3、9:6 -> 3:2 のように約すと語彙にある比になるもの
+            divisor = math.gcd(*tuplet)
+            tuplet = (tuplet[0] // divisor, tuplet[1] // divisor)
     grace_kind = None if grace is None else ("slash" if grace.get("slash") == "yes" else "grace")
+    if grace_kind and note_type in ("64th", "128th"):
+        note_type = "32nd"  # 装飾音の種類は 32 分までにまとめる
     return Duration(note_type, len(note.findall("dot")), tuplet, grace_kind)
 
 
