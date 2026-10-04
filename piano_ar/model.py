@@ -567,16 +567,19 @@ class PianoARModel(nn.Module):
 
         loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
         counts = torch.zeros(len(self.group_names), device=tokens.device)
+        correct = torch.zeros(len(self.group_names), device=tokens.device)
 
         def add_loss(logits: Tensor, target: Tensor) -> None:
-            nonlocal loss_sum, counts
-            token_loss = F.cross_entropy(
-                logits.float().reshape(-1, self.vocab_size), target.reshape(-1), ignore_index=PAD, reduction="none"
-            )
+            nonlocal loss_sum, counts, correct
+            flat_logits = logits.float().reshape(-1, self.vocab_size)
+            token_loss = F.cross_entropy(flat_logits, target.reshape(-1), ignore_index=PAD, reduction="none")
             group = self.token_group[target.reshape(-1)]
             keep = group >= 0  # PAD は除く
             loss_sum = loss_sum.index_add(0, group[keep], token_loss[keep])
             counts = counts.index_add(0, group[keep], torch.ones_like(token_loss[keep]))
+            with torch.no_grad():
+                hit = (flat_logits.argmax(-1) == target.reshape(-1)).float()
+                correct = correct.index_add(0, group[keep], hit[keep])
 
         if packed:
             add_loss(*self._local_packed(flat, context))
@@ -590,8 +593,12 @@ class PianoARModel(nn.Module):
                 add_loss(self.local_forward(target[:, :-1], context[index], cross, output), target)
 
         output = {"loss": loss_sum.sum() / counts.sum().clamp_min(1), "tokens": counts.sum()}
+        # 1 位の正解率。書き方が 1 つに決まらないトークンでは、損失は確信度の変化だけでも大きく動くので、並べて見る
+        output["acc"] = correct.sum() / counts.sum().clamp_min(1)
         for index, name in enumerate(self.group_names):
             output[f"loss_{name}"] = loss_sum[index] / counts[index].clamp_min(1)
+            output[f"acc_{name}"] = correct[index] / counts[index].clamp_min(1)
+            output[f"count_{name}"] = counts[index]
         return output
 
     # ------------------------------------------------------------------

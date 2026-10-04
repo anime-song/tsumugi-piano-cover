@@ -114,16 +114,24 @@ def make_optimizer(model: Perf2ScoreModel, args: argparse.Namespace) -> torch.op
 def evaluate(model: Perf2ScoreModel, loader: DataLoader, device: torch.device) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
+    group_counts: dict[str, float] = {}
     count = 0
     for batch in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = model(to_device(batch, device))
         tokens = int(output["tokens"])
-        for key in ("loss", *[f"loss_{g}" for g in TOKEN_GROUPS]):
+        for key in ("loss", "acc", *[f"loss_{g}" for g in TOKEN_GROUPS]):
             sums[key] = sums.get(key, 0.0) + float(output[key]) * tokens
+        # 種類ごとの正解率はその種類のトークンの数で重みづける (その種類がないバッチを 0 として数えない)
+        for g in TOKEN_GROUPS:
+            n = float(output[f"count_{g}"])
+            sums[f"acc_{g}"] = sums.get(f"acc_{g}", 0.0) + float(output[f"acc_{g}"]) * n
+            group_counts[g] = group_counts.get(g, 0.0) + n
         count += tokens
     model.train()
-    return {key: value / max(count, 1) for key, value in sums.items()}
+    result = {key: value / max(count, 1) for key, value in sums.items()}
+    result.update({f"acc_{g}": sums[f"acc_{g}"] / max(group_counts[g], 1) for g in TOKEN_GROUPS})
+    return result
 
 
 def gate_values(model: Perf2ScoreModel) -> dict[str, float]:
@@ -140,6 +148,10 @@ def gate_values(model: Perf2ScoreModel) -> dict[str, float]:
 
 def format_losses(values: dict[str, float], prefix: str = "") -> str:
     return " ".join(f"{g} {values[f'{prefix}loss_{g}']:.3f}" for g in TOKEN_GROUPS)
+
+
+def format_accuracy(values: dict[str, float]) -> str:
+    return " ".join(f"{g} {values[f'acc_{g}']:.3f}" for g in TOKEN_GROUPS)
 
 
 def main() -> None:
@@ -288,11 +300,13 @@ def main() -> None:
         """合成演奏と実演奏の検証の損失を出して、最良の判定に使う損失 (実演奏があればそちら) を返す"""
         val = evaluate(model, val_loader, device)
         print(f"[val] step {step} loss {val['loss']:.4f} {format_losses(val)}")
+        print(f"[val] step {step} acc {val['acc']:.4f} {format_accuracy(val)}")
         logs = {f"val/{k}": v for k, v in val.items()}
         main = val["loss"]
         if real_val_loader is not None:
             real = evaluate(model, real_val_loader, device)
             print(f"[val_real] step {step} loss {real['loss']:.4f} {format_losses(real)}")
+            print(f"[val_real] step {step} acc {real['acc']:.4f} {format_accuracy(real)}")
             logs.update({f"val_real/{k}": v for k, v in real.items()})
             main = real["loss"]
         if wandb_run:
