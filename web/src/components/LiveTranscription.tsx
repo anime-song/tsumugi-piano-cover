@@ -1,7 +1,7 @@
 // 採譜中に確定したノートを、曲全体のピアノロールに順に描く。ステムは 1 つずつ左から右へ採譜されていく。
 // 原曲の音源を再生していれば再生位置も出し、クリックでそこへ移る
 import { useEffect, useRef, useState } from "react";
-import { ApiError, api, type LiveStem } from "../api";
+import { ApiError, api, type LiveProgress, type LiveStem } from "../api";
 import { useT } from "../i18n";
 import type { Player } from "../player";
 import { CANVAS_FONT } from "./PianoRoll";
@@ -25,6 +25,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   const seq = useRef(0);
   const [stems, setStems] = useState<LiveStem[]>([]);
   const [stage, setStage] = useState<string | null>(null);
+  const [progress, setProgress] = useState<LiveProgress | null>(null);
   const [unsupported, setUnsupported] = useState(false);
   const stemsRef = useRef<LiveStem[]>([]);
   stemsRef.current = stems;
@@ -43,6 +44,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
         seq.current = live.seq;
         setStems(live.stems);
         setStage(live.stage);
+        setProgress(live.progress);
         if (!live.active && !active) return;
       } catch (e) {
         // 古いサーバ (この API がない) なら出さない。それ以外は一時的なものとして次で取り直す
@@ -131,6 +133,9 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   if (unsupported) return null;
   const stageNames = t.transcribeStages as Record<string, string>;
   const stemNames = t.stems as Record<string, string>;
+  // 分離の進み具合は、採譜が終わったあと (失敗・中止も含む) に残らないようにする。
+  // jobs.py 側は最後の状態をそのまま返すので、出すのは実行中だけ
+  const showProgress = active && progress !== null && progress.total > 0;
 
   return (
     <div className="live">
@@ -141,9 +146,30 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
           return (
             <span key={s} className={`live-stage ${state}`}>
               {stageNames[s]}
+              {/* 今の段階に進み具合があれば、塊の数も出す (ステム分離が長いので) */}
+              {i === index && showProgress && (
+                <span className="live-stage-count">
+                  {progress.done}/{progress.total}
+                </span>
+              )}
             </span>
           );
         })}
+      </div>
+      {/* 高さは常に確保する (出たり消えたりで下のピアノロールが動かないように) */}
+      <div
+        className={`live-bar ${showProgress ? "" : "hidden"}`}
+        role="progressbar"
+        aria-hidden={!showProgress}
+        aria-valuemin={0}
+        aria-valuemax={showProgress ? progress.total : 1}
+        aria-valuenow={showProgress ? progress.done : 0}
+      >
+        <i
+          style={{
+            width: showProgress ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` : "0%",
+          }}
+        />
       </div>
       <canvas
         ref={canvasRef}

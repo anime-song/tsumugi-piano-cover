@@ -40,6 +40,8 @@ class LiveTranscription:
         self.events: list[list] = []
         self.stems: dict[str, dict] = {}  # ステム名 -> {"duration", "pos", "done"} (届いた順)
         self.stage: str | None = None
+        # 今の段階の進み具合 {"done", "total"}。段階が変わったら None に戻す
+        self.progress: dict | None = None
         self._lock = threading.Lock()
 
     def _stem(self, name: str) -> dict:
@@ -51,6 +53,10 @@ class LiveTranscription:
             if kind == "stem":
                 self.stems[stem] = {"duration": float(data.get("duration", 0.0)), "pos": 0.0, "done": False}
                 self.stage = "transcribe"
+                self.progress = None  # 分離は終わっている
+            elif kind == "progress":
+                self.stage = str(data.get("stage") or self.stage or "")
+                self.progress = {"done": int(data.get("done", 0)), "total": int(data.get("total", 0))}
             elif kind == "notes":
                 info = self._stem(stem)
                 info["pos"] = max(info["pos"], float(data.get("pos", 0.0)))
@@ -61,10 +67,13 @@ class LiveTranscription:
                 info["done"], info["pos"] = True, info["duration"]
 
     def on_log(self, line: str) -> None:
-        for prefix, stage in _STAGES:
-            if prefix in line:
-                self.stage = stage
-                return
+        with self._lock:  # on_live / since と揃える (中途半端な組を返さない)
+            for prefix, stage in _STAGES:
+                if prefix in line:
+                    if stage != self.stage:
+                        self.progress = None  # 別の段階に移ったら前の段階の進み具合は捨てる
+                    self.stage = stage
+                    return
 
     def since(self, start: int) -> dict:
         with self._lock:
@@ -74,6 +83,7 @@ class LiveTranscription:
                 "events": self.events[start:],
                 "stems": [{"stem": name, **info} for name, info in self.stems.items()],
                 "stage": self.stage,
+                "progress": self.progress,
             }
 
 

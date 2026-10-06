@@ -113,12 +113,15 @@ export type CoverNote = [number, number, number, number, number];
 export type CoverView = { duration: number; notes: CoverNote[]; pedals: [number, number][] };
 
 export type LiveStem = { stem: string; duration: number; pos: number; done: boolean };
+// 今の段階の進み具合 (ステム分離の "分離し終えた塊 / 全体の塊")
+export type LiveProgress = { done: number; total: number };
 export type LiveTranscriptionData = {
   seq: number;
   // [id, stem, start 秒, end 秒, pitch, final (0/1)]
   events: [string, string, number, number, number, number][];
   stems: LiveStem[];
   stage: string | null;
+  progress: LiveProgress | null;
   active: boolean;
 };
 

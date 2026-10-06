@@ -73,6 +73,98 @@ def stream_notes(infer_stem) -> None:
     infer_stem.resolve_stem_model_type = resolve_stem_model_type
 
 
+def stream_separation(infer_stem) -> None:
+    """ステム分離の進み具合を "@@progress {json}" の行で流す。
+
+    run_stem_separated_transcription は分離モデルを直接呼ぶので、_separate_one_file を包んで
+    モデルの forward が呼ばれた回数 (分離した塊の数) を数える。塊の総数は stem_splitter の
+    切り方と同じ計算で先に出しておく。
+    分離モデルを外から包めない tsumugi では何もしない (採譜はできる)。
+    """
+    original = getattr(infer_stem, "_separate_one_file", None)
+    if original is None:
+        return
+    import math
+
+    import torch
+
+    # 音の長さは、分離が実際に読む経路で取る (tsumugi の _load_audio)。libsndfile は
+    # m4a/aac を読めないので、それだけに頼るとステレオの m4a で進み具合がまったく出ない。
+    load_audio = getattr(getattr(infer_stem, "infer", None), "_load_audio", None)
+    try:
+        import soundfile as sf
+    except ImportError:
+        sf = None
+    if load_audio is None and sf is None:
+        return
+
+    def batch_count(path, sep_config) -> int:
+        rate = int(sep_config.target_sample_rate)
+        if load_audio is not None:
+            waveform, _, _ = load_audio(Path(path), target_sample_rate=rate)
+            total = int(waveform.shape[-1])  # 分離が見るのと同じ長さ (リサンプルも同じ経路)
+        else:
+            info = sf.info(str(path))
+            total = int(info.frames)
+            if int(info.samplerate) != rate:
+                # torchaudio のリサンプルは切り上げなので、丸めではなく切り上げに合わせる
+                total = math.ceil(total * rate / int(info.samplerate))
+        chunk = int(sep_config.chunk_size)
+        hop = int(sep_config.hop_size) if sep_config.hop_size else chunk // 2
+        if total <= chunk:
+            padded = chunk
+        else:
+            padded = math.ceil((total - chunk) / hop) * hop + chunk
+        starts = len(range(0, padded - chunk + 1, hop))
+        return max(1, math.ceil(starts / max(1, int(sep_config.batch_size))))
+
+    class CountingSeparator(torch.nn.Module):
+        """分離モデルを包んで、塊を 1 つ処理するごとに進み具合を流す"""
+
+        def __init__(self, inner: torch.nn.Module, total: int) -> None:
+            super().__init__()
+            self.inner = inner
+            self.total = total
+            self.done = 0
+
+        def forward(self, batch):  # type: ignore[override]
+            output = self.inner(batch)
+            self.done += 1
+            # CUDA では forward が戻った時点でまだ計算中のことがある。1 つ手前までを報告して、
+            # 最後の塊を計算している間に 100% と出さないようにする
+            emit("progress", {"stage": "separate", "done": min(self.done - 1, self.total), "total": self.total})
+            return output
+
+    def separate_one_file(*args, **kwargs):
+        # tsumugi は (input_wav_path, output_directory, config, model, device, dtype) の順で呼ぶが、
+        # 名前や数が変わっても壊れないように、必要な分だけ取り出して model だけ差し替える
+        prepared = kwargs.get("input_wav_path", args[0] if len(args) > 0 else None)
+        sep_config = kwargs.get("config", args[2] if len(args) > 2 else None)
+        if prepared is None or sep_config is None:
+            return original(*args, **kwargs)
+        try:
+            total = batch_count(prepared, sep_config)
+        except Exception:  # 塊の数が分からないときは進み具合なしで今まで通り分離する
+            return original(*args, **kwargs)
+        if "model" in kwargs:
+            model = kwargs["model"]
+        elif len(args) > 3:
+            model = args[3]
+        else:  # モデルの位置が分からないので包まない
+            return original(*args, **kwargs)
+        emit("progress", {"stage": "separate", "done": 0, "total": total})
+        counter = CountingSeparator(model, total)
+        if "model" in kwargs:
+            result = original(*args, **{**kwargs, "model": counter})
+        else:
+            result = original(*args[:3], counter, *args[4:])
+        # ここまで来たら分離は終わっている (呼んだ側が結果を使う)
+        emit("progress", {"stage": "separate", "done": total, "total": total})
+        return result
+
+    infer_stem._separate_one_file = separate_one_file
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tsumugi-dir", required=True, help="tsumugi のリポジトリ (チェックポイントもここに置かれる)")
@@ -109,6 +201,7 @@ def main() -> None:
         free, total = torch.cuda.mem_get_info()
         torch.cuda.set_per_process_memory_fraction(free * args.gpu_memory_limit / total)
         print(f"VRAM の上限 {free * args.gpu_memory_limit / 1e9:.1f}GB", flush=True)
+    stream_separation(infer_stem)
     stream_notes(infer_stem)
 
     try:
