@@ -542,7 +542,9 @@ input[type="range"]:disabled {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 330px minmax(0, 1fr) 320px;
+  /* 左右は広いときは今まで通り、狭くなったら 240px まで縮めて真ん中 (演奏) を残す。
+     右の詳細を下に回すと play と details が縦に並んで場所を取るだけなので回さない */
+  grid-template-columns: minmax(240px, 330px) minmax(0, 1fr) minmax(240px, 320px);
 }
 
 .create {
@@ -1239,26 +1241,6 @@ input[type="range"]:disabled {
     background: none;
     padding: 0;
     margin-bottom: 8px;
-  }
-}
-
-@media (max-width: 1280px) {
-  .studio {
-    grid-template-columns: 310px minmax(0, 1fr);
-  }
-  .right {
-    grid-column: 2;
-    border-left: none;
-    border-top: 1px solid var(--line);
-  }
-  .studio {
-    grid-template-rows: minmax(0, 1fr) auto;
-  }
-  .create {
-    grid-row: 1 / span 2;
-  }
-  .right {
-    max-height: 40vh;
   }
 }
 
