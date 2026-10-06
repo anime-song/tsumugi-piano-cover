@@ -1369,14 +1369,14 @@ input[type="range"]:disabled {
   }
   .details-handle svg {
     transition: transform 0.22s ease;
-    transform: rotate(180deg); /* たたんでいるときは左向き (右から出てくる) */
+    transform: rotate(90deg); /* 他のアイコンと同じ描き方の山形を回す (たたんでいるときは左向き) */
   }
-  /* 開いたら三角は右向き (たたむ) になる */
+  /* 開いたら右向き (たたむ) になる */
   .studio[data-details="open"] .details-handle {
     color: var(--text);
   }
   .studio[data-details="open"] .details-handle svg {
-    transform: rotate(0deg);
+    transform: rotate(-90deg);
   }
 }
 

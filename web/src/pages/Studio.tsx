@@ -417,7 +417,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
             aria-label={t.detailsHelp}
             title={t.detailsHelp}
           >
-            <Icon name="caret" size={22} filled />
+            <Icon name="chevron" size={22} />
           </button>
           <div className="right-scroll">
             {selectedTake ? (
