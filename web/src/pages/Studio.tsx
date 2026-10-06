@@ -70,6 +70,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [tab, setTab] = useState<Tab>("play");
   // 携帯で巻物をたたむかどうか (広い画面では styles.css がボタンごと隠す)
   const [rollOpen, setRollOpen] = useState(true);
+  // 携帯と広い画面の間の幅では、右の詳細を既定でたたんでおく (押すと重ねて開く)
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [continueFrom, setContinueFrom] = useState<ContinueFrom | null>(null);
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
@@ -256,7 +258,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           </button>
         ))}
       </nav>
-      <div className="studio" data-tab={tab}>
+      <div className="studio" data-tab={tab} data-details={detailsOpen ? "open" : "closed"}>
         <CreatePanel
           config={config}
           draft={draft}
@@ -280,6 +282,15 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
               </div>
             </div>
             <div className="song-actions">
+              {/* 携帯と広い画面の間だけに出る。詳細を右に重ねて開く */}
+              <button
+                className={`btn small details-toggle ${detailsOpen ? "on" : ""}`}
+                onClick={() => setDetailsOpen(!detailsOpen)}
+                aria-expanded={detailsOpen}
+                title={t.detailsHelp}
+              >
+                <Icon name="layers" size={15} /> {t.tabDetail}
+              </button>
               {data.source && (
                 <a className="btn small" href={urls.sourceMidi(pid)} download>
                   <Icon name="download" size={15} /> {t.sourceMidi}

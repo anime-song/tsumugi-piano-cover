@@ -91,6 +91,11 @@ textarea {
   height: 100dvh;
 }
 
+/* 携帯と広い画面の間だけに出る詳細の開閉ボタン */
+.details-toggle {
+  display: none;
+}
+
 /* 携帯の表示切り替え。広い画面では出さない (Studio.tsx の .tabs) */
 .tabs {
   display: none;
@@ -898,6 +903,21 @@ input[type="range"]:disabled {
 .roll-hint {
   padding: 8px 14px 10px;
   color: var(--text-3);
+  /* 説明は 1 行のまま。狭い欄で何行にもなると、その分だけ下の一覧が潰れる */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.roll-hint-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「ループを消す」ボタンは縮めない (説明だけが … になる) */
+.roll-hint .link {
+  flex-shrink: 0;
 }
 
 .transcribe {
@@ -1268,6 +1288,39 @@ input[type="range"]:disabled {
   .roll {
     /* 画面の高さに合わせる。低い画面では低めに */
     --roll-h: clamp(170px, 28vh, 300px);
+  }
+}
+
+/* ------------------------------------------------------------ 中間の幅 */
+/* 携帯と広い画面の間は、左 (作る) と中央 (演奏) の 2 欄にして、右の詳細は既定でたたむ。
+   押すと右から重ねて開くので中央欄の幅は削られない (3 欄のままだと巻物も一覧も
+   中途半端になる幅)。携帯 (<=820px) はタブで詳細を出すのでこの規則は要らない。 */
+@media (min-width: 821px) and (max-width: 1280px) {
+  .studio {
+    position: relative;
+    grid-template-columns: minmax(240px, 330px) minmax(0, 1fr);
+  }
+  .studio[data-details="closed"] > .right {
+    display: none;
+  }
+  .studio[data-details="open"] > .right {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    width: min(360px, 45%);
+    border-left: 1px solid var(--line);
+    box-shadow: -18px 0 32px rgba(0, 0, 0, 0.45);
+  }
+  .details-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .details-toggle.on {
+    border-color: var(--accent);
+    color: var(--text);
   }
 }
 
