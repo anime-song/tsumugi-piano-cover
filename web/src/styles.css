@@ -1332,8 +1332,8 @@ input[type="range"]:disabled {
     right: 0; /* たたんでいるときは画面の右端 */
     transform: translateY(-50%);
     z-index: 21;
-    width: 22px;
-    height: 64px;
+    width: 28px;
+    height: 72px;
     padding: 0;
     border: 1px solid var(--line);
     border-right: none;
