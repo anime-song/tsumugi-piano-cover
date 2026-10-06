@@ -511,6 +511,8 @@ def main() -> None:
         )
 
     def save(path: Path) -> None:
+        # 書き込みの途中で止まっても (または別のプロセスが読んでも) 前のチェックポイントが残るよう、別名に書いてから置き換える
+        partial = path.with_name(path.name + ".partial")
         torch.save(
             {
                 "model": model.state_dict(),
@@ -525,8 +527,9 @@ def main() -> None:
                 "wandb_id": wandb_run.id if wandb_run else None,
                 "best_val_loss": best_val_loss,
             },
-            path,
+            partial,
         )
+        partial.replace(path)
 
     loader_iter = iter(train_loader)
     model.train()
