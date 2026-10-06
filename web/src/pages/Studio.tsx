@@ -442,7 +442,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           aria-label={t.detailsHelp}
           title={t.detailsHelp}
         >
-          <Icon name="caret" size={11} filled />
+          <Icon name="caret" size={16} filled />
         </button>
       </div>
       <PlayerBar

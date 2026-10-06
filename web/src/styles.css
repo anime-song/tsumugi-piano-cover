@@ -1298,25 +1298,30 @@ input[type="range"]:disabled {
 @media (min-width: 821px) and (max-width: 1280px) {
   .studio {
     position: relative;
+    overflow: hidden; /* たたんだ詳細が画面の外へ出て横スクロールにならないように */
     grid-template-columns: minmax(240px, 330px) minmax(0, 1fr);
-  }
-  .studio[data-details="closed"] > .right {
-    display: none;
   }
   /* ハンドルが右端に重なるので、テイクのカードは少し内側で折り返す */
   .studio .center.has-roll .takes-scroll {
     margin-right: 0;
     padding-right: 28px;
   }
-  .studio[data-details="open"] > .right {
+  /* 詳細は DOM に置いたまま右の外へ待避させ、開くときは滑り込ませる (display: none だと動かせない) */
+  .studio > .right {
     position: absolute;
     top: 0;
     right: 0;
     bottom: 0;
     z-index: 20;
     width: min(360px, 45%);
-    border-left: 1px solid var(--line);
     box-shadow: -18px 0 32px rgba(0, 0, 0, 0.45);
+    transform: translateX(100%);
+    visibility: hidden;
+    transition: transform 0.22s ease, visibility 0.22s;
+  }
+  .studio[data-details="open"] > .right {
+    transform: translateX(0);
+    visibility: visible;
   }
   .details-handle {
     display: inline-flex;
@@ -1327,8 +1332,8 @@ input[type="range"]:disabled {
     right: 0; /* たたんでいるときは画面の右端 */
     transform: translateY(-50%);
     z-index: 21;
-    width: 18px;
-    height: 56px;
+    width: 22px;
+    height: 64px;
     padding: 0;
     border: 1px solid var(--line);
     border-right: none;
@@ -1336,18 +1341,20 @@ input[type="range"]:disabled {
     background: var(--panel-2);
     color: var(--text-2);
     cursor: pointer;
+    transition: right 0.22s ease, box-shadow 0.22s ease, color 0.22s ease;
   }
   .details-handle svg {
-    transition: transform 0.15s;
+    transition: transform 0.22s ease;
+    transform: rotate(180deg); /* たたんでいるときは左向き (右から出てくる) */
   }
-  /* 開いたら詳細の左端に貼り付いて、三角は逆向き (たたむ) になる */
+  /* 開いたら詳細の左端に貼り付いて、三角は右向き (たたむ) になる */
   .studio[data-details="open"] .details-handle {
     right: min(360px, 45%);
     color: var(--text);
     box-shadow: -6px 0 16px rgba(0, 0, 0, 0.35);
   }
   .studio[data-details="open"] .details-handle svg {
-    transform: rotate(180deg);
+    transform: rotate(0deg);
   }
 }
 
