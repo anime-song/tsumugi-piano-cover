@@ -835,14 +835,23 @@ input[type="range"]:disabled {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex-wrap: wrap;
+  /* 中央欄が狭いと 1 つずつ折り返して巻物の見出しが何行にもなり、下の一覧を押し出していた。
+     1 行のまま横に流す (入りきらない分は横スクロール) */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  min-width: 0;
 }
 .legend-items {
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  flex-shrink: 0;
   font-size: 11.5px;
   color: var(--text-2);
+}
+.legend .check {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .legend-items > span {
   display: inline-flex;
@@ -860,6 +869,9 @@ input[type="range"]:disabled {
 }
 .roll {
   position: relative;
+  /* 画面の高さに合わせる。低い画面では 170px で下限、高い画面でも 340px まで
+     (巻物が高くなりすぎて下のテイク一覧を消さないように) */
+  --roll-h: clamp(170px, 30vh, 340px);
 }
 .roll canvas {
   display: block;
