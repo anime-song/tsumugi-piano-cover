@@ -31,6 +31,11 @@ class CoverConfig:
     # デコーダの強弱の条件 (ModelConfig.dynamics_bins) と一緒に使う
     planner_dim: int = 256
     planner_layers: int = 3
+    # cross-attention の出力のゲート (tanh) の初期値。0 なら学習の始めは事前学習モデルとまったく同じ出力になるが、
+    # ゲートが開くまで cross-attention の中の重みに勾配が流れず、原曲を使い始めるのが遅い (208M のデコーダでは
+    # step 3000 でもゲート 0.004 で、原曲ありとなしの損失の差は 0.017)。重みを読み込むときは保存した値が使われるので、
+    # 学習の始めだけに効く
+    cross_gate_init: float = 0.0
 
     @classmethod
     def from_dict(cls, values: dict) -> CoverConfig:

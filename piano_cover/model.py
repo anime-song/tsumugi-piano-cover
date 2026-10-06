@@ -13,7 +13,7 @@
 「対応する時刻」は、学習時はアラインメント (カバー -> 原曲)、生成時は原曲の時間軸の上に生成するので恒等写像。
 cross-attention の RoPE の位置は、クエリに対応する原曲の時刻、キーに原曲の時刻を使うので、時刻の差で見る場所が決まる。
 曲全体の構造 (サビの繰り返しなど) は SongEncoder が各パッチのメモリに埋め込むので、デコーダは近くだけ見ればよい。
-追加した層は出力のゲートを 0 で初期化するので、学習の始めは事前学習モデルとまったく同じ出力になる。
+追加した層は出力のゲートを 0 で初期化するので (CoverConfig.cross_gate_init)、学習の始めは事前学習モデルとまったく同じ出力になる。
 """
 
 from __future__ import annotations
@@ -246,6 +246,9 @@ class CoverModel(nn.Module):
             module.apply(PianoARModel._init_weights)
         with torch.no_grad():
             self.source_embedding.weight[0].zero_()
+            for block in (*self.global_cross, *self.local_cross):
+                block.attn_gate.fill_(math.atanh(cover_config.cross_gate_init))
+                block.mlp_gate.fill_(math.atanh(cover_config.cross_gate_init))
         if self.onset_head is not None:
             self.onset_head.apply(PianoARModel._init_weights)
             nn.init.zeros_(self.onset_head.query.weight)
