@@ -133,6 +133,9 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   if (unsupported) return null;
   const stageNames = t.transcribeStages as Record<string, string>;
   const stemNames = t.stems as Record<string, string>;
+  // 分離の進み具合は、採譜が終わったあと (失敗・中止も含む) に残らないようにする。
+  // jobs.py 側は最後の状態をそのまま返すので、出すのは実行中だけ
+  const showProgress = active && progress !== null && progress.total > 0;
 
   return (
     <div className="live">
@@ -144,7 +147,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
             <span key={s} className={`live-stage ${state}`}>
               {stageNames[s]}
               {/* 今の段階に進み具合があれば、塊の数も出す (ステム分離が長いので) */}
-              {i === index && progress && progress.total > 0 && (
+              {i === index && showProgress && (
                 <span className="live-stage-count">
                   {progress.done}/{progress.total}
                 </span>
@@ -153,11 +156,21 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
           );
         })}
       </div>
-      {progress && progress.total > 0 && (
-        <div className="live-bar" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.done}>
-          <i style={{ width: `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` }} />
-        </div>
-      )}
+      {/* 高さは常に確保する (出たり消えたりで下のピアノロールが動かないように) */}
+      <div
+        className={`live-bar ${showProgress ? "" : "hidden"}`}
+        role="progressbar"
+        aria-hidden={!showProgress}
+        aria-valuemin={0}
+        aria-valuemax={showProgress ? progress.total : 1}
+        aria-valuenow={showProgress ? progress.done : 0}
+      >
+        <i
+          style={{
+            width: showProgress ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` : "0%",
+          }}
+        />
+      </div>
       <canvas
         ref={canvasRef}
         className="live-roll"

@@ -1944,6 +1944,10 @@ input[type="range"]:disabled {
   background: var(--accent);
   transition: width 0.3s ease;
 }
+/* 分離中以外は見せないが、場所は確保しておく (ピアノロールが上下に動かないように) */
+.live-bar.hidden {
+  visibility: hidden;
+}
 .live-roll {
   display: block;
   width: 100%;

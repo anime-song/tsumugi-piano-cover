@@ -67,12 +67,13 @@ class LiveTranscription:
                 info["done"], info["pos"] = True, info["duration"]
 
     def on_log(self, line: str) -> None:
-        for prefix, stage in _STAGES:
-            if prefix in line:
-                if stage != self.stage:
-                    self.progress = None  # 別の段階に移ったら前の段階の進み具合は捨てる
-                self.stage = stage
-                return
+        with self._lock:  # on_live / since と揃える (中途半端な組を返さない)
+            for prefix, stage in _STAGES:
+                if prefix in line:
+                    if stage != self.stage:
+                        self.progress = None  # 別の段階に移ったら前の段階の進み具合は捨てる
+                    self.stage = stage
+                    return
 
     def since(self, start: int) -> dict:
         with self._lock:
