@@ -123,7 +123,12 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=1000)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--no-grad-checkpoint", action="store_true")
-    parser.add_argument("--length-buckets", type=int, default=8)
+    parser.add_argument(
+        "--length-buckets",
+        type=int,
+        default=8,
+        help="パッチを長さ順に何個の塊に分けて処理するか。0 でパディングせずにつなげて通す (パッキング、A100 で約 1.3 倍速い)",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",

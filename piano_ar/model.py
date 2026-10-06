@@ -40,6 +40,16 @@ class Condition(Protocol):
 
     def local_output(self, index: Tensor, prefix: Tensor) -> OutputHook | None: ...
 
+    def local_cross_packed(self, index: Tensor, patches: Tensor) -> CrossHook:
+        """パッキング (num_length_buckets=0) 用。patches [N, L] は損失を取るパッチのトークン (後ろが PAD)。
+        フックの x は、各パッチの Local の入力 (BOS + 最後を除くトークン) をパディングせずにつなげた [1, T, D]
+        (PianoARModel._local_packed と同じ並び)"""
+        ...
+
+    def local_output_packed(self, index: Tensor, patches: Tensor) -> OutputHook | None:
+        """パッキング用の local_output。h [T, D]、logits [T, V] は local_cross_packed と同じ並び"""
+        ...
+
 
 class StepCondition(Protocol):
     """Local を 1 トークンずつ生成するとき (local_step) に条件を入れる。パッチごとに変わる量は tensors にまとめて先に作り
@@ -299,8 +309,23 @@ class CrossBlock(nn.Module):
         self.mlp_gate = nn.Parameter(torch.zeros(1))
         self.residual_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
-        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
+    def forward(
+        self,
+        x: Tensor,
+        q_pos: Tensor,
+        memory: Tensor,
+        k_pos: Tensor,
+        mask: Tensor | None,
+        cu_seqlens_q: Tensor | None = None,
+        cu_seqlens_k: Tensor | None = None,
+        key_index: Tensor | None = None,
+        max_q: int = 0,
+        max_k: int = 0,
+    ) -> Tensor:
+        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)。
+        cu_seqlens_q を渡すとパッキング版 (attend_packed、mask は使わない)"""
+        if cu_seqlens_q is not None:
+            return self.attend_packed(x, q_pos, memory, k_pos, cu_seqlens_q, cu_seqlens_k, key_index, max_q, max_k)
         return self.attend(x, q_pos, *self.memory_kv(memory, k_pos), mask)
 
     def memory_kv(self, memory: Tensor, k_pos: Tensor) -> tuple[Tensor, Tensor]:
@@ -322,8 +347,63 @@ class CrossBlock(nn.Module):
         q = _apply_rope(self.q_norm(q).to(v.dtype), *_rope(q_pos, head_dim))
         mask = F.pad(mask, (1, 0), value=True)[:, None]
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
-        attn = self.out(attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
-        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(attn)
+        return self._add(x, attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
+
+    def attend_packed(
+        self,
+        x: Tensor,
+        q_pos: Tensor,
+        memory: Tensor,
+        k_pos: Tensor,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_k: Tensor,
+        key_index: Tensor,
+        max_q: int,
+        max_k: int,
+    ) -> Tensor:
+        """パッキング版。x [1, T, D] / q_pos [T] は N 本のクエリの系列をつなげたもの (系列 i は cu_seqlens_q[i]:[i+1])。
+        memory [R, memory_dim] / k_pos [R] は各系列が見る行をつなげたもの。系列 i のキーは「空のキー + その行」で、
+        つなげたキーの各位置が memory の何番目か (空のキーは -1) を key_index [R + N]、区切りを cu_seqlens_k で渡す。
+
+        dropout をかけるときは flash attention の可変長版を使う (Block.forward と同じ理由)。クエリとキーの区切りが違っても、
+        p=0.1 で落とす割合と、ヘッドどうし・系列どうしの独立は正しい (torch 2.13、A100 で確認)。
+        flash は落とす確率を 8 bit に丸める (p=1e-6 でも約 1/255 を落とす) ので、塊で通したときと比べる確認に、ごく小さい
+        dropout で flash の経路を通す方法は使えない"""
+        length = x.shape[1]
+        head_dim = self.inner_dim // self.heads
+        k, v = self.kv(self.memory_norm(memory)).view(-1, 2, self.heads, head_dim).unbind(1)  # [R, H, head_dim]
+        k = _apply_rope(self.k_norm(k).to(v.dtype).transpose(0, 1), *_rope(k_pos, head_dim)).transpose(0, 1)
+        # 空のキーは位置によらないよう回転をかけない
+        is_null = (key_index < 0)[:, None, None]
+        safe = key_index.clamp(min=0)
+        k = torch.where(is_null, self.k_norm(self.null_k).to(v.dtype), k[safe]).contiguous()
+        v = torch.where(is_null, self.null_v.to(v.dtype), v[safe]).contiguous()
+        q = self.q(self.norm(x)).view(1, length, self.heads, head_dim).transpose(1, 2)
+        q = _apply_rope(self.q_norm(q).to(v.dtype), *_rope(q_pos, head_dim))[0].transpose(0, 1).contiguous()
+        dropout = self.dropout if self.training else 0.0
+        if dropout > 0:
+            attn = torch.ops.aten._flash_attention_forward(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, max_q, max_k, dropout, False, False
+            )[0]
+        else:
+            attn = torch.ops.aten._efficient_attention_forward(
+                q[None],
+                k[None],
+                v[None],
+                None,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_q,
+                max_k,
+                0.0,
+                0,
+                compute_log_sumexp=torch.is_grad_enabled() and q.requires_grad,
+            )[0][0]
+        return self._add(x, attn.reshape(1, length, self.inner_dim))
+
+    def _add(self, x: Tensor, attn: Tensor) -> Tensor:
+        """attention の出力 [B, Lq, inner_dim] をゲートをかけて足し、MLP を通す"""
+        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(self.out(attn))
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + torch.tanh(self.mlp_gate).to(x.dtype) * self.residual_dropout(self.down(F.silu(gate) * up))
 
@@ -429,9 +509,12 @@ class PianoARModel(nn.Module):
         h = self.patch_summarizer(x[None], positions=positions, cu_seqlens=cu_seqlens, max_length=max_length)[0]
         return self.summary_projection(h[starts])
 
-    def _local_packed(self, patches: Tensor, context: Tensor) -> tuple[Tensor, Tensor]:
+    def _local_packed(
+        self, patches: Tensor, context: Tensor, cross: CrossHook | None = None, output: OutputHook | None = None
+    ) -> tuple[Tensor, Tensor]:
         """local_forward で各パッチの全トークンを予測するのと同じ計算を、パディングせずに 1 本につなげて行う。
-        パッチ i の入力は BOS + 自分のトークン (最後を除く)、予測の対象は自分のトークン全部。(logits [T, V], 対象 [T]) を返す"""
+        パッチ i の入力は BOS + 自分のトークン (最後を除く)、予測の対象は自分のトークン全部。(logits [T, V], 対象 [T]) を返す。
+        cross / output は Condition.local_cross_packed / local_output_packed のフック"""
         lengths = (patches != PAD).sum(-1)
         cu_seqlens = F.pad(lengths.cumsum(0), (1, 0)).int()
         total, max_length = int(cu_seqlens[-1]), int(lengths.max())
@@ -442,8 +525,11 @@ class PianoARModel(nn.Module):
         previous = torch.roll(self.token_embedding(target), 1, dims=0)
         x = torch.where((position == 0)[:, None], self.local_bos.to(previous.dtype), previous)
         x = x + self.local_context(context)[patch]
-        h = self.local_transformer(x[None], positions=position, cu_seqlens=cu_seqlens, max_length=max_length)[0]
-        return self.head(h), target
+        h = self.local_transformer(
+            x[None], positions=position, cross=cross, cu_seqlens=cu_seqlens, max_length=max_length
+        )[0]
+        logits = self.head(h)
+        return (output(h, logits) if output is not None else logits), target
 
     def local_step(
         self,
@@ -509,11 +595,10 @@ class PianoARModel(nn.Module):
 
         num_length_buckets=0 なら、パッチをパディングせずに 1 本につなげ、attention だけパッチの中に閉じて通す (パッキング)。
         塊ごとに Transformer を呼ばないので CPU の仕事 (compile したブロックの呼び出しとカーネルの起動) が減り、
-        パディングの計算 (塊 4 つで約 3 割) もなくなる。条件 (cross-attention) のある学習ではまだ使えない。
+        パディングの計算 (塊 4 つで約 3 割) もなくなる。条件 (cross-attention) は Condition の local_cross_packed /
+        local_output_packed で入れる。
         """
         packed = num_length_buckets == 0
-        if packed and condition is not None:
-            raise ValueError("パッキング (num_length_buckets=0) は条件 (cross-attention) のない学習でだけ使える")
         if packed and self.training and self.config.dropout > 0 and not flash_varlen_available():
             # memory-efficient attention の可変長版は dropout のマスクが正しくないので (Block.forward)、塊 4 つに戻す
             warnings.warn("flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2)
@@ -582,7 +667,11 @@ class PianoARModel(nn.Module):
                 correct = correct.index_add(0, group[keep], hit[keep])
 
         if packed:
-            add_loss(*self._local_packed(flat, context))
+            cross = output = None
+            if condition is not None:
+                cross = condition.local_cross_packed(trained, flat)
+                output = condition.local_output_packed(trained, flat)
+            add_loss(*self._local_packed(flat, context, cross, output))
         else:
             for index, length in buckets:
                 target = flat[index, :length]

@@ -19,6 +19,7 @@ cross-attention の RoPE の位置は、クエリに対応する原曲の時刻�
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -37,9 +38,10 @@ from piano_ar.model import (
     OutputHook,
     PianoARModel,
     Transformer,
+    flash_varlen_available,
     prepare_block_compile,
 )
-from piano_ar.tokenizer import PianoTokenizer
+from piano_ar.tokenizer import PAD, PianoTokenizer
 
 from .config import CoverConfig
 from .source import DRUM_ID, ONSET_GROUPS, TYPE_BEAT, TYPE_CHORD, TYPE_NOTE, SourceVocab, onset_group_tables
@@ -134,13 +136,27 @@ class OnsetHead(nn.Module):
     def apply_candidates(self, h: Tensor, logits: Tensor, candidates: Tensor) -> Tensor:
         """forward の後半。candidates = candidate(features) [N, F, hidden] (生成ではパッチごとに 1 回だけ作る)"""
         with torch.autocast(h.device.type, enabled=False):
-            bias = torch.einsum("ntk,nfk->ntf", self.query(h.float()), candidates)
-            logits = logits.float()
-            s = self.time_slice
-            time = logits[..., s]
-            shifted = time + bias
-            time = shifted - shifted.logsumexp(-1, keepdim=True) + time.logsumexp(-1, keepdim=True)
-            return torch.cat((logits[..., : s.start], time, logits[..., s.stop :]), dim=-1)
+            return self._shift_time(logits, torch.einsum("ntk,nfk->ntf", self.query(h.float()), candidates))
+
+    def forward_packed(self, h: Tensor, logits: Tensor, features: Tensor, keep: Tensor) -> Tensor:
+        """パッキング版の forward。h [T, D] / logits [T, V] はパッチ N 個のトークンをつなげたもので、keep [N, L] がその並び
+        (True の所を行の順に読む)。候補 [N, F, hidden] をトークンごとに集めると大きい ([T, F, hidden]) ので、
+        query だけをパッチごとの形に戻して内積を取る"""
+        with torch.autocast(h.device.type, enabled=False):
+            query = self.query(h.float())
+            slots = keep.flatten().nonzero().squeeze(1)
+            padded = query.new_zeros(keep.numel(), query.shape[-1]).index_copy(0, slots, query)
+            bias = torch.einsum("ntk,nfk->ntf", padded.view(*keep.shape, -1), self.candidate(features))
+            return self._shift_time(logits, bias[keep])
+
+    def _shift_time(self, logits: Tensor, bias: Tensor) -> Tensor:
+        """TIME の logit に bias [..., F] を足し、TIME 全体の確率は元に戻す"""
+        logits = logits.float()
+        s = self.time_slice
+        time = logits[..., s]
+        shifted = time + bias
+        time = shifted - shifted.logsumexp(-1, keepdim=True) + time.logsumexp(-1, keepdim=True)
+        return torch.cat((logits[..., : s.start], time, logits[..., s.stop :]), dim=-1)
 
 
 class Planner(nn.Module):
@@ -297,12 +313,65 @@ class CoverModel(nn.Module):
             out = self.patch_encoder(torch.cat((queries, rows), dim=1), key_valid)
             return out[:, :K], out[keep, K : K + min(length, row_width)]
 
-        # パッチごとの行数の差が大きいので、デコーダと同じく長さ順の塊に分けて通す。
+        def encode_packed(
+            features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor
+        ) -> tuple[Tensor, Tensor]:
+            """encode_patches と同じ計算を、パッチ (K 個の要約のクエリ + 行) をパディングせずにつなげて行う。
+            返す行は Local が見るパッチ (keep) の有効な行だけを、パッチ順・行順に並べたもの [行数, D]"""
+            n = valid.shape[0]
+            counts = valid.sum(-1)
+            rows = F.embedding_bag(features[valid], self.source_embedding.weight, mode="sum", padding_idx=0)
+            rows = rows + self.source_onset(onset[valid])
+            seq_lengths = counts + K
+            cu_seqlens = F.pad(seq_lengths.cumsum(0), (1, 0)).int()
+            total = int(cu_seqlens[-1])
+            sequence = torch.repeat_interleave(torch.arange(n, device=device), seq_lengths, output_size=total)
+            position = torch.arange(total, device=device) - cu_seqlens[:-1].long()[sequence]
+            is_latent = position < K
+            row_index = ((~is_latent).cumsum(0) - 1).clamp(min=0)
+            queries = self.latent_queries.to(rows.dtype)[position.clamp(max=K - 1)]
+            x = torch.where(is_latent[:, None], queries, rows[row_index])
+            out = self.patch_encoder(
+                x[None], positions=position, cu_seqlens=cu_seqlens, max_length=int(seq_lengths.max())
+            )[0]
+            latents = out[is_latent].view(n, K, -1)
+            return latents, out[~is_latent][keep.repeat_interleave(counts)]
+
+        # パッチごとの行数の差が大きいので、デコーダと同じく長さ順の塊に分けて通す (num_length_buckets=0 ならパッキング)。
         # 全曲の全パッチの行 (長い曲で数十万トークン) を通すので、学習時は塊を小分けにして塊ごとに checkpoint し、
         # 中間は backward で計算し直す (残すのは出力の要約と Local が見るパッチの行だけ)
         order = lengths.argsort()
         latent_parts, row_parts = [], []
-        for bucket in order.tensor_split(min(num_length_buckets, max(len(order), 1))):
+        if num_length_buckets == 0:
+            # パッキング: 曲の並びのまま、トークン数が CHUNK_TOKENS ほどの塊に分ける
+            tokens = (lengths + K).cumsum(0)
+            chunk_of = torch.div(tokens - 1, CHUNK_TOKENS, rounding_mode="floor")
+            order = torch.arange(len(lengths), device=device)
+            for index in order.split(torch.bincount(chunk_of).tolist() if len(order) else []):
+                if len(index) == 0:
+                    continue
+                width = max(1, int(lengths[index].max()))
+                keep = needed_flat[index]
+                args = (
+                    patch_features[index, :width],
+                    local_onset[index, :width],
+                    patch_rows_valid[index, :width],
+                    keep,
+                )
+                if self.gradient_checkpointing and self.training:
+                    latents, kept_rows = checkpoint(encode_packed, *args, use_reentrant=False)
+                else:
+                    latents, kept_rows = encode_packed(*args)
+                latent_parts.append(latents)
+                if keep.any():
+                    # 行は左詰め (source_features) なので、パッチ内の行の番号は 0, 1, ... の順
+                    count = lengths[index[keep]]
+                    target = torch.repeat_interleave(lookup_flat[index[keep]], count)
+                    column = torch.arange(len(target), device=device) - torch.repeat_interleave(
+                        F.pad(count.cumsum(0), (1, 0))[:-1], count
+                    )
+                    row_parts.append(((target, column), kept_rows))
+        for bucket in order.tensor_split(min(num_length_buckets, max(len(order), 1))) if num_length_buckets else []:
             if len(bucket) == 0:
                 continue
             length = int(lengths[bucket].max())
@@ -338,7 +407,10 @@ class CoverModel(nn.Module):
 
         rows = song.new_zeros(max(num_needed, 1), row_width, dim)
         for target, values in row_parts:
-            rows[target, : values.shape[1]] = values.to(rows.dtype)
+            if isinstance(target, tuple):  # パッキング: (パッチ, 行) ごとの値
+                rows[target] = values.to(rows.dtype)
+            else:
+                rows[target, : values.shape[1]] = values.to(rows.dtype)
         row_onset = torch.zeros(max(num_needed, 1), row_width, device=device)
         valid_rows = torch.zeros(max(num_needed, 1), row_width, dtype=torch.bool, device=device)
         row_group = torch.full((max(num_needed, 1), row_width), -1, dtype=torch.long, device=device)
@@ -428,7 +500,12 @@ class CoverModel(nn.Module):
     # 学習
     # ------------------------------------------------------------------
     def forward(self, batch: dict[str, Tensor], num_length_buckets: int = 8) -> dict[str, Tensor]:
+        """num_length_buckets=0 ならパッキング (デコーダの要約・Local と原曲のパッチエンコーダ、Local の cross-attention)"""
         F_ = self.patch_frames
+        if num_length_buckets == 0 and self.training and self.decoder.config.dropout > 0 and not flash_varlen_available():
+            # memory-efficient attention の可変長版は dropout のマスクが正しくない (piano_ar.model.Block.forward)
+            warnings.warn("flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2)
+            num_length_buckets = 4
         valid = batch["patch_valid"]
         has_source = batch["has_source"]
         S = batch["src_patch_valid"].shape[1]
@@ -571,6 +648,46 @@ class _TrainingCondition:
         onset, group, valid = self.model.local_onsets(self.memory, self.local_index[index])
         features = head.features(onset, group, valid, align[:, 0], align[:, 1])
         return lambda h, logits: head(h, logits, features)
+
+    def local_cross_packed(self, index: Tensor, patches: Tensor) -> CrossHook:
+        """local_cross のパッキング版 (piano_ar.model.Condition)。キーは各パッチが見る原曲の有効な行だけをつなげる"""
+        model = self.model
+        align = self.local_align[index]
+        rows, k_pos, valid = model.local_memory(self.memory, self.local_index[index], align[:, 0])
+        keep = patches != PAD
+        lengths = keep.sum(-1)
+        cu_seqlens_q = F.pad(lengths.cumsum(0), (1, 0)).int()
+        scale = (align[:, 1] - align[:, 0]).float() / model.patch_frames
+        q_pos = (query_onsets(patches[:, :-1], model.tokenizer) * scale[:, None])[keep]
+        counts = valid.sum(-1)
+        # パッチ i のキーは「空のキー + その行」。空のキーの位置は (それまでの行数) + i
+        cu_seqlens_k = (F.pad(counts.cumsum(0), (1, 0)) + torch.arange(len(counts) + 1, device=counts.device)).int()
+        is_null = torch.zeros(int(cu_seqlens_k[-1]), dtype=torch.bool, device=counts.device)
+        is_null[cu_seqlens_k[:-1].long()] = True
+        key_index = torch.where(is_null, -1, (~is_null).cumsum(0) - 1)
+        memory, key_pos = rows[valid], k_pos[valid]
+        max_q, max_k = int(lengths.max()), int(counts.max()) + 1
+
+        def hook(i: int, x: Tensor) -> Tensor:
+            if i not in model.local_cross_blocks:
+                return x
+            block = model.local_cross[model.local_cross_blocks.index(i)]
+            return model.run_cross(
+                block, x, q_pos, memory, key_pos, None, cu_seqlens_q, cu_seqlens_k, key_index, max_q, max_k
+            )
+
+        return hook
+
+    def local_output_packed(self, index: Tensor, patches: Tensor) -> OutputHook | None:
+        head = self.model.onset_head
+        if head is None:
+            return None
+        align = self.local_align[index]
+        onset, group, valid = self.model.local_onsets(self.memory, self.local_index[index])
+        features = head.features(onset, group, valid, align[:, 0], align[:, 1])
+        keep = patches != PAD
+        keep = keep[:, : int(keep.sum(-1).max())]
+        return lambda h, logits: head.forward_packed(h, logits, features, keep)
 
     def local_step_tensors(self, index: Tensor) -> dict[str, Tensor]:
         """有効なパッチの番号 index [N] を Local で 1 トークンずつ生成するときの量 (piano_cover.rollout)"""
