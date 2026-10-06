@@ -33,6 +33,7 @@ from piano_ar.evaluation import synthesize, write_wav
 from piano_ar.tokenizer import PianoTokenizer
 
 from .arrangement import measurable
+from .metadata import copy_metadata
 from .config import CoverConfig
 from .data import source_tensors
 from .hub import load_cover
@@ -210,6 +211,8 @@ def main() -> None:
         manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
         tokenizer.events_to_midi(cover.events, path)
+        # 原曲のテンポ・拍子・調・コードマーカーを写す
+        copy_metadata(args.source, path)
         if args.wav:
             write_wav(synthesize(cover.events, tokenizer.config.frame_rate), path.with_suffix(".wav"))
         print(f"{path}: {len(cover.patches) * patch_seconds:.0f} 秒 / {len(cover.events)} イベント")

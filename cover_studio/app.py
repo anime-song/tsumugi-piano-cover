@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import shutil
 import uuid
@@ -28,6 +29,8 @@ from .engine import Engine
 from .jobs import Job, LiveTranscription, Runner
 from .project import Project, projects, safe_name
 from .web import STATIC_DIR
+
+log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
 API_VERSION = 2
@@ -356,6 +359,23 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         path = p.take_midi(tid)
         if not path.is_file():
             raise HTTPException(404, "まだ生成していません")
+        # メタデータなしで書かれた古いテイクだけ、ここで 1 回だけ直す (書き込みは一時ファイル -> 置換)。
+        # 毎回書き直すと秒 -> tick の丸めが積もって音が少しずつずれるうえ、同時のダウンロードと
+        # ぶつかって書きかけのファイルを返すことがある。直したら take.json に印を残す。
+        source_created = (p.data.get("source") or {}).get("created")
+        recorded = take.get("source_created")
+        if recorded is not None:
+            same_source = recorded == source_created
+        else:  # 印がない古いテイク: 原曲がテイクより後に作られていれば、別の原曲に入れ替わっている
+            same_source = source_created is None or source_created <= (take.get("created") or "")
+        if p.has_source and not take.get("metadata_copied") and same_source:
+            try:
+                from piano_cover.metadata import copy_metadata
+
+                copy_metadata(p.source_path, path)
+                p.update_take(tid, metadata_copied=True)
+            except Exception:  # 写せなくても、中身 (音) は返す
+                log.exception("cover.mid にメタデータを写せませんでした: %s", path)
         name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
         return FileResponse(path, media_type="audio/midi", headers={"Content-Disposition": _attachment(name)})
 

@@ -215,6 +215,7 @@ class Engine:
         from piano_ar.evaluation import events_end_frame
         from piano_ar.tokenizer import KIND, KIND_NOTE
         from piano_cover.generate import CoverParams, generate_covers
+        from piano_cover.metadata import score_for_cover
 
         with self._lock:
             first = project.take(take_ids[0])
@@ -251,9 +252,27 @@ class Engine:
             np.random.seed(seed % (2**32))
             covers = generate_covers(model, source, params, num_samples=len(take_ids), prompt=prompt, progress=on_patch)
 
+        # 原曲のメタデータ (テンポ・拍子・調・コードマーカー) は、書き出す前に Score に入れて
+        # 1 回だけ書き出す。書き出してから写すと秒 -> tick の丸めが 2 回起きて、音が少しずつずれる
+        source_score = None
+        if project.has_source:
+            try:
+                from symusic import Score
+
+                source_score = Score(str(project.source_path)).to("second")
+            except Exception:
+                log("原曲のメタデータを読めなかったので、メタデータなしで書き出します")
+        source_created = (project.data.get("source") or {}).get("created")
+
         for take_id, cover in zip(take_ids, covers):
             d = project.take_dir(take_id)
-            tokenizer.events_to_midi(cover.events, d / "cover.mid")
+            try:
+                score_for_cover(tokenizer, cover.events, source_score).dump_midi(str(d / "cover.mid"))
+                metadata_copied = source_score is not None
+            except Exception:  # メタデータを写せなくても、テイクは落とさない
+                log("原曲のメタデータを写せなかったので、メタデータなしで書き出します")
+                tokenizer.events_to_midi(cover.events, d / "cover.mid")
+                metadata_copied = False
             (d / "patches.json").write_text(json.dumps(cover.patches), encoding="utf-8")
             notes = int((cover.events[:, KIND] == KIND_NOTE).sum()) if len(cover.events) else 0
             project.update_take(
@@ -261,6 +280,9 @@ class Engine:
                 state="done",
                 duration=events_end_frame(cover.events) / frame_rate if len(cover.events) else 0.0,
                 notes=notes,
+                # どの原曲から作ったかと、メタデータを入れ終えた印 (古いテイクを後から直すときに使う)
+                source_created=source_created,
+                metadata_copied=metadata_copied,
             )
 
     # ------------------------------------------------------------ 採譜

@@ -235,7 +235,12 @@ class PianoTokenizer:
             return np.zeros((0, 5), dtype=np.int32)
         return trim_overlapping_notes(sort_events(np.asarray(rows, dtype=np.int64))).astype(np.int32)
 
-    def events_to_midi(self, events: np.ndarray, path: str | Path) -> None:
+    def events_to_score(self, events: np.ndarray):
+        """イベント配列から Score を作る (まだ書き出さない)。
+
+        原曲のメタデータを足してから 1 回だけ書き出すために、書き出しと分けてある。
+        書き出してから写すと、秒 -> tick の丸めが 2 回起きて音が少しずつずれる。
+        """
         from symusic import ControlChange, Note, Score, Track
 
         fr = self.config.frame_rate
@@ -247,7 +252,10 @@ class PianoTokenizer:
             else:
                 track.controls.append(ControlChange(onset / fr, 64, 127 if kind == KIND_PEDAL_ON else 0, "second"))
         score.tracks.append(track)
-        score.dump_midi(str(path))
+        return score
+
+    def events_to_midi(self, events: np.ndarray, path: str | Path) -> None:
+        self.events_to_score(events).dump_midi(str(path))
 
 
 def sort_events(events: np.ndarray) -> np.ndarray:
