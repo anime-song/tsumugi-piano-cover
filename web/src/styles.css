@@ -874,9 +874,13 @@ input[type="range"]:disabled {
 }
 .roll {
   position: relative;
+  /* たたむときに動かせるよう、高さを持たせる (canvas は同じ --roll-h で描いている) */
+  height: var(--roll-h, 300px);
+  overflow: hidden;
   /* 画面の高さに合わせる。低い画面では 170px で下限、高い画面でも 340px まで
      (巻物が高くなりすぎて下のテイク一覧を消さないように) */
   --roll-h: clamp(170px, 30vh, 340px);
+  transition: height 0.22s ease, opacity 0.22s ease;
 }
 .roll canvas {
   display: block;
@@ -909,6 +913,20 @@ input[type="range"]:disabled {
   gap: 6px;
   white-space: nowrap;
   overflow: hidden;
+  max-height: 64px; /* たたむときに max-height を 0 にして動かす */
+  transition: max-height 0.22s ease, opacity 0.22s ease, padding 0.22s ease;
+}
+/* たたむと見出しだけが残り、下のテイク一覧に場所をあける。
+   display: none だと動かないので、高さと不透明度で畳む (roll-zoom は .roll の中なので一緒に隠れる) */
+.roll-card.collapsed .roll {
+  height: 0;
+  opacity: 0;
+}
+.roll-card.collapsed .roll-hint {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  opacity: 0;
 }
 .roll-hint-text {
   min-width: 0;
@@ -1280,11 +1298,6 @@ input[type="range"]:disabled {
   .roll-toggle {
     display: inline-flex;
   }
-  .roll-card.collapsed .roll,
-  .roll-card.collapsed .roll-zoom,
-  .roll-card.collapsed .roll-hint {
-    display: none;
-  }
   .roll {
     /* 画面の高さに合わせる。低い画面では低めに */
     --roll-h: clamp(170px, 28vh, 300px);
@@ -1532,12 +1545,6 @@ input[type="range"]:disabled {
   .studio[data-tab="play"] .roll {
     /* 画面の高さに合わせる。低い画面では 190px で下限 */
     --roll-h: clamp(190px, 34vh, 360px);
-  }
-  /* たたむと見出しだけが残り、下のテイク一覧に場所をあける */
-  .studio[data-tab="play"] .roll-card.collapsed .roll,
-  .studio[data-tab="play"] .roll-card.collapsed .roll-zoom,
-  .studio[data-tab="play"] .roll-card.collapsed .roll-hint {
-    display: none;
   }
   .studio[data-tab="play"] .takes-scroll {
     overflow: visible;
