@@ -408,42 +408,45 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
         </section>
 
         <aside className="right">
-          {selectedTake ? (
-            <TakeDetail
-              take={selectedTake}
-              config={config}
-              position={() => (player.loopOn && player.loop ? player.loop[0] : player.position())}
-              midiUrl={urls.takeMidi(pid, selectedTake.id)}
-              onRename={(name) => updateTake(selectedTake, { name })}
-              onMemo={(memo) => updateTake(selectedTake, { memo })}
-              onFavorite={() => updateTake(selectedTake, { favorite: !selectedTake.favorite })}
-              onReuse={() => reuse(selectedTake)}
-              onContinue={(seconds) => {
-                setContinueFrom({ take: selectedTake.id, seconds: Math.round(seconds * 100) / 100 });
-                reuse(selectedTake);
-              }}
-              onWav={() =>
-                run(async () => {
-                  const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));
-                  await downloadCoverWav(view.notes, `${data.title}_${takeLabel(selectedTake, t)}.wav`);
-                })
-              }
-              onDelete={() => deleteTake(selectedTake)}
-            />
-          ) : (
-            <div className="detail empty muted">{t.selectTakeHint}</div>
-          )}
+          {/* 携帯と広い画面の間だけ出る開閉ハンドル (三角)。詳細の中に置いてあるので、
+              開閉の transform と一緒に動く (外に置くと別々のアニメーションになってずれる) */}
+          <button
+            className={`details-handle ${detailsOpen ? "open" : ""}`}
+            onClick={() => setDetailsOpen(!detailsOpen)}
+            aria-expanded={detailsOpen}
+            aria-label={t.detailsHelp}
+            title={t.detailsHelp}
+          >
+            <Icon name="caret" size={22} filled />
+          </button>
+          <div className="right-scroll">
+            {selectedTake ? (
+              <TakeDetail
+                take={selectedTake}
+                config={config}
+                position={() => (player.loopOn && player.loop ? player.loop[0] : player.position())}
+                midiUrl={urls.takeMidi(pid, selectedTake.id)}
+                onRename={(name) => updateTake(selectedTake, { name })}
+                onMemo={(memo) => updateTake(selectedTake, { memo })}
+                onFavorite={() => updateTake(selectedTake, { favorite: !selectedTake.favorite })}
+                onReuse={() => reuse(selectedTake)}
+                onContinue={(seconds) => {
+                  setContinueFrom({ take: selectedTake.id, seconds: Math.round(seconds * 100) / 100 });
+                  reuse(selectedTake);
+                }}
+                onWav={() =>
+                  run(async () => {
+                    const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));
+                    await downloadCoverWav(view.notes, `${data.title}_${takeLabel(selectedTake, t)}.wav`);
+                  })
+                }
+                onDelete={() => deleteTake(selectedTake)}
+              />
+            ) : (
+              <div className="detail empty muted">{t.selectTakeHint}</div>
+            )}
+          </div>
         </aside>
-        {/* 携帯と広い画面の間だけ出る、詳細の左端に貼り付く開閉ハンドル (三角) */}
-        <button
-          className={`details-handle ${detailsOpen ? "open" : ""}`}
-          onClick={() => setDetailsOpen(!detailsOpen)}
-          aria-expanded={detailsOpen}
-          aria-label={t.detailsHelp}
-          title={t.detailsHelp}
-        >
-          <Icon name="caret" size={22} filled />
-        </button>
       </div>
       <PlayerBar
         player={player}
