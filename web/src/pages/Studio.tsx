@@ -282,15 +282,6 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
               </div>
             </div>
             <div className="song-actions">
-              {/* 携帯と広い画面の間だけに出る。詳細を右に重ねて開く */}
-              <button
-                className={`btn small details-toggle ${detailsOpen ? "on" : ""}`}
-                onClick={() => setDetailsOpen(!detailsOpen)}
-                aria-expanded={detailsOpen}
-                title={t.detailsHelp}
-              >
-                <Icon name="layers" size={15} /> {t.tabDetail}
-              </button>
               {data.source && (
                 <a className="btn small" href={urls.sourceMidi(pid)} download>
                   <Icon name="download" size={15} /> {t.sourceMidi}
@@ -443,6 +434,16 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
             <div className="detail empty muted">{t.selectTakeHint}</div>
           )}
         </aside>
+        {/* 携帯と広い画面の間だけ出る、詳細の左端に貼り付く開閉ハンドル (三角) */}
+        <button
+          className={`details-handle ${detailsOpen ? "open" : ""}`}
+          onClick={() => setDetailsOpen(!detailsOpen)}
+          aria-expanded={detailsOpen}
+          aria-label={t.detailsHelp}
+          title={t.detailsHelp}
+        >
+          <Icon name="caret" size={11} filled />
+        </button>
       </div>
       <PlayerBar
         player={player}

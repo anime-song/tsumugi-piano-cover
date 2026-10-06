@@ -91,8 +91,8 @@ textarea {
   height: 100dvh;
 }
 
-/* 携帯と広い画面の間だけに出る詳細の開閉ボタン */
-.details-toggle {
+/* 携帯と広い画面の間だけに出る、詳細の開閉ハンドル (詳細の左端に貼り付く三角) */
+.details-handle {
   display: none;
 }
 
@@ -1303,6 +1303,11 @@ input[type="range"]:disabled {
   .studio[data-details="closed"] > .right {
     display: none;
   }
+  /* ハンドルが右端に重なるので、テイクのカードは少し内側で折り返す */
+  .studio .center.has-roll .takes-scroll {
+    margin-right: 0;
+    padding-right: 28px;
+  }
   .studio[data-details="open"] > .right {
     position: absolute;
     top: 0;
@@ -1313,14 +1318,36 @@ input[type="range"]:disabled {
     border-left: 1px solid var(--line);
     box-shadow: -18px 0 32px rgba(0, 0, 0, 0.45);
   }
-  .details-toggle {
+  .details-handle {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    justify-content: center;
+    position: absolute;
+    top: 50%;
+    right: 0; /* たたんでいるときは画面の右端 */
+    transform: translateY(-50%);
+    z-index: 21;
+    width: 18px;
+    height: 56px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-right: none;
+    border-radius: 10px 0 0 10px;
+    background: var(--panel-2);
+    color: var(--text-2);
+    cursor: pointer;
   }
-  .details-toggle.on {
-    border-color: var(--accent);
+  .details-handle svg {
+    transition: transform 0.15s;
+  }
+  /* 開いたら詳細の左端に貼り付いて、三角は逆向き (たたむ) になる */
+  .studio[data-details="open"] .details-handle {
+    right: min(360px, 45%);
     color: var(--text);
+    box-shadow: -6px 0 16px rgba(0, 0, 0, 0.35);
+  }
+  .studio[data-details="open"] .details-handle svg {
+    transform: rotate(180deg);
   }
 }
 

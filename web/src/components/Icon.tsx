@@ -18,6 +18,8 @@ const PATHS: Record<string, string> = {
   sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
   layers: "M12 4 3 9l9 5 9-5zM3 14l9 5 9-5",
   chip: "M7 7h10v10H7zM9.5 3v4M14.5 3v4M9.5 17v4M14.5 17v4M3 9.5h4M3 14.5h4M17 9.5h4M17 14.5h4",
+  // 右向きの三角 (詳細を開く / たたむハンドル。CSS で回して使う)
+  caret: "M9.5 5.5 16 12l-6.5 6.5z",
 };
 
 export function Icon({ name, size = 18, filled }: { name: string; size?: number; filled?: boolean }) {
