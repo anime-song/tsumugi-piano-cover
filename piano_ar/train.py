@@ -148,17 +148,19 @@ def context_patches(args: dict | argparse.Namespace, patch_seconds: float) -> in
 def adapt_state(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """以前のチェックポイントの重みを、今の model に読めるようにする。
 
-    チャンネルの埋め込みが model より少なければ、既存の分をそのまま使い、増えた分は model の初期値にする
-    (channel_index は追記だけなので番号は変わらない)。あとから足した部分 (強弱の条件など) がなければ model の初期値
-    (0 で始まるので、足す前と同じ出力) を使う。
+    チャンネルの埋め込みが model より少なければ、既存の分をそのまま使い、増えた分は「チャンネル指定なし」(0 番) の
+    写しにする (channel_index は追記だけなので番号は変わらない)。0 番は学習で大きな値になっていることがあり、
+    model の初期値から始めると、新しいチャンネルの曲では入力が大きくずれる。
+    あとから足した部分 (強弱の条件など) がなければ model の初期値 (0 で始まるので、足す前と同じ出力) を使う。
     """
     state = dict(state)
     current = model.state_dict()
     key = "channel_embedding.weight"
     old, new = state[key], current[key]
     if old.shape[0] < new.shape[0]:
-        state[key] = torch.cat([old.to(new.dtype), new[old.shape[0] :].to(old.device)])
-        print(f"チャンネルの埋め込みを {old.shape[0]} -> {new.shape[0]} に増やした")
+        added = old[:1].expand(new.shape[0] - old.shape[0], -1)
+        state[key] = torch.cat([old, added]).to(new.dtype)
+        print(f"チャンネルの埋め込みを {old.shape[0]} -> {new.shape[0]} に増やした (増えた分は 0 番の写し)")
     for key in current.keys() - state.keys():
         if key.startswith("dynamics_embedding"):
             state[key] = current[key]
