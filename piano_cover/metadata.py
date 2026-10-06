@@ -9,10 +9,15 @@
 ピアノ 1 本なので、原曲の全トラックの歌詞をまとめてそのピアノトラックに置く。
 
 notes / controls はカバーのもの、メタデータと歌詞は原曲のものを、という分担。
+
+書き出すのは 1 回だけにする。書いてから写すと秒 -> tick の丸めが 2 回起きるので、
+`score_for_cover` でメタデータを入れた Score を作ってから `dump_midi` する。
+`copy_metadata` は、メタデータなしで書かれた古いテイクを 1 回だけ直すためのもの。
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # 写す対象 (Score の属性名)
@@ -26,49 +31,47 @@ def lyrics_of(score) -> list[tuple[float, str]]:
     return items
 
 
-def _snapshot(score) -> tuple:
-    """比較用に、メタデータを丸めた数の組にする (秒は 0.1 ms まで)"""
-    def at(value: float) -> float:
-        return round(float(value), 4)
-
-    return (
-        tuple((at(t.time), round(float(t.qpm), 4)) for t in score.tempos),
-        tuple((at(t.time), int(t.numerator), int(t.denominator)) for t in score.time_signatures),
-        tuple((at(k.time), int(k.key), int(k.tonality)) for k in score.key_signatures),
-        tuple((at(m.time), str(m.text)) for m in score.markers),
-        tuple((at(time), text) for time, text in lyrics_of(score)),
-    )
-
-
-def copy_metadata(source: str | Path, target: str | Path, *, force: bool = False) -> bool:
-    """source のテンポ・拍子・調・マーカー・歌詞を target に写して書き戻す。
-
-    すでに同じものが入っていれば何もしない (何度呼んでも結果は同じ)。
-    書き換えたら True、そのままなら False を返す。
-    """
-    from symusic import Score
-
-    src = Score(str(source)).to("second")
-    out = Score(str(target)).to("second")
-    if not force and _snapshot(src) == _snapshot(out):
-        return False
+def apply_metadata(score, source) -> None:
+    """source のテンポ・拍子・調・マーカー・歌詞を score に写す (どちらも秒の Score)"""
+    from symusic import TextMeta
 
     for name in META_BLOCKS:
-        items = [item.copy() for item in getattr(src, name)]
-        block = getattr(out, name)
+        items = [item.copy() for item in getattr(source, name)]
+        block = getattr(score, name)
         block.clear()
         for item in items:
             block.append(item)
 
     # 歌詞はトラックごとの情報なので、まとめてカバーのピアノトラックに置く
-    from symusic import TextMeta
+    for track in score.tracks:
+        track.lyrics.clear()
+    lyrics = lyrics_of(source)
+    if lyrics and score.tracks:
+        for time, text in lyrics:
+            score.tracks[0].lyrics.append(TextMeta(time, text, "second"))
 
-    lyrics = lyrics_of(src)
-    if lyrics_of(out) != lyrics:
-        for track in out.tracks:
-            track.lyrics.clear()
-        if lyrics and out.tracks:
-            for time, text in lyrics:
-                out.tracks[0].lyrics.append(TextMeta(time, text, "second"))
-    out.dump_midi(str(target))
+
+def score_for_cover(tokenizer, events, source):
+    """原曲のメタデータを入れた、カバーの Score を作る (書き出しは呼ぶ側で 1 回だけ)"""
+    score = tokenizer.events_to_score(events)
+    if source is not None:
+        apply_metadata(score, source)
+    return score
+
+
+def copy_metadata(source: str | Path, target: str | Path) -> bool:
+    """メタデータなしで書かれた古いテイクの MIDI を、原曲のメタデータつきに書き直す。
+
+    notes / controls は target のものを使い、書き出しは一時ファイルに書いてから置き換える
+    (読んでいる側や同時のダウンロードに、書きかけのファイルを見せない)。
+    秒 -> tick の丸めは 1 回だけ。何度も呼ぶとその分ずれるので、呼ぶ側が「1 回だけ」を守ること。
+    """
+    from symusic import Score
+
+    src = Score(str(source)).to("second")
+    out = Score(str(target)).to("second")
+    apply_metadata(out, src)
+    tmp = Path(target).with_suffix(".mid.tmp")
+    out.dump_midi(str(tmp))
+    os.replace(tmp, target)
     return True
