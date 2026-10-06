@@ -809,9 +809,27 @@ input[type="range"]:disabled {
 .roll-title .spinner {
   flex-shrink: 0;
 }
-/* 巻物の開閉ボタン (携帯だけ。広い画面では出さない) */
+/* 巻物の開閉ボタン。既定は隠しておき、画面が低いときと携帯の幅で出す
+   (低い画面では、たたんで下のテイク一覧に場所をあけるために使う) */
 .roll-toggle {
   display: none;
+  align-items: center;
+  gap: 4px;
+  min-height: 36px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.roll-toggle svg {
+  transition: transform 0.15s;
+}
+.roll-toggle.open svg {
+  transform: rotate(180deg);
 }
 .legend {
   display: flex;
@@ -1221,26 +1239,23 @@ input[type="range"]:disabled {
   --fill: 50%;
 }
 
-/* ------------------------------------------------------------ 狭い画面 */
-/* 右の詳細が下に回り込む幅、または画面が低いときは、巻物と一覧を分けずに 1 つの
-   スクロールに戻す。分けたままだと、巻物 + 歌の見出しで一覧の場所が残らない
-   (1366x650 だと一覧が 40〜50px しか見えない)。 */
-@media (max-width: 1280px), (max-height: 800px) {
-  .center.has-roll {
-    display: block;
-    overflow-y: auto;
-    padding: 18px 20px 24px;
+/* ------------------------------------------------------------ 低い画面 */
+/* 画面が低いときは、幅に関係なく巻物をたたんで一覧に場所をあけられるようにする。
+   中央欄そのものをスクロールさせると巻物と一覧がどちらも中途半端になるので、
+   「巻物は固定・一覧だけがスクロール」の形は変えず、たたむボタンと低い巻物だけを足す
+   (1366x650 のような画面だと、たたまないと一覧が 40〜50px しか残らない)。 */
+@media (max-height: 800px) {
+  .roll-toggle {
+    display: inline-flex;
   }
-  .center.has-roll .takes-scroll {
-    overflow: visible;
-    margin-right: 0;
-    padding: 0;
+  .roll-card.collapsed .roll,
+  .roll-card.collapsed .roll-zoom,
+  .roll-card.collapsed .roll-hint {
+    display: none;
   }
-  .center.has-roll .takes-head {
-    position: static;
-    background: none;
-    padding: 0;
-    margin-bottom: 8px;
+  .roll {
+    /* 画面の高さに合わせる。低い画面では低めに */
+    --roll-h: clamp(170px, 28vh, 300px);
   }
 }
 
@@ -1383,23 +1398,6 @@ input[type="range"]:disabled {
   .studio[data-tab="play"] .roll-toggle {
     display: inline-flex;
     grid-area: toggle;
-    align-items: center;
-    gap: 4px;
-    min-height: 36px;
-    padding: 4px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    background: var(--panel-2);
-    color: var(--text-2);
-    font-size: 12px;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  .studio[data-tab="play"] .roll-toggle svg {
-    transition: transform 0.15s;
-  }
-  .studio[data-tab="play"] .roll-toggle.open svg {
-    transform: rotate(180deg);
   }
   .studio[data-tab="play"] .legend {
     grid-area: legend;
