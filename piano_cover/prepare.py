@@ -24,7 +24,8 @@
 あとから作った対応 (version 3、local/align_mined.py) は原曲側が最初から音声の絶対時刻なので戻さない。
 
 dataset_mined.json の組のカバーは事前学習に入っているので、原曲の分け方に関係なく学習側に入れる
-(検証・テスト側の原曲の曲なら入れない)。チャンネルは事前学習の一覧の演奏者から引く。
+(検証・テスト側の原曲の曲なら入れない)。dataset.json にない原曲 (足した組で初めて出てくる曲) は検証・テストに
+カバーがないので、ハッシュに関係なく学習側にする。チャンネルは事前学習の一覧の演奏者から引く。
 原曲と長さが大きく違うカバー (カバー / 原曲 が --min-length-ratio〜--max-length-ratio の外) は入れない。
 --exclude にカバーの動画 ID の一覧 (JSON の配列) を渡すと、そのカバーは入れない (組の品質を確かめて弾いたものなど)。
 今の組では、範囲外のカバーはメロディの一致率 (下記) の中央値が 0.3 前後しかなく (範囲内は 0.69)、
@@ -374,6 +375,7 @@ def main() -> None:
     covers_of: dict[str, list[str]] = {}
     for entry in pairs.values():
         covers_of.setdefault(entry["original"], []).extend(entry["pianos"])
+    paired_originals = set(covers_of)
     mined: set[str] = set()
     if not args.no_mined and MINED_DATASET.exists():
         import csv
@@ -431,6 +433,8 @@ def main() -> None:
                 print(f"失敗 {result}")
                 continue
             split = split_of(result["original_id"], args.val_percent, args.test_percent)
+            if result["original_id"] not in paired_originals:
+                split = 0
             kept = []
             for cover in result["covers"]:
                 piano_id, end_frame = cover[0], cover[2]
