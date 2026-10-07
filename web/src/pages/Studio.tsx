@@ -70,6 +70,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   const [tab, setTab] = useState<Tab>("play");
   // 携帯で巻物をたたむかどうか (広い画面では styles.css がボタンごと隠す)
   const [rollOpen, setRollOpen] = useState(true);
+  // 携帯と広い画面の間の幅では、右の詳細を既定でたたんでおく (押すと重ねて開く)
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [continueFrom, setContinueFrom] = useState<ContinueFrom | null>(null);
   const [draft, setDraftState] = useState<Draft>(() => loadDraft(pid, config));
   const setDraft = (d: Draft) => {
@@ -256,7 +258,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
           </button>
         ))}
       </nav>
-      <div className="studio" data-tab={tab}>
+      <div className="studio" data-tab={tab} data-details={detailsOpen ? "open" : "closed"}>
         <CreatePanel
           config={config}
           draft={draft}
@@ -406,31 +408,44 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
         </section>
 
         <aside className="right">
-          {selectedTake ? (
-            <TakeDetail
-              take={selectedTake}
-              config={config}
-              position={() => (player.loopOn && player.loop ? player.loop[0] : player.position())}
-              midiUrl={urls.takeMidi(pid, selectedTake.id)}
-              onRename={(name) => updateTake(selectedTake, { name })}
-              onMemo={(memo) => updateTake(selectedTake, { memo })}
-              onFavorite={() => updateTake(selectedTake, { favorite: !selectedTake.favorite })}
-              onReuse={() => reuse(selectedTake)}
-              onContinue={(seconds) => {
-                setContinueFrom({ take: selectedTake.id, seconds: Math.round(seconds * 100) / 100 });
-                reuse(selectedTake);
-              }}
-              onWav={() =>
-                run(async () => {
-                  const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));
-                  await downloadCoverWav(view.notes, `${data.title}_${takeLabel(selectedTake, t)}.wav`);
-                })
-              }
-              onDelete={() => deleteTake(selectedTake)}
-            />
-          ) : (
-            <div className="detail empty muted">{t.selectTakeHint}</div>
-          )}
+          {/* 携帯と広い画面の間だけ出る開閉ハンドル (三角)。詳細の中に置いてあるので、
+              開閉の transform と一緒に動く (外に置くと別々のアニメーションになってずれる) */}
+          <button
+            className={`details-handle ${detailsOpen ? "open" : ""}`}
+            onClick={() => setDetailsOpen(!detailsOpen)}
+            aria-expanded={detailsOpen}
+            aria-label={t.detailsHelp}
+            title={t.detailsHelp}
+          >
+            <Icon name="chevron" size={22} />
+          </button>
+          <div className="right-scroll">
+            {selectedTake ? (
+              <TakeDetail
+                take={selectedTake}
+                config={config}
+                position={() => (player.loopOn && player.loop ? player.loop[0] : player.position())}
+                midiUrl={urls.takeMidi(pid, selectedTake.id)}
+                onRename={(name) => updateTake(selectedTake, { name })}
+                onMemo={(memo) => updateTake(selectedTake, { memo })}
+                onFavorite={() => updateTake(selectedTake, { favorite: !selectedTake.favorite })}
+                onReuse={() => reuse(selectedTake)}
+                onContinue={(seconds) => {
+                  setContinueFrom({ take: selectedTake.id, seconds: Math.round(seconds * 100) / 100 });
+                  reuse(selectedTake);
+                }}
+                onWav={() =>
+                  run(async () => {
+                    const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));
+                    await downloadCoverWav(view.notes, `${data.title}_${takeLabel(selectedTake, t)}.wav`);
+                  })
+                }
+                onDelete={() => deleteTake(selectedTake)}
+              />
+            ) : (
+              <div className="detail empty muted">{t.selectTakeHint}</div>
+            )}
+          </div>
         </aside>
       </div>
       <PlayerBar
