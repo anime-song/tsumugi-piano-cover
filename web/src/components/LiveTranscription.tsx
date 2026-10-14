@@ -44,7 +44,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
         seq.current = live.seq;
         setStems(live.stems);
         setStage(live.stage);
-        setProgress(live.progress);
+        setProgress(live.progress ?? null); // 進み具合を返さないサーバでも落ちないように
         if (!live.active && !active) return;
       } catch (e) {
         // 古いサーバ (この API がない) なら出さない。それ以外は一時的なものとして次で取り直す
@@ -135,7 +135,7 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   const stemNames = t.stems as Record<string, string>;
   // 分離の進み具合は、採譜が終わったあと (失敗・中止も含む) に残らないようにする。
   // jobs.py 側は最後の状態をそのまま返すので、出すのは実行中だけ
-  const showProgress = active && progress !== null && progress.total > 0;
+  const showProgress = active && !!progress && progress.total > 0;
 
   return (
     <div className="live">
