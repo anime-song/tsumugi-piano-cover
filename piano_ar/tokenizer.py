@@ -8,6 +8,12 @@ duration はビン化前のフレーム数のまま持つので、時間伸縮�
     patch   := event* (EOP | EOS)
 TIME は直前のイベントと onset が同じなら省略する (和音は PITCH DUR VEL が続く)。パッチ先頭のイベントは必ず TIME を持つ。
 同じ onset の中は PEDAL_OFF -> PEDAL_ON -> ノート (pitch 昇順) の順に並べる。EOS は曲の終わりを含むパッチの終端。
+
+DUR のビンは、離鍵 (onset + 長さ) がペダルのどの区間にあるかを元の長さと変えないものを選ぶ (pedal_safe_duration_bins)。
+一番近いビンに丸めるだけだと、長いビンほど刻みが粗いので、ペダルで伸びていた音が伸びなくなったり、逆にはみ出して
+伸びたりする (カバー 6,965 本で 1.9% の音、鳴る長さが 300ms 以上変わる音 0.9%)。選び直すと 0.04% になる。
+同じフレームの離鍵は、そのフレームのペダルより前とみなす (同時の PEDAL_ON には捕まらない)。MIDI に書くときは
+この並びになるよう、PEDAL_ON を PEDAL_ON_DELAY 秒だけ遅らせる。
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ NUM_SPECIAL_TOKENS = 5
 # イベント配列の列と kind。kind の値は同じ onset 内の並び順も兼ねる
 ONSET, KIND, PITCH, DURATION, VELOCITY = range(5)
 KIND_PEDAL_OFF, KIND_PEDAL_ON, KIND_NOTE = 0, 1, 2
+
+# 同じ時刻の離鍵より後にペダルが踏まれるよう、MIDI に書くときに PEDAL_ON を遅らせる秒数 (events_to_score)
+PEDAL_ON_DELAY = 0.001
 
 # 損失をトークンの種類別に見るためのグループ
 TOKEN_GROUPS = ("end", "pedal", "time", "pitch", "duration", "velocity")
@@ -73,6 +82,26 @@ class PianoTokenizer:
     # ------------------------------------------------------------------
     def duration_bin(self, frames: np.ndarray | int) -> np.ndarray:
         return np.searchsorted(self._duration_bounds, frames)
+
+    def pedal_safe_duration_bins(self, notes: np.ndarray, pedal_bounds: np.ndarray) -> np.ndarray:
+        """notes (イベント配列のノートの行) の DUR のビン。離鍵がペダルの同じ区間に入るビンのうち、元の離鍵に
+        一番近いものを選ぶ (一番近いビンがそうならそのまま)。pedal_bounds はペダルの on, off, on, off, ... のフレーム"""
+        bins = np.asarray(self.duration_bin(notes[:, DURATION]))
+        if len(pedal_bounds) == 0 or len(notes) == 0:
+            return bins
+        onset = notes[:, ONSET].astype(np.int64)
+        release = onset + notes[:, DURATION]
+        side = np.searchsorted(pedal_bounds, release, side="left")
+        rounded = np.searchsorted(pedal_bounds, onset + self.duration_values[bins], side="left")
+        for i in np.flatnonzero(side != rounded):
+            s = side[i]
+            lo = pedal_bounds[s - 1] if s > 0 else -np.inf
+            hi = pedal_bounds[s] if s < len(pedal_bounds) else np.inf
+            candidates = onset[i] + self.duration_values
+            ok = np.flatnonzero((candidates > lo) & (candidates <= hi))
+            if len(ok):
+                bins[i] = ok[np.argmin(np.abs(candidates[ok] - release[i]))]
+        return bins
 
     def velocity_bin(self, velocity: np.ndarray | int) -> np.ndarray:
         return np.clip(
@@ -140,13 +169,17 @@ class PianoTokenizer:
     # ------------------------------------------------------------------
     # イベント配列 -> パッチごとのトークン
     # ------------------------------------------------------------------
-    def event_tokens(self, row: np.ndarray, local_onset: int, with_time: bool) -> list[int]:
+    def event_tokens(
+        self, row: np.ndarray, local_onset: int, with_time: bool, duration_bin: int | None = None
+    ) -> list[int]:
         tokens = [self.time_offset + local_onset] if with_time else []
         kind = row[KIND]
         if kind == KIND_NOTE:
+            if duration_bin is None:
+                duration_bin = int(self.duration_bin(row[DURATION]))
             tokens += [
                 self.pitch_offset + int(row[PITCH]) - self.config.pitch_min,
-                self.duration_offset + int(self.duration_bin(row[DURATION])),
+                self.duration_offset + int(duration_bin),
                 self.velocity_offset + int(self.velocity_bin(row[VELOCITY])),
             ]
         else:
@@ -191,13 +224,20 @@ class PianoTokenizer:
         relative = relative[selected]
         patch_index = relative // F
         bounds = np.searchsorted(patch_index, np.arange(num_valid + 1))
+        # ペダルとの関係を保つ DUR のビン (ペダルの境界は窓の外のものも使う。on と off は交互に並んでいる)
+        pedal_bounds = events[events[:, KIND] != KIND_NOTE, ONSET].astype(np.int64)
+        is_note = window_events[:, KIND] == KIND_NOTE
+        duration_bins = np.zeros(len(window_events), dtype=np.int64)
+        duration_bins[is_note] = self.pedal_safe_duration_bins(window_events[is_note], pedal_bounds)
 
         for p in range(num_valid):
             sequence: list[int] = []
             previous_onset = -1
             for i in range(bounds[p], bounds[p + 1]):
                 local_onset = int(relative[i] - p * F)
-                event = self.event_tokens(window_events[i], local_onset, local_onset != previous_onset)
+                event = self.event_tokens(
+                    window_events[i], local_onset, local_onset != previous_onset, int(duration_bins[i])
+                )
                 if len(sequence) + len(event) > L - 1:
                     break
                 sequence += event
@@ -250,7 +290,9 @@ class PianoTokenizer:
             if kind == KIND_NOTE:
                 track.notes.append(Note(onset / fr, duration / fr, pitch, velocity, "second"))
             else:
-                track.controls.append(ControlChange(onset / fr, 64, 127 if kind == KIND_PEDAL_ON else 0, "second"))
+                # 同じ時刻の離鍵の後に踏む (離鍵はそのフレームのペダルより前とみなしてトークン化している)
+                time = onset / fr + (PEDAL_ON_DELAY if kind == KIND_PEDAL_ON else 0.0)
+                track.controls.append(ControlChange(time, 64, 127 if kind == KIND_PEDAL_ON else 0, "second"))
         score.tracks.append(track)
         return score
 
