@@ -31,11 +31,15 @@ from .arrangement import ARRANGEMENT_NAMES, arrangement_values, map_to_source
 from .config import CoverConfig
 from .rollout import Rollout, RolloutBank
 from .source import (
+    INSTRUMENT_ID,
+    ROW_D,
     ROW_TYPE,
     TYPE_BEAT,
     TYPE_CHORD,
     TYPE_KEY,
+    TYPE_NOTE,
     SourceVocab,
+    is_sheetsage,
     sort_rows,
     source_features,
     stretch_rows,
@@ -43,6 +47,7 @@ from .source import (
 )
 
 SPLITS = {"train": 0, "val": 1, "test": 2}
+MELODY_ID = INSTRUMENT_ID["melody"]
 
 
 @dataclass(frozen=True)
@@ -193,7 +198,8 @@ class CoverWindowDataset(Dataset):
 
     学習用は窓の位置がランダムで、原曲とカバーに同じ時間伸縮・移調をかける (ベロシティのずらしはカバーだけ)。
     source_dropout の確率で原曲を外し (CFG 用)、structure_dropout の確率で拍・コード・キーをそれぞれ外す
-    (推定値なので、なくても動くようにする)。
+    (推定値なので、なくても動くようにする)。melody_dropout の確率で、tsumugi のメロディと SheetSage のメロディを
+    それぞれ外す (片方が間違っていても、もう片方や伴奏から弾けるようにする)。
     pretraining を渡すと、index が カバーの数 以上のときは事前学習の曲を原曲なしで返す (忘却を防ぐため混ぜる)。
     drift を渡すと、窓の前半のカバーの時刻をずらして後半で原曲に戻らせる (DriftConfig)。検証では窓ごとに決まった乱数で
     ずらすので、毎回同じ窓になる。
@@ -221,6 +227,7 @@ class CoverWindowDataset(Dataset):
         channel_dropout: float = 0.15,
         source_dropout: float = 0.1,
         structure_dropout: float = 0.2,
+        melody_dropout: float = 0.0,
         pretraining: PianoWindowDataset | None = None,
         drift: DriftConfig | None = None,
         memory_patches: int = 0,
@@ -253,6 +260,7 @@ class CoverWindowDataset(Dataset):
         self.channel_dropout = channel_dropout if self.train else 0.0
         self.source_dropout = source_dropout
         self.structure_dropout = structure_dropout if self.train else 0.0
+        self.melody_dropout = melody_dropout if self.train else 0.0
         self.covers = np.flatnonzero(cache.split == SPLITS[split])
         self.pretraining = pretraining
         self.drift = drift
@@ -356,6 +364,13 @@ class CoverWindowDataset(Dataset):
             for row_type in (TYPE_BEAT, TYPE_CHORD, TYPE_KEY):
                 if random.random() < self.structure_dropout:
                     rows = rows[rows[:, ROW_TYPE] != row_type]
+            if self.melody_dropout > 0:
+                tsumugi = (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] == MELODY_ID)
+                drop = np.zeros(len(rows), dtype=bool)
+                for melody in (tsumugi, is_sheetsage(rows)):
+                    if random.random() < self.melody_dropout:
+                        drop |= melody
+                rows = rows[~drop]
             features = source_features(rows, source_end, self.tokenizer, self.vocab, self.cover_config.max_source_rows)
             source_items = source_tensors(features)
             if self.dynamics_bins:

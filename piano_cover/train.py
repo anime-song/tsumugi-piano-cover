@@ -99,6 +99,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--source-dropout", type=float, default=0.1, help="原曲を外す確率 (CFG 用)")
     parser.add_argument("--structure-dropout", type=float, default=0.2, help="拍・コード・キーをそれぞれ外す確率")
     parser.add_argument(
+        "--melody-dropout", type=float, default=0.2, help="tsumugi と SheetSage のメロディをそれぞれ外す確率"
+    )
+    parser.add_argument(
         "--drift-prob", type=float, default=0.5, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
     )
     parser.add_argument(
@@ -322,6 +325,12 @@ def main() -> None:
         )
     else:
         pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+    sheetsage = cache.meta.get("sheetsage") or {}
+    cover_config = replace(
+        cover_config,
+        sheetsage_beats=bool(sheetsage.get("beats", False)),
+        sheetsage_melody=bool(sheetsage.get("melody", False)),
+    )
     decoder_from = None
     if args.decoder_from:
         if not args.init_cover:
@@ -369,6 +378,7 @@ def main() -> None:
         channel_dropout=args.channel_dropout,
         source_dropout=args.source_dropout,
         structure_dropout=args.structure_dropout,
+        melody_dropout=args.melody_dropout,
         pretraining=pretraining,
         drift=DriftConfig(prob=args.drift_prob) if args.drift_prob > 0 else None,
         sync_mask=not args.no_sync_mask,

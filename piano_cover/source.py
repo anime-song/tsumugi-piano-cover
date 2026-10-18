@@ -2,10 +2,15 @@
 
 原曲は「行」の配列 int32 [N, 6] = (onset, type, a, b, c, d) で持つ。時間はデコーダと同じフレーム単位。
     NOTE : a = pitch (0-127, ドラムは GM の打楽器番号), b = duration, c = velocity, d = 楽器 ID (INSTRUMENTS)
+           d が SHEETSAGE_SUNG / SHEETSAGE_PLAYED なら SheetSage2-Refined のメロディ (歌 / 楽器)
     BEAT : a = 1 なら小節の頭
     CHORD: a = root (0-11, 12 はコードなし N), b = 種類 ID (CHORD_QUALITIES), c = ベース音 (0-11, 12 は転回なし)
     KEY  : a = 主音 (0-11), b = 0 長調 / 1 短調
 時刻は原曲の音声の先頭からの絶対時刻のまま (アラインメントの原曲側の時刻と同じ基準) で、先頭の無音も詰めない。
+
+with_sheetsage で、SheetSage2-Refined (piano_ar.sheetsage) の注釈を足せる。拍は tsumugi のテンポマップのものを捨てて
+SheetSage の拍と小節の頭に置き換え、メロディは tsumugi のメロディとは別の楽器 ID の音として足す。どちらも音声の
+絶対時刻なので、そのまま並べられる (60 曲で拍の差の中央値 -12ms、メロディの onset の差 -9ms)。
 
 エンコーダに入れるときは source_features で 2 秒パッチごとに並べ、各行を埋め込み表の番号 5 個 (種類 + 属性 4 つ) にする。
 パッチの先頭には「その時点で鳴っているコード」と「その時点のキー」の行を足す。キーは曲の途中で変わるので、
@@ -38,6 +43,11 @@ INSTRUMENTS = (
 )  # fmt: skip
 INSTRUMENT_ID = {name: i for i, name in enumerate(INSTRUMENTS)}
 DRUM_ID = INSTRUMENT_ID["drums"]
+# SheetSage2-Refined のメロディの楽器 ID。tsumugi の楽器の後ろに置き、埋め込みも表の最後に足す (SourceVocab) ので、
+# これを使わない以前の原曲の行とチェックポイントはそのまま読める
+SHEETSAGE_SUNG, SHEETSAGE_PLAYED = len(INSTRUMENTS), len(INSTRUMENTS) + 1
+# 強さが分からないので、埋め込みの番号を決めるための仮の値
+SHEETSAGE_VELOCITY = 96
 
 # tsumugi のコードマーカー ("Ab:add9/C" の ":" と "/" の間) の種類。長三和音は種類なしで書かれるので "maj" にする
 CHORD_QUALITIES = (
@@ -153,6 +163,45 @@ def load_source(path: str | Path, frame_rate: int) -> tuple[np.ndarray, int]:
     return sort_rows(array).astype(np.int32), end_frame
 
 
+def sheetsage_rows(annotation: dict, frame_rate: int) -> np.ndarray:
+    """SheetSage2-Refined の注釈 (piano_ar.sheetsage の JSON) を行にする: 拍と小節の頭、メロディの音"""
+    rows = []
+    downbeats = {round(float(d) * frame_rate) for d in annotation["downbeats"]}
+    for beat in annotation["beats"]:
+        frame = round(float(beat) * frame_rate)
+        rows.append([frame, TYPE_BEAT, int(frame in downbeats), 0, 0, 0])
+    for note in annotation["melody"]:
+        onset = round(float(note["start"]) * frame_rate)
+        duration = max(1, round(float(note["end"]) * frame_rate) - onset)
+        instrument = SHEETSAGE_SUNG if note["track"] == 0 else SHEETSAGE_PLAYED
+        rows.append([onset, TYPE_NOTE, int(note["pitch"]), duration, SHEETSAGE_VELOCITY, instrument])
+    return np.asarray(rows, dtype=np.int64).reshape(-1, 6)
+
+
+def with_sheetsage(
+    rows: np.ndarray, annotation: dict, frame_rate: int, beats: bool = True, melody: bool = True
+) -> np.ndarray:
+    """tsumugi の行に SheetSage の注釈を足す。beats なら拍を置き換え、melody ならメロディの音を足す"""
+    extra = sheetsage_rows(annotation, frame_rate)
+    rows = rows.astype(np.int64)
+    parts = [rows]
+    if beats:
+        parts = [rows[rows[:, ROW_TYPE] != TYPE_BEAT], extra[extra[:, ROW_TYPE] == TYPE_BEAT]]
+    if melody:
+        parts.append(extra[extra[:, ROW_TYPE] == TYPE_NOTE])
+    return sort_rows(np.concatenate(parts)).astype(np.int32)
+
+
+def is_sheetsage(rows: np.ndarray) -> np.ndarray:
+    """SheetSage のメロディの音の行か"""
+    return (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] >= SHEETSAGE_SUNG)
+
+
+def tsumugi_notes(rows: np.ndarray) -> np.ndarray:
+    """tsumugi で採譜した音の行だけ (SheetSage のメロディを除く)"""
+    return rows[(rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] < SHEETSAGE_SUNG)]
+
+
 # 学習できる onset-bias (CoverModel の OnsetHead) で原曲の onset を分ける種類
 ONSET_GROUPS = ("melody", "keys", "guitar", "bass", "other", "kick", "snare", "drums", "beat", "downbeat", "chord")
 _INSTRUMENT_ONSET_GROUP = {
@@ -173,6 +222,8 @@ def onset_group_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     行の種類が NOTE なら楽器 (ドラムは打楽器番号) で、BEAT は小節の頭かどうか、CHORD はコードの変わり目で分ける"""
     group = {name: i for i, name in enumerate(ONSET_GROUPS)}
     instrument = np.array([group[_INSTRUMENT_ONSET_GROUP.get(name, "other")] for name in INSTRUMENTS], dtype=np.int64)
+    # SheetSage のメロディは tsumugi のメロディと同じ種類にする (種類を増やすと以前の OnsetHead が読めない)
+    instrument = np.concatenate([instrument, [group["melody"], group["melody"]]])
     drum = np.full(128, group["drums"], dtype=np.int64)
     drum[list(_KICK)] = group["kick"]
     drum[list(_SNARE)] = group["snare"]
@@ -278,6 +329,8 @@ class SourceVocab:
             "bass": 13,
             "tonic": 12,
             "mode": 2,
+            # 以前のチェックポイントの表 (source_vocab_size) はここまで。SheetSage のメロディ (歌 / 楽器) は後ろに足す
+            "sheetsage": 2,
         }
         self.offset: dict[str, int] = {}
         next_index = 1
@@ -342,6 +395,8 @@ def source_features(
     feature[note, 2] = o["duration"] + tokenizer.duration_bin(b[note])
     feature[note, 3] = o["velocity"] + tokenizer.velocity_bin(c[note])
     feature[note, 4] = o["instrument"] + d[note]
+    sheetsage = note & (d >= SHEETSAGE_SUNG)
+    feature[sheetsage, 4] = o["sheetsage"] + d[sheetsage] - SHEETSAGE_SUNG
     beat = t == TYPE_BEAT
     feature[beat, 1] = o["downbeat"] + a[beat]
     chord = (t == TYPE_CHORD) | (t == TYPE_CHORD_STATE)

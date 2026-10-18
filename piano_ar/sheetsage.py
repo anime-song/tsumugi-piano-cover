@@ -96,9 +96,7 @@ class SheetSageAnnotator:
         # HeadBeats.probabilities と HeadMelody.probabilities の変換
         beat_probs = {k: torch.sigmoid(beat_out[k]).numpy() for k in ("beat", "downbeat")}
         beat_probs |= {
-            k: torch.softmax(beat_out[k], -1).numpy()
-            for k in ("bar_beats", "beats_left", "bar_unit")
-            if k in beat_out
+            k: torch.softmax(beat_out[k], -1).numpy() for k in ("bar_beats", "beats_left", "bar_unit") if k in beat_out
         }
         beat_probs |= {k: beat_out[k].numpy() for k in OFFSETS if k in beat_out}
         melody_probs = {
@@ -202,8 +200,19 @@ def rendered(midi: list[Path], args, annotator: SheetSageAnnotator):
     python = str(Path(args.render_python).resolve()) if args.render_python else sys.executable
     workers = [
         subprocess.Popen(
-            [python, "-m", "piano_ar.render_midi", str(listing), str(queue), "--soundfont", str(args.soundfont.resolve()),
-             "--sample-rate", str(annotator.sample_rate), "--worker", f"{w}/{args.render_workers}"],
+            [
+                python,
+                "-m",
+                "piano_ar.render_midi",
+                str(listing),
+                str(queue),
+                "--soundfont",
+                str(args.soundfont.resolve()),
+                "--sample-rate",
+                str(annotator.sample_rate),
+                "--worker",
+                f"{w}/{args.render_workers}",
+            ],
             cwd=Path(__file__).resolve().parents[1],
         )  # fmt: skip
         for w in range(args.render_workers)

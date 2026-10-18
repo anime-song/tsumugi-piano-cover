@@ -36,6 +36,10 @@ class CoverConfig:
     # step 3000 でもゲート 0.004 で、原曲ありとなしの損失の差は 0.017)。重みを読み込むときは保存した値が使われるので、
     # 学習の始めだけに効く
     cross_gate_init: float = 0.0
+    # 原曲の行に SheetSage2-Refined の注釈を使って学習したか (キャッシュの meta.json の sheetsage から決まる)。
+    # 生成でも同じ形の行を作る: beats なら拍を SheetSage のものに置き換え、melody ならメロディの音を足す
+    sheetsage_beats: bool = False
+    sheetsage_melody: bool = False
 
     @classmethod
     def from_dict(cls, values: dict) -> CoverConfig:

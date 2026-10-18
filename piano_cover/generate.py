@@ -38,7 +38,10 @@ from .config import CoverConfig
 from .data import source_tensors
 from .hub import load_cover
 from .model import CoverModel, SourceCondition
-from .source import SourceVocab, load_source, onset_time_bias, source_features, trim_lead
+from .source import ROW_ONSET, SourceVocab, load_source, onset_time_bias, source_features, trim_lead, with_sheetsage
+
+# 原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の出力) の置き場所
+SHEETSAGE_DIR = Path("data/sheetsage/original")
 
 
 @dataclass
@@ -85,8 +88,27 @@ class Cover:
     patches: list[list[int]]  # パッチごとのトークン列 (lead を詰めた時間軸)。途中から作り直すときの prompt に使う
 
 
-def prepare_source(path: str | Path, tokenizer: PianoTokenizer, cover_config: CoverConfig) -> PreparedSource:
+def prepare_source(
+    path: str | Path, tokenizer: PianoTokenizer, cover_config: CoverConfig, sheetsage: str | Path | None = None
+) -> PreparedSource:
+    """sheetsage は原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の JSON)。SheetSage で学習したモデル
+    (cover_config.sheetsage_beats / sheetsage_melody) では要る。省略すると data/sheetsage/original/<原曲>.json を探す"""
     rows, end_frame = load_source(path, tokenizer.config.frame_rate)
+    if cover_config.sheetsage_beats or cover_config.sheetsage_melody:
+        annotation_path = Path(sheetsage) if sheetsage else SHEETSAGE_DIR / f"{Path(path).stem}.json"
+        if not annotation_path.exists():
+            raise FileNotFoundError(
+                f"{annotation_path} がありません。原曲の音声に python -m piano_ar.sheetsage をかけて作ってください"
+            )
+        annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+        rows = with_sheetsage(
+            rows,
+            annotation,
+            tokenizer.config.frame_rate,
+            beats=cover_config.sheetsage_beats,
+            melody=cover_config.sheetsage_melody,
+        )
+        rows = rows[rows[:, ROW_ONSET] < end_frame]
     rows, lead = trim_lead(rows)
     features = source_features(
         rows, end_frame - lead, tokenizer, SourceVocab(tokenizer.config), cover_config.max_source_rows
@@ -158,6 +180,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--source", required=True, help="原曲の MIDI (tsumugi の merged)")
+    parser.add_argument(
+        "--sheetsage",
+        default=None,
+        help="原曲の SheetSage2-Refined の注釈 (省略で data/sheetsage/original/<原曲>.json)",
+    )
     parser.add_argument("--planner", default=None, help="Planner の重みを差し替える (piano_cover.train_planner の出力)")
     parser.add_argument("--out-dir", default="outputs/piano_cover")
     parser.add_argument("--seconds", type=float, default=None, help="生成する長さ。省略で原曲の最後まで")
@@ -201,7 +228,7 @@ def main() -> None:
             channel = json.loads(Path(index_path).read_text(encoding="utf-8"))[args.channel]
 
     params = CoverParams.from_dict({**vars(args), "channel": channel, "arrangement": not args.no_arrangement})
-    source = prepare_source(args.source, tokenizer, model.config)
+    source = prepare_source(args.source, tokenizer, model.config, args.sheetsage)
     covers = generate_covers(model, source, params, num_samples=args.num_samples)
 
     out_dir = Path(args.out_dir)

@@ -10,7 +10,7 @@ import numpy as np
 
 from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PITCH
 
-from .source import INSTRUMENTS, ROW_A, ROW_D, ROW_ONSET, ROW_TYPE, TYPE_NOTE
+from .source import INSTRUMENTS, ROW_A, ROW_D, ROW_ONSET, is_sheetsage, tsumugi_notes
 
 MELODY = INSTRUMENTS.index("melody")
 DRUMS = INSTRUMENTS.index("drums")
@@ -25,9 +25,11 @@ def sync_metrics(events: np.ndarray, rows: np.ndarray, frame_rate: int, bin_seco
                    遠い onset と比べないよう、差が 150ms 以内の onset だけで測る
     melody_top     原曲のメロディの音の ±50ms で、出力の最高音が同じ音名である割合
     melody_late    メロディの音と、同じ音名の一番近い出力の音が 50ms より離れている割合 (±150ms 以内で探す)
+    melody_top_ss / melody_late_ss  同じものを SheetSage2-Refined のメロディ (行にあれば) で測ったもの
+    onset_sync と drift_std_ms の原曲の onset は tsumugi の音だけ (SheetSage のメロディを足しても変わらないように)
     """
     notes = events[events[:, KIND] == KIND_NOTE]
-    source_notes = rows[rows[:, ROW_TYPE] == TYPE_NOTE]
+    source_notes = tsumugi_notes(rows)
     reference = np.unique(source_notes[source_notes[:, ROW_D] != DRUMS, ROW_ONSET]).astype(np.float64)
     out: dict[str, float] = {}
     if len(notes) == 0 or len(reference) < 2:
@@ -44,8 +46,14 @@ def sync_metrics(events: np.ndarray, rows: np.ndarray, frame_rate: int, bin_seco
     if len(medians) >= 2:
         out["drift_std_ms"] = float(np.std(medians) / frame_rate * 1000)
 
-    melody = source_notes[(source_notes[:, ROW_D] == MELODY) & (source_notes[:, ROW_ONSET] <= notes[:, ONSET].max())]
-    if len(melody):
+    last = notes[:, ONSET].max()
+    for suffix, melody in (
+        ("", source_notes[source_notes[:, ROW_D] == MELODY]),
+        ("_ss", rows[is_sheetsage(rows)]),
+    ):
+        melody = melody[melody[:, ROW_ONSET] <= last]
+        if len(melody) == 0:
+            continue
         top, late = [], []
         for onset, pitch in melody[:, [ROW_ONSET, ROW_A]]:
             near = notes[np.abs(notes[:, ONSET] - onset) <= tol50]
@@ -53,6 +61,6 @@ def sync_metrics(events: np.ndarray, rows: np.ndarray, frame_rate: int, bin_seco
             same = notes[notes[:, PITCH] % 12 == pitch % 12, ONSET] - onset
             same = np.abs(same[np.abs(same) <= tol150])
             late.append(len(same) == 0 or same.min() > tol50)
-        out["melody_top"] = float(np.mean(top))
-        out["melody_late"] = float(np.mean(late))
+        out[f"melody_top{suffix}"] = float(np.mean(top))
+        out[f"melody_late{suffix}"] = float(np.mean(late))
     return out
