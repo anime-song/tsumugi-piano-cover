@@ -14,6 +14,11 @@
 --dynamics-dropout の確率で外して学習するので、条件なしでも生成できる。
 検証の損失がそれまでで最も低くなったら out-dir/best.pt にも保存する。
 --sample-every ごとに曲を生成して out-dir/samples に MIDI で保存し、wandb には音声とピアノロールを送る。
+
+--beat-tokens で拍のトークン (piano_ar.beat_tokenizer、1 パッチ = 1 小節) で学習する。キャッシュには
+piano_ar.prepare_beats で拍を足しておく。窓と記憶は小節の数 (--window-bars / --memory-bars) で決め、小節の拍数と
+テンポを Global の条件に入れる。--init-from に時刻のトークンのモデル (piano_ar_long など) を渡すと、Transformer の
+本体だけを引き継ぎ、語彙の変わる埋め込みと出力層は新しく作る。
 """
 
 from __future__ import annotations
@@ -31,7 +36,9 @@ import torch
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader
 
-from .config import ModelConfig
+from .beat_data import BeatAnnotations, BeatWindowDataset
+from .beat_tokenizer import BeatTokenizer
+from .config import BeatTokenizerConfig, ModelConfig
 from .data import AugmentConfig, PianoWindowDataset, PretrainingCache, collate, make_sampler
 from .evaluation import piano_roll_image, sample_stats, synthesize
 from .model import PianoARModel
@@ -50,6 +57,11 @@ def build_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-seconds", type=float, default=192.0, help="窓の前に付ける記憶 (文脈) の長さ。窓と合わせて曲全体を見る"
     )
+    parser.add_argument("--beat-tokens", action="store_true", help="拍のトークン (1 パッチ = 1 小節) で学習する")
+    parser.add_argument("--window-bars", type=int, default=32, help="拍のトークン: 損失を取る窓の小節数")
+    parser.add_argument("--memory-bars", type=int, default=96, help="拍のトークン: 窓の前に付ける記憶の小節数")
+    parser.add_argument("--sample-bars", type=int, default=16, help="拍のトークン: 生成評価の小節数")
+    parser.add_argument("--prompt-bars", type=int, default=4, help="拍のトークン: 続き生成で与える小節数")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--steps", type=int, default=50_000, help="optimizer の更新回数")
@@ -112,7 +124,7 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--sample-top-p", type=float, default=0.95)
     # モデルの大きさ (ModelConfig の各項目を --dim などで上書きできる)
     for field in fields(ModelConfig):
-        if field.name != "num_channels":
+        if field.name not in ("num_channels", "max_bar_beats", "tempo_bins"):
             parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(field.default), default=field.default)
     # ModelConfig の既定値 0 は以前のチェックポイントを読むためのもの。新しく学習するときは強弱の条件を入れる
     parser.set_defaults(dynamics_bins=24)
@@ -165,6 +177,15 @@ def adapt_state(state: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[
         if key.startswith("dynamics_embedding"):
             state[key] = current[key]
             print(f"{key} はチェックポイントにないので新しく作る")
+    for key in current.keys() - state.keys():
+        if key.startswith(("bar_embedding", "tempo_embedding")):
+            state[key] = current[key]
+            print(f"{key} はチェックポイントにないので新しく作る")
+    for key in ("token_embedding.weight", "head.weight"):
+        if key in state and state[key].shape != current[key].shape:
+            # 語彙が変わった (時刻のトークン -> 拍のトークン): 本体だけを引き継ぎ、埋め込みと出力層は新しく作る
+            state[key] = current[key]
+            print(f"{key} は語彙が違うので新しく作る")
     key = "dynamics_embedding.weight"
     if key in state and state[key].shape[0] < current[key].shape[0]:
         # 条件の列を後ろに足した: 既存の列はそのまま、足した列は model の初期値 (0) にする
@@ -193,7 +214,9 @@ def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str,
 
 
 @torch.no_grad()
-def evaluate(model: PianoARModel, loader: DataLoader, device: torch.device, length_buckets: int = 8) -> dict[str, float]:
+def evaluate(
+    model: PianoARModel, loader: DataLoader, device: torch.device, length_buckets: int = 8
+) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
     count = 0
@@ -293,6 +316,82 @@ def sample_evaluation(
         wandb_run.log(logs, step=step)
 
 
+def sample_evaluation_beats(
+    model: PianoARModel, val_set: BeatWindowDataset, args: argparse.Namespace, step: int, out_dir: Path, wandb_run
+) -> None:
+    """拍のトークンの生成評価。検証曲の小節の拍数とテンポを条件にして、冒頭から生成したもの (free) と、冒頭の
+    --prompt-bars 小節を与えて続きを生成したもの (continuation) を、その曲の拍の時刻に置いて残す"""
+    tokenizer = val_set.tokenizer
+    writer = PianoTokenizer()
+    fr = tokenizer.config.frame_rate
+    cache = val_set.cache
+    sample_dir = out_dir / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    logs: dict[str, object] = {}
+    stats: list[dict[str, float]] = []
+    if wandb_run:
+        import wandb
+    model.eval()
+    started = time.time()
+    device = next(model.parameters()).device
+    count = 0
+    for song in val_set.songs.tolist():
+        if count == args.sample_count:
+            break
+        events = cache.song_events(song)
+        first = float(events[:, 0].min(initial=0))
+        grid = val_set.annotations.grid(song, first, int(cache.end_frames[song]), tokenizer.config.max_bar_beats)
+        if grid is None or grid.num_bars < args.sample_bars + 1:
+            continue
+        quantized = tokenizer.quantize(events, grid)
+        window = tokenizer.tokenize_window(quantized, grid, 0, args.sample_bars)
+        if not window["patch_valid"].all():
+            continue
+        bar_beats = torch.from_numpy(window["bar_beats"]).to(device)
+        tempo = torch.from_numpy(window["tempo"]).to(device)
+        prompt = [[t for t in row.tolist() if t != PAD] for row in window["tokens"][: args.prompt_bars]]
+        common = {
+            "num_patches": args.sample_bars,
+            "temperature": args.sample_temperature,
+            "top_p": args.sample_top_p,
+            "context_patches": args.window_bars + args.memory_bars,
+            "bar_beats": bar_beats,
+            "tempo": tempo,
+        }
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            free = model.generate(tokenizer, num_samples=1, **common)[0]
+            continued = model.generate(tokenizer, num_samples=1, prompts=[prompt], **common)[0]
+        reference = [[t for t in row.tolist() if t != PAD] for row in window["tokens"]]
+        prompt_frames = int(grid.beats[grid.bar_starts[args.prompt_bars]])
+        for name, patches, mark in (
+            (f"free{count}", free, 0),
+            (f"continuation{count}", continued, prompt_frames),
+            (f"reference{count}", reference, prompt_frames),
+        ):
+            is_reference = name.startswith("reference")
+            path = sample_dir / (f"{name}.mid" if is_reference else f"step{step:07d}_{name}.mid")
+            if is_reference and path.exists():
+                continue
+            generated = tokenizer.patches_to_events(patches, grid)
+            writer.events_to_midi(generated, path)
+            if not is_reference:
+                stats.append(sample_stats(generated, fr))
+            if wandb_run:
+                logs[f"samples/{name}_audio"] = wandb.Audio(synthesize(generated, fr), sample_rate=16000)
+                logs[f"samples/{name}_roll"] = wandb.Image(piano_roll_image(generated, writer, prompt_frames=mark))
+        count += 1
+    model.train()
+    mean_stats = {key: float(np.mean([s.get(key, 0.0) for s in stats])) for key in stats[0]} if stats else {}
+    logs.update({f"sample_stats/{k}": v for k, v in mean_stats.items()})
+    print(
+        f"[sample] step {step} {time.time() - started:.0f}s "
+        + " ".join(f"{k} {v:.2f}" for k, v in mean_stats.items())
+        + f" -> {sample_dir}"
+    )
+    if wandb_run:
+        wandb_run.log(logs, step=step)
+
+
 def reference_stats(val_set: PianoWindowDataset, seconds: float) -> dict[str, float]:
     """生成の統計量と比べる基準として、検証曲の冒頭 seconds 秒の統計量の平均を出す"""
     fr = val_set.tokenizer.config.frame_rate
@@ -314,12 +413,21 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cache = PretrainingCache(args.cache_dir)
-    tokenizer = PianoTokenizer(cache.tokenizer_config)
-    window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
-    memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
+    beat_config = {}
+    if args.beat_tokens:
+        annotations = BeatAnnotations(args.cache_dir)
+        tokenizer = BeatTokenizer(BeatTokenizerConfig())
+        window_patches, memory_patches = args.window_bars, args.memory_bars
+        beat_config = {"max_bar_beats": tokenizer.config.max_bar_beats, "tempo_bins": tokenizer.config.num_tempo_bins}
+    else:
+        tokenizer = PianoTokenizer(cache.tokenizer_config)
+        window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
+        memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
+    excluded = ("num_channels", "max_bar_beats", "tempo_bins")
     model_config = ModelConfig(
-        **{f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name != "num_channels"},
+        **{f.name: getattr(args, f.name) for f in fields(ModelConfig) if f.name not in excluded},
         num_channels=cache.meta["num_channels"],
+        **beat_config,
     )
     init = None
     if args.init_from and not args.resume:
@@ -328,37 +436,38 @@ def main() -> None:
             ModelConfig.from_dict(init["model_config"]),
             num_channels=cache.meta["num_channels"],
             dynamics_bins=args.dynamics_bins,
+            **beat_config,
         )
     source_weights = {
         name: float(value) for name, value in (item.split("=") for item in args.source_weights.split(",") if item)
     }
 
-    train_set = PianoWindowDataset(
-        cache,
-        split="train",
-        window_patches=window_patches,
+    def make_set(split: str, memory: int, val_start: int = 0, dynamics_bins: int = 0, **train_options):
+        """窓 (パッチ単位、拍のトークンなら小節単位) のデータセット"""
+        if args.beat_tokens:
+            return BeatWindowDataset(
+                cache, annotations, tokenizer.config, split=split, window_bars=window_patches, memory_bars=memory,
+                val_start_bar=val_start, dynamics_bins=dynamics_bins, **train_options,
+            )  # fmt: skip
+        return PianoWindowDataset(
+            cache, split=split, window_patches=window_patches, memory_patches=memory, val_start_patch=val_start,
+            dynamics_bins=dynamics_bins, **train_options,
+        )  # fmt: skip
+
+    train_set = make_set(
+        "train",
+        memory_patches,
+        dynamics_bins=model_config.dynamics_bins,
         augment=None if args.no_augment else AugmentConfig(),
         song_start_prob=args.song_start_prob,
         channel_dropout=args.channel_dropout,
-        memory_patches=memory_patches,
-        dynamics_bins=model_config.dynamics_bins,
         dynamics_dropout=args.dynamics_dropout,
     )
-    dynamics = {"dynamics_bins": model_config.dynamics_bins}
-    val_set = PianoWindowDataset(
-        cache, split="val", window_patches=window_patches, memory_patches=memory_patches, **dynamics
-    )
+    val_set = make_set("val", memory_patches, dynamics_bins=model_config.dynamics_bins)
     # 曲の途中から始まる窓で、記憶ありとなしを比べる (記憶がどれだけ効いているか)
     long_sets = (
         {
-            name: PianoWindowDataset(
-                cache,
-                split="val",
-                window_patches=window_patches,
-                memory_patches=memory,
-                val_start_patch=memory_patches,
-                **dynamics,
-            )
+            name: make_set("val", memory, memory_patches, model_config.dynamics_bins)
             for name, memory in (("long", memory_patches), ("long_nomem", 0))
         }
         if memory_patches
@@ -366,9 +475,7 @@ def main() -> None:
     )
     if model_config.dynamics_bins:
         # 強弱の条件を外した検証 (条件がどれだけ効いているか)
-        long_sets["nodyn"] = PianoWindowDataset(
-            cache, split="val", window_patches=window_patches, memory_patches=memory_patches
-        )
+        long_sets["nodyn"] = make_set("val", memory_patches)
     micro_steps = args.steps * args.grad_accum
     train_loader = DataLoader(
         train_set,
@@ -428,7 +535,7 @@ def main() -> None:
             name=args.wandb_run_name,
             id=wandb_id,
             resume="allow" if wandb_id else None,
-            config={**vars(args), "model": asdict(model_config), "tokenizer": asdict(cache.tokenizer_config)},
+            config={**vars(args), "model": asdict(model_config), "tokenizer": asdict(tokenizer.config)},
         )
         wandb_run.summary["parameters_M"] = sum(p.numel() for p in model.parameters()) / 1e6
         if args.sample_every and len(val_set):
@@ -455,7 +562,8 @@ def main() -> None:
             "optimizer": tree_map(to_cpu, optimizer.state_dict()),
             "step": step,
             "model_config": asdict(model_config),
-            "tokenizer_config": asdict(cache.tokenizer_config),
+            "tokenizer_config": asdict(tokenizer.config),
+            "tokenizer_type": "beat" if args.beat_tokens else "time",
             "channel_index": cache.meta.get("channel_index"),
             "args": vars(args),
             "wandb_id": wandb_run.id if wandb_run else None,
@@ -515,7 +623,9 @@ def main() -> None:
 
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device, args.length_buckets)
-            extra = {name: evaluate(model, loader, device, args.length_buckets) for name, loader in long_loaders.items()}
+            extra = {
+                name: evaluate(model, loader, device, args.length_buckets) for name, loader in long_loaders.items()
+            }
             long = {name: result["loss"] for name, result in extra.items()}
             print(
                 f"[val] step {step} loss {val['loss']:.4f} "
@@ -542,7 +652,10 @@ def main() -> None:
                     wandb_run.summary.update({"best/val_loss": best_val_loss, "best/step": step})
 
         if args.sample_every and step % args.sample_every == 0:
-            sample_evaluation(model, tokenizer, val_set, args, step, out_dir, wandb_run)
+            if args.beat_tokens:
+                sample_evaluation_beats(model, val_set, args, step, out_dir, wandb_run)
+            else:
+                sample_evaluation(model, tokenizer, val_set, args, step, out_dir, wandb_run)
 
         if step % args.save_every == 0 or step == args.steps:
             save(out_dir / "latest.pt")

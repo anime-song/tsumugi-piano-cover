@@ -93,6 +93,19 @@ def load_weights(model: nn.Module, path: Path) -> None:
     load_model(model, str(path / WEIGHTS_NAME), strict=True)
 
 
+def make_tokenizer(tokenizer_config: dict, tokenizer_type: str | None = None):
+    """保存した設定からトークナイザーを作る。tokenizer_type が "beat" なら拍のトークン (piano_ar.beat_tokenizer)"""
+    if tokenizer_type == "beat":
+        from .beat_tokenizer import BeatTokenizer
+        from .config import BeatTokenizerConfig
+
+        return BeatTokenizer(BeatTokenizerConfig(**tokenizer_config))
+    from .config import TokenizerConfig
+    from .tokenizer import PianoTokenizer
+
+    return PianoTokenizer(TokenizerConfig(**tokenizer_config))
+
+
 def load_pretrained_ar(
     name_or_path: str | Path = HF_REPO,
     *,
@@ -101,13 +114,12 @@ def load_pretrained_ar(
     device: str | torch.device = "cpu",
 ):
     """PianoARModel.from_pretrained の中身。model.tokenizer と model.context_patches も付けて返す"""
-    from .config import ModelConfig, TokenizerConfig
+    from .config import ModelConfig
     from .model import PianoARModel
-    from .tokenizer import PianoTokenizer
 
     path = resolve_pretrained(name_or_path, subfolder, revision)
     config = read_config(path, "piano_ar")
-    tokenizer = PianoTokenizer(TokenizerConfig(**config["tokenizer_config"]))
+    tokenizer = make_tokenizer(config["tokenizer_config"], config.get("tokenizer_type"))
     model = PianoARModel(ModelConfig.from_dict(config["model_config"]), tokenizer)
     load_weights(model, path)
     model.tokenizer = tokenizer
@@ -117,18 +129,21 @@ def load_pretrained_ar(
 
 def load_ar_checkpoint(checkpoint_path: str | Path, device: str | torch.device = "cpu"):
     """学習のチェックポイント (.pt) を from_pretrained と同じ形で読む"""
-    from .config import ModelConfig, TokenizerConfig
+    from .config import ModelConfig
     from .model import PianoARModel
-    from .tokenizer import PianoTokenizer
     from .train import context_patches
 
     # optimizer の状態 (モデルの 2 倍の大きさ) も入っているので、mmap で必要な分だけ読む
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
-    tokenizer = PianoTokenizer(TokenizerConfig(**checkpoint["tokenizer_config"]))
+    tokenizer_type = checkpoint.get("tokenizer_type")
+    tokenizer = make_tokenizer(checkpoint["tokenizer_config"], tokenizer_type)
     model = PianoARModel(ModelConfig.from_dict(checkpoint["model_config"]), tokenizer)
     model.load_state_dict(checkpoint["model"])
     model.tokenizer = tokenizer
-    model.context_patches = context_patches(checkpoint["args"], tokenizer.config.patch_seconds)
+    if tokenizer_type == "beat":  # 文脈は小節の数 (学習の窓 + 記憶)
+        model.context_patches = int(checkpoint["args"]["window_bars"] + checkpoint["args"]["memory_bars"])
+    else:
+        model.context_patches = context_patches(checkpoint["args"], tokenizer.config.patch_seconds)
     return model.to(device).eval()
 
 

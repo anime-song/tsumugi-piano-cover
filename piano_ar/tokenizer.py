@@ -343,10 +343,15 @@ class BatchGrammar:
         # 同じ onset 内の並び: 0 = まだ何もない, 1 = PEDAL_OFF, 2 = PEDAL_ON, 3 = ノート
         self.order = torch.zeros(rows, dtype=torch.long, device=device)
         self.last_pitch = torch.zeros(rows, dtype=torch.long, device=device)
+        # TIME の上限 (これ未満の位置だけを出す)。拍のトークンでは小節の拍数で決まる
+        self.time_limit = torch.full((rows, 1), tokenizer.pitch_offset - tokenizer.time_offset, device=device)
         self.vocab = torch.arange(tokenizer.vocab_size, device=device)[None]
 
-    def reset(self, pedal_down: torch.Tensor, finished: torch.Tensor | None = None) -> None:
-        """パッチの頭の状態にする。pedal_down [N] はパッチの頭のペダル、finished [N] の行は PAD だけを出す (曲が終わった行)"""
+    def reset(
+        self, pedal_down: torch.Tensor, finished: torch.Tensor | None = None, time_limit: int | None = None
+    ) -> None:
+        """パッチの頭の状態にする。pedal_down [N] はパッチの頭のペダル、finished [N] の行は PAD だけを出す (曲が終わった行)。
+        time_limit は TIME の上限 (省略でパッチの全体)"""
         self.pedal_down.copy_(pedal_down)
         if finished is None:
             self.finished.zero_()
@@ -358,6 +363,7 @@ class BatchGrammar:
         self.onset.fill_(-1)
         self.order.zero_()
         self.last_pitch.fill_(-1)
+        self.time_limit.fill_(self.tok.pitch_offset - self.tok.time_offset if time_limit is None else time_limit)
 
     def allowed(self) -> torch.Tensor:
         """次に出せるトークン [N, vocab] (bool)"""
@@ -374,7 +380,7 @@ class BatchGrammar:
         )
         # 残りトークン数で 1 イベントが収まる場合だけ新しいイベントを始められる
         room = (self.length + 5 <= max_tokens)[:, None]
-        new_time = room & (v >= tok.time_offset + self.onset[:, None] + 1) & (v < tok.pitch_offset)
+        new_time = room & (v >= tok.time_offset + self.onset[:, None] + 1) & (v < tok.time_offset + self.time_limit)
         same = room & (self.onset >= 0)[:, None] & self._same_onset(self.order, self.last_pitch)
         event_start = (stage == self.EVENT_START) & (end | new_time | same)
         mask = torch.where(limit, end, after_pitch | after_duration | after_time | event_start)

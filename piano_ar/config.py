@@ -74,6 +74,10 @@ class ModelConfig:
     dynamics_bins: int = 0
     # 条件の列の数。強さと音の多さの 2 列に、カバーでは編曲の性質 (piano_cover.arrangement) を後ろに足す
     dynamics_columns: int = 2
+    # 拍のトークン (piano_ar.beat_tokenizer) のモデルなら、パッチ (小節) ごとの拍数 (1〜max_bar_beats) とテンポの段階
+    # (1〜tempo_bins) を Global の入力に足す (0 は指定なし)。0 なら使わない (時刻のトークンのモデル)
+    max_bar_beats: int = 0
+    tempo_bins: int = 0
 
     @classmethod
     def from_dict(cls, values: dict) -> ModelConfig:

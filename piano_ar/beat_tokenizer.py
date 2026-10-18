@@ -108,12 +108,30 @@ class BeatGrid:
         last_frame: float,
         max_bar_beats: int,
     ) -> BeatGrid | None:
-        """拍と小節の頭 (秒) から作る。first_frame〜last_frame (イベントの範囲) を覆うまで、端の拍の間隔で拍と小節を延ばす。
-        拍が 4 つ未満なら None"""
-        beats = np.asarray(beat_seconds, dtype=np.float64) * frame_rate
+        """拍と小節の頭 (秒) から作る (from_frames)"""
+        return cls.from_frames(
+            np.asarray(beat_seconds, dtype=np.float64) * frame_rate,
+            np.asarray(downbeat_seconds, dtype=np.float64) * frame_rate,
+            first_frame,
+            last_frame,
+            max_bar_beats,
+        )
+
+    @classmethod
+    def from_frames(
+        cls,
+        beat_frames: np.ndarray,
+        downbeat_frames: np.ndarray,
+        first_frame: float,
+        last_frame: float,
+        max_bar_beats: int,
+    ) -> BeatGrid | None:
+        """拍と小節の頭 (フレーム) から作る。first_frame〜last_frame (イベントの範囲) を覆うまで、端の拍の間隔で拍と小節を
+        延ばす。拍が 4 つ未満なら None"""
+        beats = np.asarray(beat_frames, dtype=np.float64)
         if len(beats) < 4 or np.any(np.diff(beats) <= 0):
             return None
-        index = np.round(np.interp(np.asarray(downbeat_seconds) * frame_rate, beats, np.arange(len(beats)))).astype(int)
+        index = np.round(np.interp(np.asarray(downbeat_frames), beats, np.arange(len(beats)))).astype(int)
         downs = sorted(set(index.tolist()) & set(range(len(beats))))
         if not downs:
             downs = [0]

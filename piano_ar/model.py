@@ -433,6 +433,10 @@ class PianoARModel(nn.Module):
         # パッチごとの強さと音の多さなど (0 は指定なし)。列 c の番号 + c * (bins + 1) を同じ表で引く
         if config.dynamics_bins:
             self.dynamics_embedding = nn.Embedding(config.dynamics_columns * (config.dynamics_bins + 1), dim)
+        # 拍のトークンのモデル: 小節の拍数とテンポ (生成では原曲の拍から分かるので、予測せずに条件として渡す)
+        if config.max_bar_beats:
+            self.bar_embedding = nn.Embedding(config.max_bar_beats + 1, dim)
+            self.tempo_embedding = nn.Embedding(config.tempo_bins + 1, dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
@@ -473,14 +477,19 @@ class PianoARModel(nn.Module):
         channel: Tensor,
         cross: CrossHook | None = None,
         dynamics: Tensor | None = None,
+        bar_beats: Tensor | None = None,
+        tempo: Tensor | None = None,
     ) -> Tensor:
         """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す。
-        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)"""
+        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)。
+        bar_beats / tempo [B, P] は拍のトークンのモデルでのパッチ p (小節) の拍数とテンポの段階"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
         if dynamics is not None and self.config.dynamics_bins:
             offset = torch.arange(dynamics.shape[-1], device=dynamics.device) * (self.config.dynamics_bins + 1)
             inputs = inputs + self.dynamics_embedding(dynamics + offset).sum(-2)
+        if self.config.max_bar_beats and bar_beats is not None:
+            inputs = inputs + self.bar_embedding(bar_beats) + self.tempo_embedding(tempo)
         return self.global_transformer(inputs, cross=cross)
 
     def local_forward(
@@ -601,7 +610,9 @@ class PianoARModel(nn.Module):
         packed = num_length_buckets == 0
         if packed and self.training and self.config.dropout > 0 and not flash_varlen_available():
             # memory-efficient attention の可変長版は dropout のマスクが正しくないので (Block.forward)、塊 4 つに戻す
-            warnings.warn("flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2)
+            warnings.warn(
+                "flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2
+            )
             packed, num_length_buckets = False, 4
         tokens = batch["tokens"]
         valid = batch["patch_valid"]
@@ -648,6 +659,8 @@ class PianoARModel(nn.Module):
             batch["channel"],
             cross=condition.global_cross() if condition is not None else None,
             dynamics=batch.get("dynamics"),
+            bar_beats=batch.get("bar_beats"),
+            tempo=batch.get("tempo"),
         )[patch_loss]
 
         loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
@@ -720,6 +733,8 @@ class PianoARModel(nn.Module):
         end_after: int = 0,
         dynamics: Tensor | None = None,
         progress: Callable[[int, int], None] | None = None,
+        bar_beats: Tensor | None = None,
+        tempo: Tensor | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -732,6 +747,8 @@ class PianoARModel(nn.Module):
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
         dynamics [num_patches, C] はパッチごとの強さと音の多さなどの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
         progress(終わったパッチ数, num_patches) はパッチを 1 つ生成するたびに呼ぶ (UI の進み具合。例外を投げれば止まる)。
+        bar_beats / tempo [num_patches] は拍のトークンのモデルでの小節の拍数とテンポの段階。小節の中の位置は
+        拍数 × ticks_per_beat 未満に絞る。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -786,8 +803,14 @@ class PianoARModel(nn.Module):
             song_start_tensor = torch.full((rows,), song_start, dtype=torch.long, device=device)
             global_cross = bound.global_cross(first, p) if bound is not None else None
             window_dynamics = dynamics[first : p + 1][None].expand(rows, -1, -1) if dynamics is not None else None
+            beat_conditions = {}
+            if bar_beats is not None:
+                beat_conditions = {
+                    "bar_beats": bar_beats[first : p + 1][None].expand(rows, -1),
+                    "tempo": tempo[first : p + 1][None].expand(rows, -1),
+                }
             context = self.global_forward(
-                stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics
+                stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics, **beat_conditions
             )[:, -1]
 
             forced = None
@@ -808,6 +831,7 @@ class PianoARModel(nn.Module):
                 allow_eos=p >= end_after,
                 time_bias=time_bias[p] if time_bias is not None else None,
                 forced=forced,
+                time_limit=int(bar_beats[p]) * tokenizer.ticks_per_beat if bar_beats is not None else None,
             )
 
             pedal_down, song_end = pedal_down.tolist(), song_end.tolist()
@@ -861,8 +885,9 @@ class LocalSampler:
         allow_eos: bool = True,
         time_bias: Tensor | None = None,
         forced: Tensor | None = None,
+        time_limit: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """1 パッチを生成する。context [rows, D] は Global の出力、tensors はこのパッチの StepCondition の量。
+        """1 パッチを生成する。time_limit は TIME (拍のトークンでは小節の中の位置) の上限 (これ未満だけを出す)。context [rows, D] は Global の出力、tensors はこのパッチの StepCondition の量。
         guide は rows 行の logits を samples 行にまとめる (cfg)。行 r の入力はサンプル r % samples のトークン。
         pedal_down / finished [samples] はパッチの頭のペダルと、もう曲が終わった行 (PAD だけを出す)。
         time_bias [patch_frames] は TIME の logit に足す量 (_bias_time)、forced [samples, max_patch_tokens] は
@@ -879,7 +904,7 @@ class LocalSampler:
         state.allow_eos.fill_(allow_eos)
 
         def reset() -> None:
-            state.grammar.reset(pedal_down, finished)
+            state.grammar.reset(pedal_down, finished, time_limit)
             state.step.zero_()
             state.token.zero_()
             state.sequence.fill_(PAD)
