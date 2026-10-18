@@ -26,6 +26,36 @@ class TokenizerConfig:
 
 
 @dataclass(frozen=True)
+class BeatTokenizerConfig:
+    """拍のトークン (piano_ar.beat_tokenizer)。1 パッチ = 1 小節で、小節の中の位置と音の長さを拍の刻みで表す"""
+
+    # イベント配列のフレーム (TokenizerConfig と同じ 10ms)。拍の時刻もこの単位で持つ
+    frame_rate: int = 100
+    # 1 拍の刻み。16 分 (3) と 3 連 (4) と 16 分の 3 連 (2) が乗る。カバーの音の 98.9% が刻みの ±30ms に入る
+    # (local/probe_beats.py の (a))
+    ticks_per_beat: int = 12
+    # 1 小節の拍数の上限。超える小節は分ける
+    max_bar_beats: int = 16
+    pitch_min: int = 21
+    pitch_max: int = 108
+    # 長さは exact_duration_ticks までは 1 刻みずつ、その先は対数で max_duration_ticks まで
+    num_duration_bins: int = 96
+    exact_duration_ticks: int = 48
+    max_duration_ticks: int = 768
+    num_velocity_bins: int = 32
+    # 1 パッチ (1 小節) のトークン列の上限 (終端込み)。4/4 の小節の 99.9% は 194 以下 (local/probe_beats.py の (b))
+    max_patch_tokens: int = 512
+    # 小節のテンポ (その小節の拍の長さの平均から読む BPM) の条件の段階。対数で tempo_min〜tempo_max
+    num_tempo_bins: int = 32
+    tempo_min: float = 30.0
+    tempo_max: float = 300.0
+
+    @property
+    def max_bar_ticks(self) -> int:
+        return self.max_bar_beats * self.ticks_per_beat
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     dim: int = 512
     heads: int = 8
