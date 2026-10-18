@@ -316,7 +316,10 @@ def transpose_rows(rows: np.ndarray, shift: int) -> np.ndarray:
 class SourceVocab:
     """行の属性を 1 つの埋め込み表の番号にする。0 はパディング (ゼロベクトル)"""
 
-    def __init__(self, tokenizer_config: TokenizerConfig) -> None:
+    def __init__(self, tokenizer_config) -> None:
+        if not isinstance(tokenizer_config, TokenizerConfig):
+            # 拍のトークンのモデルでも、原曲の行の長さとベロシティの番号は時刻のトークナイザーのもの (フレーム)
+            tokenizer_config = TokenizerConfig()
         sizes = {
             "type": NUM_TYPES,
             "pitch": 128,
@@ -346,21 +349,40 @@ def source_features(
     tokenizer: PianoTokenizer,
     vocab: SourceVocab,
     max_rows: int,
+    grid=None,
+    ticks_per_beat: int = 12,
 ) -> dict[str, np.ndarray]:
     """行をパッチごとに並べる。
 
+    grid (piano_ar.beat_tokenizer.BeatGrid、原曲の拍) を渡すと、1 パッチ = 原曲の 1 小節にし、行の位置を原曲の拍の
+    刻み (拍の番号 x ticks_per_beat) にする (拍のトークンのカバーモデル)。音の長さとベロシティの番号はフレームのまま。
+
     返り値 (S = 曲のパッチ数, R = 1 パッチの行数の最大):
         features [S, R, 5] int16  埋め込み表の番号 (種類, 属性 4 つ)。0 はパディング
-        onset    [S, R] int32     行の絶対フレーム (Local の cross-attention の位置に使う)
+        onset    [S, R] int32     行の絶対フレーム (grid があれば絶対の刻み。Local の cross-attention の位置に使う)
         valid    [S, R] bool
+        patch_start [S] int64     パッチの始まり (フレーム、grid があれば刻み)
     """
-    F = tokenizer.patch_frames
-    num_patches = max(1, -(-end_frame // F))
     rows = rows.astype(np.int64)
-    rows = rows[(rows[:, ROW_ONSET] >= 0) & (rows[:, ROW_ONSET] < num_patches * F)]
+    if grid is None:
+        F = tokenizer.patch_frames
+        num_patches = max(1, -(-end_frame // F))
+        starts = np.arange(num_patches) * F
+        end = num_patches * F
+    else:
+        rows[:, ROW_ONSET] = np.round(grid.beat_position(rows[:, ROW_ONSET]) * ticks_per_beat)
+        bar_ticks = grid.bar_starts * ticks_per_beat
+        end_tick = int(np.ceil(grid.beat_position(np.array([end_frame]))[0] * ticks_per_beat))
+        num_patches = max(1, int(np.searchsorted(bar_ticks, end_tick, side="left")))
+        num_patches = min(num_patches, grid.num_bars)
+        starts = bar_ticks[:num_patches]
+        end = int(bar_ticks[num_patches])
+    rows = rows[(rows[:, ROW_ONSET] >= starts[0]) & (rows[:, ROW_ONSET] < end)]
+
+    def patch_of(onset: np.ndarray) -> np.ndarray:
+        return np.searchsorted(starts, onset, side="right") - 1
 
     # パッチの先頭に「その時点のコード / キー」を足す (パッチの先頭ちょうどで変わる場合はその行があるので足さない)
-    starts = np.arange(num_patches) * F
     state_rows = []
     for row_type, state_type in ((TYPE_CHORD, TYPE_CHORD_STATE), (TYPE_KEY, TYPE_KEY_STATE)):
         changes = rows[rows[:, ROW_TYPE] == row_type]
@@ -376,9 +398,9 @@ def source_features(
         rows = np.concatenate([rows, *state_rows])
     # 同じパッチの中はコード/キーの状態 -> 時刻順
     is_state = rows[:, ROW_TYPE] >= TYPE_CHORD_STATE
-    rows = rows[np.lexsort((rows[:, ROW_TYPE], rows[:, ROW_ONSET], ~is_state, rows[:, ROW_ONSET] // F))]
+    rows = rows[np.lexsort((rows[:, ROW_TYPE], rows[:, ROW_ONSET], ~is_state, patch_of(rows[:, ROW_ONSET])))]
 
-    patch = rows[:, ROW_ONSET] // F
+    patch = patch_of(rows[:, ROW_ONSET])
     first = np.searchsorted(patch, np.arange(num_patches))
     rank = np.arange(len(rows)) - first[patch]
     keep = rank < max_rows
@@ -413,4 +435,4 @@ def source_features(
     features[patch, rank] = feature
     onset[patch, rank] = rows[:, ROW_ONSET]
     valid[patch, rank] = True
-    return {"features": features, "onset": onset, "valid": valid}
+    return {"features": features, "onset": onset, "valid": valid, "patch_start": starts.astype(np.int64)}

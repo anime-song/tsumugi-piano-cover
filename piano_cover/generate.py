@@ -30,6 +30,7 @@ import numpy as np
 import torch
 
 from piano_ar.evaluation import synthesize, write_wav
+from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
 from piano_ar.tokenizer import PianoTokenizer
 
 from .arrangement import measurable
@@ -38,7 +39,17 @@ from .config import CoverConfig
 from .data import source_tensors
 from .hub import load_cover
 from .model import CoverModel, SourceCondition
-from .source import ROW_ONSET, SourceVocab, load_source, onset_time_bias, source_features, trim_lead, with_sheetsage
+from .source import (
+    ROW_ONSET,
+    ROW_TYPE,
+    TYPE_NOTE,
+    SourceVocab,
+    load_source,
+    onset_time_bias,
+    source_features,
+    trim_lead,
+    with_sheetsage,
+)
 
 # 原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の出力) の置き場所
 SHEETSAGE_DIR = Path("data/sheetsage/original")
@@ -76,6 +87,10 @@ class PreparedSource:
     rows: np.ndarray
     lead: int
     features: dict[str, np.ndarray]
+    # 拍のトークンのモデル: 原曲の拍 (最初の音を含む小節から)、小節の拍数とテンポの段階
+    grid: BeatGrid | None = None
+    bar_beats: np.ndarray | None = None
+    tempo: np.ndarray | None = None
 
     @property
     def num_patches(self) -> int:
@@ -94,7 +109,8 @@ def prepare_source(
     """sheetsage は原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の JSON)。SheetSage で学習したモデル
     (cover_config.sheetsage_beats / sheetsage_melody) では要る。省略すると data/sheetsage/original/<原曲>.json を探す"""
     rows, end_frame = load_source(path, tokenizer.config.frame_rate)
-    if cover_config.sheetsage_beats or cover_config.sheetsage_melody:
+    beat_tokens = isinstance(tokenizer, BeatTokenizer)
+    if cover_config.sheetsage_beats or cover_config.sheetsage_melody or beat_tokens:
         annotation_path = Path(sheetsage) if sheetsage else SHEETSAGE_DIR / f"{Path(path).stem}.json"
         if not annotation_path.exists():
             raise FileNotFoundError(
@@ -109,11 +125,46 @@ def prepare_source(
             melody=cover_config.sheetsage_melody,
         )
         rows = rows[rows[:, ROW_ONSET] < end_frame]
+    if beat_tokens:
+        return _prepare_beats(rows, end_frame, annotation, tokenizer, cover_config)
     rows, lead = trim_lead(rows)
     features = source_features(
         rows, end_frame - lead, tokenizer, SourceVocab(tokenizer.config), cover_config.max_source_rows
     )
     return PreparedSource(rows, lead, features)
+
+
+def _prepare_beats(
+    rows: np.ndarray, end_frame: int, annotation: dict, tokenizer: BeatTokenizer, cover_config: CoverConfig
+) -> PreparedSource:
+    """拍のトークンのモデルの原曲: 原曲の拍で小節ごとのパッチにし、原曲の最初の音を含む小節から生成する
+    (それより前は無音か拍だけなので、学習で見た曲の始まりと合わない。時刻のトークンの trim_lead と同じ理由)"""
+    fr = tokenizer.config.frame_rate
+    grid = BeatGrid.build(
+        annotation["beats"], annotation["downbeats"], fr, 0.0, end_frame, tokenizer.config.max_bar_beats
+    )
+    if grid is None:
+        raise ValueError("原曲の拍が少なすぎます")
+    return prepare_beats_source(rows, end_frame, grid, tokenizer, cover_config)
+
+
+def prepare_beats_source(
+    rows: np.ndarray, end_frame: int, grid: BeatGrid, tokenizer: BeatTokenizer, cover_config: CoverConfig
+) -> PreparedSource:
+    """原曲の行と拍 (grid) から、拍のトークンのモデルに渡す形を作る (学習中の生成評価からも使う)"""
+    fr = tokenizer.config.frame_rate
+    notes = rows[rows[:, ROW_TYPE] == TYPE_NOTE]
+    first = float(notes[:, ROW_ONSET].min()) if len(notes) else 0.0
+    first_bar = int(np.searchsorted(grid.bar_starts, grid.beat_position(np.array([first]))[0], side="right") - 1)
+    grid = BeatGrid(grid.beats, grid.bar_starts[max(first_bar, 0) :])
+    features = source_features(
+        rows, end_frame, PianoTokenizer(), SourceVocab(tokenizer.config), cover_config.max_source_rows,
+        grid=grid, ticks_per_beat=tokenizer.ticks_per_beat,
+    )  # fmt: skip
+    S = len(features["features"])
+    bar_beats = grid.bar_beats[:S]
+    tempo = tokenizer.tempo_bin(grid.tempo()[:S] * fr * 60)
+    return PreparedSource(rows, 0, features, grid, bar_beats, tempo)
 
 
 def generate_covers(
@@ -131,7 +182,13 @@ def generate_covers(
     device = next(model.parameters()).device
     num_patches = source.num_patches
     if params.seconds is not None:
-        num_patches = min(num_patches, math.ceil(params.seconds / tokenizer.config.patch_seconds))
+        if source.grid is not None:  # 拍のトークン: 小節の頭が seconds を超えるまで
+            starts = (
+                source.grid.beats[source.grid.bar_starts[:num_patches]] - source.grid.beats[source.grid.bar_starts[0]]
+            )
+            num_patches = max(1, int(np.searchsorted(starts, params.seconds * tokenizer.config.frame_rate)))
+        else:
+            num_patches = min(num_patches, math.ceil(params.seconds / tokenizer.config.patch_seconds))
     common = {
         "num_patches": num_patches,
         "channel": params.channel,
@@ -146,7 +203,10 @@ def generate_covers(
     }
     if prompt:
         common["prompts"] = [prompt] * num_samples
-    if params.onset_bias:
+    if source.grid is not None:
+        common["bar_beats"] = torch.from_numpy(source.bar_beats).to(device)
+        common["tempo"] = torch.from_numpy(source.tempo).to(device)
+    if params.onset_bias and source.grid is None:
         bias = onset_time_bias(
             source.rows,
             num_patches,
@@ -161,7 +221,11 @@ def generate_covers(
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
         condition = SourceCondition(model, tensors)
         arrangement = (params.fill, params.above, params.span) if params.arrangement else (None,) * 3
-        known = measurable(source.rows, num_patches, tokenizer.patch_frames, tokenizer.config.frame_rate)
+        known = (
+            measurable(source.rows, num_patches, tokenizer.patch_frames, tokenizer.config.frame_rate)
+            if source.grid is None
+            else None
+        )
         dynamics = model.planned_dynamics(
             condition.memory, params.channel, num_patches, params.dynamics, params.density, arrangement, known
         )
@@ -170,8 +234,11 @@ def generate_covers(
         )
     covers = []
     for patches in samples:
-        events = tokenizer.patches_to_events(patches)
-        events[:, 0] += source.lead  # 原曲の時刻に戻す
+        if source.grid is not None:  # 拍のトークン: 原曲の拍の時刻に置く
+            events = tokenizer.patches_to_events(patches, source.grid)
+        else:
+            events = tokenizer.patches_to_events(patches)
+            events[:, 0] += source.lead  # 原曲の時刻に戻す
         covers.append(Cover(events, patches))
     return covers
 
@@ -233,7 +300,6 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    patch_seconds = tokenizer.config.patch_seconds
     for i, cover in enumerate(covers):
         manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
@@ -242,7 +308,8 @@ def main() -> None:
         copy_metadata(args.source, path)
         if args.wav:
             write_wav(synthesize(cover.events, tokenizer.config.frame_rate), path.with_suffix(".wav"))
-        print(f"{path}: {len(cover.patches) * patch_seconds:.0f} 秒 / {len(cover.events)} イベント")
+        seconds = (cover.events[:, 0].max(initial=0) - cover.events[:, 0].min(initial=0)) / tokenizer.config.frame_rate
+        print(f"{path}: {len(cover.patches)} パッチ ({seconds:.0f} 秒) / {len(cover.events)} イベント")
 
 
 if __name__ == "__main__":

@@ -199,8 +199,22 @@ class BeatTokenizer:
         group[self.velocity_offset :] = TOKEN_GROUPS.index("velocity")
         self.token_group = group
         self.group_names = TOKEN_GROUPS
+        # カバーモデル (piano_cover) との互換: パッチの中の位置の数 (時刻のトークンのパッチのフレーム数にあたる) と、
+        # OnsetHead が原曲の onset の近さを測る幅 (刻み。時刻のトークンでは 2 / 6 フレーム = 20 / 60ms)
+        self.patch_frames = c.max_bar_ticks
+        self.onset_widths = (0.5, 1.5)
 
     # ------------------------------------------------------------------
+    def events_to_score(self, events: np.ndarray):
+        """イベント配列 (フレーム) から Score を作る (PianoTokenizer.events_to_score と同じ)"""
+        from .config import TokenizerConfig
+        from .tokenizer import PianoTokenizer
+
+        return PianoTokenizer(TokenizerConfig(frame_rate=self.config.frame_rate)).events_to_score(events)
+
+    def events_to_midi(self, events: np.ndarray, path) -> None:
+        self.events_to_score(events).dump_midi(str(path))
+
     def duration_bin(self, ticks: np.ndarray | int) -> np.ndarray:
         return np.searchsorted(self._duration_bounds, ticks)
 

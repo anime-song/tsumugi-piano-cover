@@ -36,13 +36,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from piano_ar.beat_data import BeatAnnotations, BeatWindowDataset
 from piano_ar.config import ModelConfig
 from piano_ar.data import AugmentConfig, PianoWindowDataset, PretrainingCache
+from piano_ar.hub import make_tokenizer
 from piano_ar.evaluation import piano_roll_image, sample_stats, synthesize
 from piano_ar.tokenizer import TOKEN_GROUPS, PianoTokenizer
 from piano_ar.train import adapt_state, context_patches, limit_gpu_memory, lr_at, to_device
 
 from .arrangement import ARRANGEMENT_NAMES, measurable
+from .beat_data import BeatCoverCache, BeatCoverDataset
 from .config import CoverConfig
 from .data import CoverCache, CoverWindowDataset, DriftConfig, collate_cover, make_cover_sampler, source_tensors
 from .metrics import sync_metrics
@@ -73,6 +76,14 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument("--pretrain-cache", default="data/piano_ar/pretraining")
     parser.add_argument("--pretrain-mix", type=float, default=0.2, help="事前学習の曲を混ぜる割合 (0 で混ぜない)")
+    parser.add_argument(
+        "--beat-tokens",
+        action="store_true",
+        help="拍のトークン (1 パッチ = 1 小節)。--pretrained は piano_ar.train --beat-tokens の重み、"
+        "--cache-dir は piano_cover.prepare_beats のキャッシュ、--pretrain-cache は piano_ar.prepare_beats で拍を足したもの",
+    )
+    parser.add_argument("--window-bars", type=int, default=32, help="拍のトークン: 損失を取る窓の小節数")
+    parser.add_argument("--memory-bars", type=int, default=96, help="拍のトークン: 窓の前に付ける記憶の小節数")
     parser.add_argument("--window-seconds", type=float, default=64.0, help="損失を取る窓の長さ")
     parser.add_argument(
         "--memory-seconds", type=float, default=192.0, help="窓の前に付ける記憶 (文脈) の長さ (piano_ar.train と同じ)"
@@ -301,75 +312,63 @@ def sample_evaluation(
         wandb_run.log(logs, step=step)
 
 
-def main() -> None:
-    args = build_args()
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    limit_gpu_memory(args.gpu_memory_limit)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def sample_evaluation_beats(
+    model: CoverModel, val_set: BeatCoverDataset, args: argparse.Namespace, step: int, out_dir: Path, wandb_run
+) -> None:
+    """拍のトークンの生成評価: 検証の原曲 (毎回同じ曲) の最初の音の小節から、原曲の拍の上にカバーを生成する"""
+    from .generate import CoverParams, generate_covers, prepare_beats_source
 
-    cache = CoverCache(args.cache_dir)
-    tokenizer = PianoTokenizer(cache.tokenizer_config)
-    vocab = SourceVocab(cache.tokenizer_config)
-    cover_config = CoverConfig(**{f.name: getattr(args, f.name) for f in fields(CoverConfig)})
-    if args.init_cover:
-        pretrained = torch.load(args.init_cover, map_location="cpu", weights_only=False, mmap=True)
-        cover_config = replace(
-            CoverConfig.from_dict(pretrained["cover_config"]),
-            onset_head_dim=args.onset_head_dim,
-            planner_dim=args.planner_dim,
-            planner_layers=args.planner_layers,
-        )
-    else:
-        pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-    sheetsage = cache.meta.get("sheetsage") or {}
-    cover_config = replace(
-        cover_config,
-        sheetsage_beats=bool(sheetsage.get("beats", False)),
-        sheetsage_melody=bool(sheetsage.get("melody", False)),
+    cache = val_set.cache
+    tokenizer = model.tokenizer
+    fr = tokenizer.config.frame_rate
+    covers, seen = [], set()
+    for cover in val_set.covers.tolist():
+        if int(cache.source_index[cover]) not in seen:
+            seen.add(int(cache.source_index[cover]))
+            covers.append(cover)
+        if len(covers) == args.sample_count:
+            break
+    sample_dir = out_dir / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    logs: dict[str, object] = {}
+    stats = []
+    if wandb_run:
+        import wandb
+    model.eval()
+    started = time.time()
+    for i, cover in enumerate(covers):
+        source = int(cache.source_index[cover])
+        rows = cache.source_rows(source)
+        end = int(cache.source_end_frames[source])
+        grid = cache.source_grid(source, end, tokenizer.config.max_bar_beats)
+        prepared = prepare_beats_source(rows, end, grid, tokenizer, model.config)
+        params = CoverParams(
+            channel=int(cache.channels[cover]), temperature=args.sample_temperature, top_p=args.sample_top_p,
+            source_cfg=args.sample_source_cfg, dynamics=1.0, arrangement=False, seconds=args.sample_seconds,
+        )  # fmt: skip
+        events = generate_covers(model, prepared, params)[0].events
+        stats.append({**sample_stats(events, fr), **sync_metrics(events, rows, fr)})
+        name = f"cover{i}_source{source}"
+        path = sample_dir / f"step{step:07d}_{name}.mid"
+        tokenizer.events_to_midi(events, path)
+        if wandb_run:
+            logs[f"samples/{name}_audio"] = wandb.Audio(synthesize(events, fr), sample_rate=16000)
+            logs[f"samples/{name}_roll"] = wandb.Image(piano_roll_image(events, tokenizer))
+    model.train()
+    keys = sorted({key for s in stats for key in s})
+    mean_stats = {key: float(np.mean([s[key] for s in stats if key in s])) for key in keys}
+    logs.update({f"sample_stats/{k}": v for k, v in mean_stats.items()})
+    print(
+        f"[sample] step {step} {time.time() - started:.0f}s "
+        + " ".join(f"{k} {v:.2f}" for k, v in mean_stats.items())
+        + f" -> {sample_dir}"
     )
-    decoder_from = None
-    if args.decoder_from:
-        if not args.init_cover:
-            raise SystemExit("--decoder-from は --init-cover と一緒に使います")
-        decoder_from = torch.load(args.decoder_from, map_location="cpu", weights_only=False, mmap=True)
-    # デコーダの設定とチャンネルの番号の表は、デコーダの重みを読むチェックポイントのものを使う
-    decoder_checkpoint = decoder_from or pretrained
-    for checkpoint_ in (pretrained, decoder_checkpoint):
-        if checkpoint_["tokenizer_config"] != asdict(cache.tokenizer_config):
-            raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
-    arrangement = bool(args.dynamics_bins) and not args.no_arrangement
-    model_config = replace(
-        ModelConfig.from_dict(decoder_checkpoint["model_config"]),
-        dynamics_bins=args.dynamics_bins,
-        dynamics_columns=2 + (len(ARRANGEMENT_NAMES) if arrangement else 0),
-    )
-    window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
-    memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
+    if wandb_run:
+        wandb_run.log(logs, step=step)
 
-    pretraining = None
-    if args.pretrain_mix > 0:
-        pretraining = PianoWindowDataset(
-            PretrainingCache(args.pretrain_cache),
-            split="train",
-            window_patches=window_patches,
-            augment=None if args.no_augment else AugmentConfig(),
-            song_start_prob=args.song_start_prob,
-            channel_dropout=args.channel_dropout,
-            memory_patches=memory_patches,
-            dynamics_bins=args.dynamics_bins,
-            dynamics_dropout=args.dynamics_dropout,
-        )
-    common = {
-        "window_patches": window_patches,
-        "cover_config": cover_config,
-        "memory_patches": memory_patches,
-        "dynamics_bins": args.dynamics_bins,
-        "arrangement": arrangement,
-    }
+
+def time_datasets(args, cache, common, pretraining, window_patches, memory_patches, cover_config, arrangement):
+    """時刻のトークンの学習と検証のデータセット"""
     train_set = CoverWindowDataset(
         cache,
         split="train",
@@ -417,6 +416,150 @@ def main() -> None:
         if memory_patches
         else {}
     )
+    return train_set, val_set, val_nosource, val_noarr, val_resync, long_sets
+
+
+def main() -> None:
+    args = build_args()
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    limit_gpu_memory(args.gpu_memory_limit)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cache = BeatCoverCache(args.cache_dir) if args.beat_tokens else CoverCache(args.cache_dir)
+    tokenizer = PianoTokenizer(cache.tokenizer_config)
+    vocab = SourceVocab(cache.tokenizer_config)
+    cover_config = CoverConfig(**{f.name: getattr(args, f.name) for f in fields(CoverConfig)})
+    if args.init_cover:
+        pretrained = torch.load(args.init_cover, map_location="cpu", weights_only=False, mmap=True)
+        cover_config = replace(
+            CoverConfig.from_dict(pretrained["cover_config"]),
+            onset_head_dim=args.onset_head_dim,
+            planner_dim=args.planner_dim,
+            planner_layers=args.planner_layers,
+        )
+    else:
+        pretrained = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+    sheetsage = cache.meta.get("sheetsage") or {}
+    cover_config = replace(
+        cover_config,
+        sheetsage_beats=bool(sheetsage.get("beats", False)),
+        sheetsage_melody=bool(sheetsage.get("melody", False)),
+    )
+    decoder_from = None
+    if args.decoder_from:
+        if not args.init_cover:
+            raise SystemExit("--decoder-from は --init-cover と一緒に使います")
+        decoder_from = torch.load(args.decoder_from, map_location="cpu", weights_only=False, mmap=True)
+    # デコーダの設定とチャンネルの番号の表は、デコーダの重みを読むチェックポイントのものを使う
+    decoder_checkpoint = decoder_from or pretrained
+    if args.beat_tokens:
+        if decoder_checkpoint.get("tokenizer_type") != "beat":
+            raise SystemExit(
+                "--beat-tokens には拍のトークンで事前学習したデコーダ (piano_ar.train --beat-tokens) が要ります"
+            )
+        tokenizer = make_tokenizer(decoder_checkpoint["tokenizer_config"], "beat")
+    else:
+        for checkpoint_ in (pretrained, decoder_checkpoint):
+            if checkpoint_["tokenizer_config"] != asdict(cache.tokenizer_config):
+                raise SystemExit("事前学習とカバーのキャッシュでトークナイザーの設定が違います")
+    arrangement = bool(args.dynamics_bins) and not args.no_arrangement
+    model_config = replace(
+        ModelConfig.from_dict(decoder_checkpoint["model_config"]),
+        dynamics_bins=args.dynamics_bins,
+        dynamics_columns=2 + (len(ARRANGEMENT_NAMES) if arrangement else 0),
+    )
+    window_patches = round(args.window_seconds / cache.tokenizer_config.patch_seconds)
+    memory_patches = round(args.memory_seconds / cache.tokenizer_config.patch_seconds)
+    if args.beat_tokens:
+        window_patches, memory_patches = args.window_bars, args.memory_bars
+
+    pretraining = None
+    if args.pretrain_mix > 0 and args.beat_tokens:
+        pretraining = BeatWindowDataset(
+            PretrainingCache(args.pretrain_cache),
+            BeatAnnotations(args.pretrain_cache),
+            tokenizer.config,
+            split="train",
+            window_bars=window_patches,
+            memory_bars=memory_patches,
+            augment=None if args.no_augment else AugmentConfig(),
+            song_start_prob=args.song_start_prob,
+            channel_dropout=args.channel_dropout,
+            dynamics_bins=args.dynamics_bins,
+            dynamics_dropout=args.dynamics_dropout,
+        )
+    elif args.pretrain_mix > 0:
+        pretraining = PianoWindowDataset(
+            PretrainingCache(args.pretrain_cache),
+            split="train",
+            window_patches=window_patches,
+            augment=None if args.no_augment else AugmentConfig(),
+            song_start_prob=args.song_start_prob,
+            channel_dropout=args.channel_dropout,
+            memory_patches=memory_patches,
+            dynamics_bins=args.dynamics_bins,
+            dynamics_dropout=args.dynamics_dropout,
+        )
+    common = {
+        "window_patches": window_patches,
+        "cover_config": cover_config,
+        "memory_patches": memory_patches,
+        "dynamics_bins": args.dynamics_bins,
+        "arrangement": arrangement,
+    }
+    if args.beat_tokens:
+        beat_common = {
+            "window_bars": window_patches,
+            "cover_config": cover_config,
+            "tokenizer_config": tokenizer.config,
+            "memory_bars": memory_patches,
+            "dynamics_bins": args.dynamics_bins,
+            "arrangement": arrangement,
+        }
+        train_set = BeatCoverDataset(
+            cache,
+            split="train",
+            augment=None if args.no_augment else AugmentConfig(),
+            song_start_prob=args.song_start_prob,
+            channel_dropout=args.channel_dropout,
+            source_dropout=args.source_dropout,
+            structure_dropout=args.structure_dropout,
+            melody_dropout=args.melody_dropout,
+            pretraining=pretraining,
+            sync_mask=not args.no_sync_mask,
+            dynamics_dropout=args.dynamics_dropout,
+            **beat_common,
+        )
+        val_set = BeatCoverDataset(cache, split="val", source_dropout=0.0, **beat_common)
+        val_nosource = BeatCoverDataset(cache, split="val", source_dropout=1.0, **beat_common)
+        val_noarr = (
+            BeatCoverDataset(cache, split="val", source_dropout=0.0, **{**beat_common, "arrangement": False})
+            if arrangement
+            else None
+        )
+        val_resync = None
+        long_sets = (
+            {
+                name: BeatCoverDataset(
+                    cache,
+                    split="val",
+                    source_dropout=0.0,
+                    val_start_bar=memory_patches,
+                    **{**beat_common, "memory_bars": memory},
+                )  # fmt: skip
+                for name, memory in (("long", memory_patches), ("long_nomem", 0))
+            }
+            if memory_patches
+            else {}
+        )
+    else:
+        train_set, val_set, val_nosource, val_noarr, val_resync, long_sets = time_datasets(
+            args, cache, common, pretraining, window_patches, memory_patches, cover_config, arrangement
+        )
     micro_steps = args.steps * args.grad_accum
     loader_options = {"num_workers": args.num_workers, "collate_fn": collate_cover}
     train_loader = DataLoader(
@@ -431,7 +574,7 @@ def main() -> None:
     val_loader = DataLoader(val_set, batch_size=args.batch_size, **loader_options)
     val_nosource_loader = DataLoader(val_nosource, batch_size=args.batch_size, **loader_options)
     val_noarr_loader = DataLoader(val_noarr, batch_size=args.batch_size, **loader_options) if val_noarr else None
-    val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options)
+    val_resync_loader = DataLoader(val_resync, batch_size=args.batch_size, **loader_options) if val_resync else None
     rollout_loaders = {}
     if args.val_rollouts:
         bank = RolloutBank.load(args.val_rollouts)
@@ -457,6 +600,12 @@ def main() -> None:
     )
 
     model = CoverModel(model_config, cover_config, tokenizer, vocab.size).to(device)
+    # 生成評価で見る文脈 (拍のトークンは小節の数)
+    model.context_patches = (
+        window_patches + memory_patches
+        if args.beat_tokens
+        else context_patches(args, cache.tokenizer_config.patch_seconds)
+    )
     model.set_gradient_checkpointing(not args.no_grad_checkpoint)
     if args.freeze_decoder:
         model.decoder.requires_grad_(False)
@@ -530,7 +679,8 @@ def main() -> None:
                 "step": step,
                 "model_config": asdict(model_config),
                 "cover_config": asdict(cover_config),
-                "tokenizer_config": asdict(cache.tokenizer_config),
+                "tokenizer_config": asdict(tokenizer.config),
+                "tokenizer_type": "beat" if args.beat_tokens else "time",
                 "source_vocab_size": vocab.size,
                 "channel_index": decoder_checkpoint.get("channel_index"),
                 "args": vars(args),
@@ -595,7 +745,9 @@ def main() -> None:
         if args.val_every and step % args.val_every == 0 and len(val_set):
             val = evaluate(model, val_loader, device)
             val_nosource_loss = evaluate(model, val_nosource_loader, device)["loss"]
-            resync = evaluate(model, val_resync_loader, device)
+            resync = (
+                evaluate(model, val_resync_loader, device) if val_resync_loader else {"loss": 0.0, "loss_time": 0.0}
+            )
             rollout = {kind: evaluate(model, loader, device) for kind, loader in rollout_loaders.items()}
             long = {name: evaluate(model, loader, device)["loss"] for name, loader in long_loaders.items()}
             noarr = evaluate(model, val_noarr_loader, device) if val_noarr_loader else None
@@ -635,7 +787,10 @@ def main() -> None:
                     wandb_run.summary.update({"best/val_loss": best_val_loss, "best/step": step})
 
         if args.sample_every and step % args.sample_every == 0 and len(val_set):
-            sample_evaluation(model, tokenizer, val_set, args, step, out_dir, wandb_run)
+            if args.beat_tokens:
+                sample_evaluation_beats(model, val_set, args, step, out_dir, wandb_run)
+            else:
+                sample_evaluation(model, tokenizer, val_set, args, step, out_dir, wandb_run)
 
         if step % args.save_every == 0 or step == args.steps:
             save(out_dir / "latest.pt")

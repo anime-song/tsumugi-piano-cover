@@ -464,7 +464,7 @@ class CoverWindowDataset(Dataset):
         return patch_loss
 
 
-SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid", "plan_target")
+SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid", "plan_target", "src_patch_start")
 
 
 def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -483,6 +483,12 @@ def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
         valid[i, :s, :r] = item["src_valid"]
         patch_valid[i, :s] = item["src_patch_valid"]
     out.update(src_features=features, src_onset=onset, src_valid=valid, src_patch_valid=patch_valid)
+    if any("src_patch_start" in item for item in batch):  # 拍のトークン: 原曲の小節の頭の刻み
+        starts = torch.zeros(len(batch), num_patches, dtype=torch.long)
+        for i, item in enumerate(batch):
+            if "src_patch_start" in item:
+                starts[i, : len(item["src_patch_start"])] = item["src_patch_start"]
+        out["src_patch_start"] = starts
     if any("plan_target" in item for item in batch):
         # 原曲のない行 (事前学習の曲) の正解は列が少ない (すべて NaN) ので、一番多い列に合わせる
         columns = max(item["plan_target"].shape[1] for item in batch if "plan_target" in item)

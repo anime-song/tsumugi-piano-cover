@@ -90,6 +90,8 @@ class OnsetHead(nn.Module):
     def __init__(self, dim: int, hidden: int, tokenizer: PianoTokenizer) -> None:
         super().__init__()
         self.patch_frames = tokenizer.patch_frames
+        # 拍のトークンでは幅を刻みで持つ (BeatTokenizer.onset_widths)
+        self.widths = tuple(getattr(tokenizer, "onset_widths", self.WIDTHS))
         self.time_slice = slice(tokenizer.time_offset, tokenizer.pitch_offset)
         self.offset = SourceVocab(tokenizer.config).offset
         instrument, drum, row_type = onset_group_tables()
@@ -97,7 +99,7 @@ class OnsetHead(nn.Module):
         self.register_buffer("drum_group", torch.from_numpy(drum), persistent=False)
         self.register_buffer("type_group", torch.from_numpy(row_type), persistent=False)
         self.candidate = nn.Sequential(
-            nn.Linear(len(ONSET_GROUPS) * len(self.WIDTHS), hidden), nn.SiLU(), nn.Linear(hidden, hidden)
+            nn.Linear(len(ONSET_GROUPS) * len(self.widths), hidden), nn.SiLU(), nn.Linear(hidden, hidden)
         )
         self.query = nn.Linear(dim, hidden, bias=False)
 
@@ -125,7 +127,7 @@ class OnsetHead(nn.Module):
         distance = onset.float()[:, None, :] - source_time[:, :, None]  # [N, F, M]
         use = valid & (group >= 0)
         one_hot = F.one_hot(group.clamp(min=0), len(ONSET_GROUPS)).float() * use[..., None]  # [N, M, G]
-        parts = [torch.exp(-0.5 * (distance / width) ** 2) @ one_hot for width in self.WIDTHS]
+        parts = [torch.exp(-0.5 * (distance / width) ** 2) @ one_hot for width in self.widths]
         return torch.log1p(torch.cat(parts, dim=-1))
 
     def forward(self, h: Tensor, logits: Tensor, features: Tensor) -> Tensor:
@@ -297,7 +299,11 @@ class CoverModel(nn.Module):
         patch_features = features[patch_valid]
         patch_rows_valid = row_valid[patch_valid]
         onset = batch["src_onset"][patch_valid].long()
-        local_onset = (onset - flat[:, 1:2] * self.patch_frames).clamp(0, self.patch_frames - 1)
+        if "src_patch_start" in batch:  # 拍のトークン: 原曲のパッチ (小節) の長さが違うので、パッチの頭は渡されたもの
+            patch_start = batch["src_patch_start"][patch_valid].long()[:, None]
+        else:
+            patch_start = flat[:, 1:2] * self.patch_frames
+        local_onset = (onset - patch_start).clamp(0, self.patch_frames - 1)
         needed_flat = needed[patch_valid]
         lookup_flat = torch.where(needed_flat, needed_flat.long().cumsum(0) - 1, -1)
         num_needed = int(needed_flat.sum())
@@ -516,7 +522,10 @@ class CoverModel(nn.Module):
         # Local が見る原曲のパッチ (カバーの各パッチの中央に対応する原曲のパッチ ± r)
         align = batch["align"][valid]  # [N, 2] 原曲のフレーム
         song_of = valid.nonzero()[:, 0]
-        centers = torch.div(align.mean(-1), F_, rounding_mode="floor").long()
+        if "align_center" in batch:  # 拍のトークン: 小節の中央が当たる原曲の小節はデータの側で決める
+            centers = batch["align_center"][valid].long()
+        else:
+            centers = torch.div(align.mean(-1), F_, rounding_mode="floor").long()
         r = self.config.local_cross_radius
         neighbors = centers[:, None] + torch.arange(-r, r + 1, device=centers.device)
         inside = (neighbors >= 0) & (neighbors < S) & has_source[song_of][:, None]
@@ -605,8 +614,9 @@ class _TrainingCondition:
         F_ = model.patch_frames
         has_source = batch["has_source"]
         align = batch["align"]
-        # Global: カバーのパッチ p の中央に対応する原曲の位置 (パッチ単位)。キーはパッチ番号 (の中央) と比べる
-        self.global_pos = align.mean(-1) / F_ - 0.5
+        # Global: カバーのパッチ p の中央に対応する原曲の位置 (パッチ単位)。キーはパッチ番号 (の中央) と比べる。
+        # 拍のトークンではカバーの小節の頭が当たる原曲の小節 (小数)。生成では恒等なのでパッチ p は p
+        self.global_pos = batch["align_bar"].float() if "align_bar" in batch else align.mean(-1) / F_ - 0.5
         distance = (memory.song_pos[:, None, :] - self.global_pos[:, :, None]).abs()
         self.global_mask = (
             (distance <= model.config.global_cross_window) & memory.song_valid[:, None, :] & has_source[:, None, None]
@@ -710,6 +720,8 @@ class SourceCondition:
         batch = {key: value[None] for key, value in source.items()}
         self.num_patches = int(batch["src_patch_valid"].shape[1])
         self.memory = model.encode_source(batch, batch["src_patch_valid"])
+        # 拍のトークン: 原曲のパッチ (小節) の頭の刻み。なければ時刻のトークンで、パッチ p の頭は p x patch_frames
+        self.patch_start = source["src_patch_start"].float() if "src_patch_start" in source else None
 
     def bind(self, conditioned: list[bool]) -> _BoundSourceCondition:
         return _BoundSourceCondition(self, conditioned)
@@ -719,6 +731,7 @@ class _BoundSourceCondition:
     def __init__(self, source: SourceCondition, conditioned: list[bool]) -> None:
         self.model = source.model
         self.memory = source.memory
+        self.patch_start = source.patch_start
         self.rows = len(conditioned)
         # False の行 (CFG の「原曲なし」) は原曲を見せない
         self.conditioned = torch.tensor(conditioned, dtype=torch.bool, device=self.memory.song.device)
@@ -743,9 +756,8 @@ class _BoundSourceCondition:
     def local_cross(self, patch: int, prefix: Tensor) -> CrossHook:
         model, memory = self.model, self.memory
         device = memory.song.device
-        F_ = model.patch_frames
         index = model.local_neighbors(torch.tensor([patch], device=device), memory.lookup)
-        rows, k_pos, valid = model.local_memory(memory, index, torch.tensor([patch * F_], device=device).float())
+        rows, k_pos, valid = model.local_memory(memory, index, self.start(patch)[:1])
         rows, k_pos = rows.expand(self.rows, -1, -1), k_pos.expand(self.rows, -1)
         mask = (valid.expand(self.rows, -1) & self.conditioned[:, None])[:, None, :]
         q_pos = query_onsets(prefix, model.tokenizer)
@@ -762,9 +774,18 @@ class _BoundSourceCondition:
         device = memory.song.device
         F_ = model.patch_frames
         index = model.local_neighbors(torch.tensor([patch], device=device), memory.lookup).expand(self.rows, -1)
-        start = torch.full((self.rows,), patch * F_, dtype=torch.float32, device=device)
+        start = self.start(patch)
         # CFG の「原曲なし」の行は原曲を見せない
         return model.local_step_tensors(memory, index, start, start + F_, self.conditioned)
+
+    def start(self, patch: int) -> Tensor:
+        """パッチ patch の頭の原曲の位置 [rows] (時刻のトークンはフレーム、拍のトークンは刻み)"""
+        device = self.memory.song.device
+        if self.patch_start is not None:
+            value = self.patch_start[min(patch, len(self.patch_start) - 1)].to(device)
+        else:
+            value = torch.tensor(float(patch * self.model.patch_frames), device=device)
+        return value.expand(self.rows).float()
 
     def step_cross(self, tensors: dict[str, Tensor], i: int, x: Tensor, onset: Tensor) -> Tensor:
         return self.model.step_cross(tensors, i, x, onset)
