@@ -42,6 +42,7 @@ data/metadata/
 
 data/alignments/
 data/piano_score/
+data/sheetsage/
 
 # 公開用に書き出した重み (piano_ar.export / piano_cover.export) と UI のプロジェクト
 pretrained/

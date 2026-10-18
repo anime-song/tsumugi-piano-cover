@@ -15,3 +15,5 @@ huggingface_hub
 fastapi
 uvicorn
 python-multipart
+# 音声の拍とメロディの注釈 (piano_ar.sheetsage)
+sheetsage2-refined @ git+https://github.com/anime-song/SheetSage2-Refined
