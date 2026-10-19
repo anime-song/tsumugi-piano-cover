@@ -3,10 +3,12 @@
 python -m piano_ar.generate --checkpoint checkpoints/piano_ar/latest.pt --seconds 60 --num-samples 4
 python -m piano_ar.generate --checkpoint ... --channel UCxxxxxxxx --cfg-scale 1.5
 python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover   # 公開した重み (Hugging Face)
+python -m piano_ar.generate --checkpoint checkpoints/b4/ar-long-beat/best.pt --seconds 48 --bpm 120 --beats-per-bar 4
 
 --checkpoint は学習のチェックポイント (.pt)、piano_ar.export の出力のフォルダ、Hugging Face の repository のどれか。
 
 --cfg-scale はチャンネル (演奏者) の強さ。
+拍トークンのモデルでは --bpm と --beats-per-bar で小節の時刻と Global の条件を作る。
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from .evaluation import synthesize, write_wav
@@ -34,6 +37,9 @@ def main() -> None:
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="> 1 でチャンネル / スタイルを強める")
     parser.add_argument("--context-seconds", type=float, default=None, help="Global が見る長さ。省略で学習時の窓の長さ")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--bpm", type=float, default=120.0, help="拍トークンのモデルで生成に使うテンポ")
+    parser.add_argument("--beats-per-bar", type=int, default=4, help="拍トークンのモデルで生成に使う小節の拍数")
+    parser.add_argument("--min-seconds", type=float, default=0.0, help="この長さまでは曲の終了を許さない")
     parser.add_argument("--wav", action="store_true", help="確認用の簡易シンセ音声も保存する")
     args = parser.parse_args()
 
@@ -51,11 +57,36 @@ def main() -> None:
             index_path = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True)["channel_index"]
             channel = json.loads(Path(index_path).read_text(encoding="utf-8"))[args.channel]
 
-    patch_seconds = tokenizer.config.patch_seconds
+    beat_mode = hasattr(tokenizer, "ticks_per_beat")
+    if beat_mode:
+        from .beat_tokenizer import BeatGrid
+
+        if not 1 <= args.beats_per_bar <= tokenizer.config.max_bar_beats:
+            parser.error(f"--beats-per-bar は 1〜{tokenizer.config.max_bar_beats} にしてください")
+        if not tokenizer.config.tempo_min <= args.bpm <= tokenizer.config.tempo_max:
+            parser.error(f"--bpm は {tokenizer.config.tempo_min}〜{tokenizer.config.tempo_max} にしてください")
+        patch_seconds = args.beats_per_bar * 60.0 / args.bpm
+        num_patches = math.ceil(args.seconds / patch_seconds)
+        total_beats = num_patches * args.beats_per_bar
+        grid = BeatGrid(
+            beats=np.arange(total_beats + 1, dtype=np.float64) * 60.0 / args.bpm * tokenizer.config.frame_rate,
+            bar_starts=np.arange(0, total_beats + 1, args.beats_per_bar, dtype=np.int64),
+        )
+        conditions = {
+            "bar_beats": torch.full((num_patches,), args.beats_per_bar, dtype=torch.long, device=device),
+            "tempo": torch.from_numpy(tokenizer.tempo_bin(np.full(num_patches, args.bpm))).to(device),
+        }
+    else:
+        patch_seconds = tokenizer.config.patch_seconds
+        num_patches = math.ceil(args.seconds / patch_seconds)
+        conditions = {}
+    if num_patches < 1:
+        parser.error("--seconds は正の値にしてください")
+    end_after = min(num_patches - 1, max(0, math.floor(args.min_seconds / patch_seconds)))
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         samples = model.generate(
             tokenizer,
-            num_patches=math.ceil(args.seconds / patch_seconds),
+            num_patches=num_patches,
             channel=channel,
             num_samples=args.num_samples,
             temperature=args.temperature,
@@ -64,14 +95,17 @@ def main() -> None:
             context_patches=(
                 round(args.context_seconds / patch_seconds) if args.context_seconds else model.context_patches
             ),
+            end_after=end_after,
+            **conditions,
         )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.checkpoint).stem or "piano_ar"
     for i, patches in enumerate(samples):
-        events = tokenizer.patches_to_events(patches)
-        path = out_dir / f"{stem}_ch{channel}_{i}.mid"
+        events = tokenizer.patches_to_events(patches, grid) if beat_mode else tokenizer.patches_to_events(patches)
+        suffix = f"_{int(args.bpm)}bpm_{args.beats_per_bar}beat" if beat_mode else ""
+        path = out_dir / f"{stem}{suffix}_ch{channel}_{i}.mid"
         tokenizer.events_to_midi(events, path)
         if args.wav:
             write_wav(synthesize(events, tokenizer.config.frame_rate), path.with_suffix(".wav"))
