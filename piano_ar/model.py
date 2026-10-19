@@ -376,6 +376,10 @@ class CrossBlock(nn.Module):
         # 空のキーは位置によらないよう回転をかけない
         is_null = (key_index < 0)[:, None, None]
         safe = key_index.clamp(min=0)
+        # 全系列で原曲の行が 0 件になる場合もある。where は未採用の枝も評価するので、
+        # 空の k/v を safe=0 で索引できるよう番兵を 1 行足す。
+        k = F.pad(k, (0, 0, 0, 0, 0, 1))
+        v = F.pad(v, (0, 0, 0, 0, 0, 1))
         k = torch.where(is_null, self.k_norm(self.null_k).to(v.dtype), k[safe]).contiguous()
         v = torch.where(is_null, self.null_v.to(v.dtype), v[safe]).contiguous()
         q = self.q(self.norm(x)).view(1, length, self.heads, head_dim).transpose(1, 2)
