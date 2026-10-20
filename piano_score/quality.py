@@ -17,6 +17,14 @@
                        分けた取り込みや初心者の書き方)。低音と後打ちの和音を分け合う伴奏 (和音か、離れた音) は数えない
     ledger             ト音記号の段で加線 4 本を超える低い音・ヘ音記号の段で加線 4 本を超える高い音
     odd_measure        拍子と長さが合わない小節 (曲の最初と最後の小節は除く。弱起と終わりの短い小節は正しい書き方)
+曲ごとの印 (0 / 1):
+    tab                TAB 譜 (TAB の音部記号かフレットの番号がある)
+    no_time            拍子記号がどこにもない
+
+low_quality が外す基準。ユーザーが良い・微妙・悪いを付けた見本 (2026-10-21、30 曲 + 確認済みの悪い 3 曲) に合わせた:
+悪い楽譜は、段に合わない音域の音 (ある小節から先がオクターブ違う・音部記号の誤り) と TAB 譜がいちばん目立ち、
+拍をまたぐ連符・タイの鎖・旋律の線の段の分け方がそれに続く。細切れの休符と拍をまたぐ音価は、良い楽譜にも多いので使わない。
+拍子と合わない小節が多い楽譜 (拍子記号がない楽譜を含む) は、見た目が良くても小節の拍子を学べないので外す。
 """
 
 from __future__ import annotations
@@ -33,6 +41,14 @@ STEP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 # 1 つの音符で書ける長さ (4 分音符単位): 全音符〜64 分音符と、その付点・複付点
 NOTE_VALUES = {Fraction(4, 2**k) * m for k in range(7) for m in (Fraction(1), Fraction(3, 2), Fraction(7, 4))}
 RULES = ("tuplet_misaligned", "redundant_tie", "rest_split", "beat_cross", "staff_split", "ledger")
+# low_quality で外すしきい値 (この値を超えたら外す)
+LIMITS = {
+    "ledger": 0.04,
+    "tuplet_misaligned": 0.01,
+    "redundant_tie": 0.05,
+    "staff_split": 0.02,
+    "odd_measure": 0.2,
+}
 EPS = Fraction(1, 256)
 
 
@@ -42,6 +58,8 @@ def _same_beat(start: Fraction, end: Fraction, beat: Fraction) -> bool:
 
 def lint(path: str | Path) -> dict:
     root = ET.parse(path).getroot()
+    tab = any((sign.text or "") == "TAB" for sign in root.iter("sign")) or root.find(".//fret") is not None
+    no_time = root.find(".//time") is None
     counts: dict[str, int] = defaultdict(int)
     notes_total = 0
     measures_total = 0
@@ -172,9 +190,18 @@ def lint(path: str | Path) -> dict:
     n = max(1, notes_total)
     out = {rule: counts[rule] / n for rule in RULES}
     out["odd_measure"] = counts["odd_measure"] / max(1, measures_total)
+    out["tab"] = int(tab)
+    out["no_time"] = int(no_time)
     out["notes"] = notes_total
     out["measures"] = measures_total
     return out
+
+
+def low_quality(result: dict) -> bool:
+    """lint の結果から、学習に使わない低品質の楽譜か"""
+    if "error" in result or result.get("tab") or result.get("no_time"):
+        return True
+    return any(result[name] > limit for name, limit in LIMITS.items())
 
 
 def _lint_file(path: str) -> tuple[str, dict]:
@@ -195,7 +222,8 @@ def main() -> None:
     if args.ids:
         for score_id in args.ids:
             _, result = _lint_file(str(Path(args.dir) / f"{score_id}.musicxml"))
-            print(score_id, " ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in result.items()))
+            values = " ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in result.items())
+            print(score_id, "低品質" if low_quality(result) else "良い", values)
         return
     paths = sorted(str(p) for p in Path(args.dir).glob("*.musicxml"))
     results = {}
@@ -208,7 +236,10 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results), encoding="utf-8")
     errors = sum("error" in r for r in results.values())
-    print(f"{len(results)} 曲 (読めなかった {errors}) を {out} に書いた")
+    low = sum(low_quality(r) for r in results.values())
+    print(
+        f"{len(results)} 曲 (読めなかった {errors}、低品質 {low} = {low / max(1, len(results)):.1%}) を {out} に書いた"
+    )
 
 
 if __name__ == "__main__":
