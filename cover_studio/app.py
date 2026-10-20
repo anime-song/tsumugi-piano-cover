@@ -271,7 +271,15 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         open_project(pid)
         job = next((j for j in runner.jobs(pid) if j.kind == "transcribe"), None)
         if job is None or job._live is None:
-            return {"seq": 0, "events": [], "stems": [], "stage": None, "active": bool(job and job.active)}
+            # 進み具合を作る前 (待ちの間) も同じ形で返す。progress を省くと画面が undefined を読む
+            return {
+                "seq": 0,
+                "events": [],
+                "stems": [],
+                "stage": None,
+                "progress": None,
+                "active": bool(job and job.active),
+            }
         return {**job._live.since(since), "active": job.active}
 
     @app.put("/api/projects/{pid}/source")
