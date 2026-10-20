@@ -2,7 +2,11 @@
 
 python -m piano_cover.generate --checkpoint checkpoints/piano_cover/best.pt --source Dataset/original_midis_v2/merged/<id>.mid
 python -m piano_cover.generate ... --channel UCxxxxxxxx --source-cfg 1.75 --onset-bias 4 --seconds 60 --wav
-python -m piano_cover.generate --checkpoint anime-song/tsumugi-piano-cover --source song.mid   # 公開した重み
+python -m piano_cover.generate --checkpoint anime-song/tsumugi-piano-cover --source song.mid   # 公開した重み (V1)
+python -m piano_cover.generate --checkpoint anime-song/tsumugi-piano-cover-v2 --source song.mid --audio song.mp3  # V2
+
+SheetSage2-Refined の拍とメロディや、原曲の音声の特徴を使うモデル (V2) では、--audio に原曲の音声を渡すと、
+それらを作ってから生成する (--out-dir に <音声>.sheetsage.json と <音声>.frames.npy を残す)。
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
 生成は原曲の最初の音から始め (trim_lead)、出力はそのぶん後ろにずらして原曲の時刻に戻す。
@@ -277,6 +281,37 @@ def generate_covers(
     return covers
 
 
+def analyze_audio(
+    audio: str | Path, model: CoverModel, out_dir: str | Path, sheetsage_model: str | None = None, device=None
+) -> tuple[Path | None, np.ndarray | None]:
+    """原曲の音声から、モデルが使う SheetSage2-Refined の注釈 (拍・メロディ) と音声の特徴を作る。
+    (注釈の JSON のパス, 特徴) を返し、使わないものは None。注釈は out_dir/<音声>.sheetsage.json に書く"""
+    import gc
+
+    from piano_ar.sheetsage import SheetSageAnnotator
+
+    from .audio_frames import FrameExtractor, FrameProjector
+
+    c = model.config
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device = str(device) if device is not None else None
+    annotation = None
+    if c.sheetsage_beats or c.sheetsage_melody or isinstance(model.tokenizer, BeatTokenizer):
+        annotator = SheetSageAnnotator(sheetsage_model, device=device)
+        annotation = out_dir / f"{Path(audio).stem}.sheetsage.json"
+        annotation.write_text(json.dumps(annotator.annotate(audio), ensure_ascii=False), encoding="utf-8")
+        del annotator
+        gc.collect()
+    frames = None
+    if c.frame_dims:
+        frames = FrameProjector(FrameExtractor(sheetsage_model, device=device), model.frames_pca_path)(audio)
+        np.save(out_dir / f"{Path(audio).stem}.frames.npy", frames)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return annotation, frames
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
@@ -285,6 +320,12 @@ def main() -> None:
         "--sheetsage",
         default=None,
         help="原曲の SheetSage2-Refined の注釈 (省略で data/sheetsage/original/<原曲>.json)",
+    )
+    parser.add_argument(
+        "--audio", default=None, help="原曲の音声。SheetSage2-Refined の注釈と音声の特徴をここから作る (V2 のモデル)"
+    )
+    parser.add_argument(
+        "--sheetsage-model", default=None, help="SheetSage2-Refined の重み (既定 anime-song/SheetSage2-Refined)"
     )
     parser.add_argument("--planner", default=None, help="Planner の重みを差し替える (piano_cover.train_planner の出力)")
     parser.add_argument("--out-dir", default="outputs/piano_cover")
@@ -329,11 +370,15 @@ def main() -> None:
             channel = json.loads(Path(index_path).read_text(encoding="utf-8"))[args.channel]
 
     params = CoverParams.from_dict({**vars(args), "channel": channel, "arrangement": not args.no_arrangement})
-    source = prepare_source(args.source, tokenizer, model.config, args.sheetsage)
-    covers = generate_covers(model, source, params, num_samples=args.num_samples)
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    sheetsage, frames = args.sheetsage, None
+    if args.audio:
+        annotation, frames = analyze_audio(args.audio, model, out_dir, args.sheetsage_model, device)
+        sheetsage = sheetsage or annotation
+    source = prepare_source(args.source, tokenizer, model.config, sheetsage, frames)
+    covers = generate_covers(model, source, params, num_samples=args.num_samples)
+
     for i, cover in enumerate(covers):
         manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"

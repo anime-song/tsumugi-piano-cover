@@ -27,6 +27,7 @@ def main() -> None:
         "model_type": "piano_ar",
         "model_config": vars(model.config),
         "tokenizer_config": vars(model.tokenizer.config),
+        "tokenizer_type": "beat" if hasattr(model.tokenizer, "ticks_per_beat") else "time",
         "context_patches": model.context_patches,
     }
     out = save_pretrained(model, args.out, config)

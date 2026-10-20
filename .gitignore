@@ -47,6 +47,7 @@ data/audio_frames/
 
 # 公開用に書き出した重み (piano_ar.export / piano_cover.export) と UI のプロジェクト
 pretrained/
+pretrained_v2/
 projects/
 cover_studio/static/
 web/node_modules/

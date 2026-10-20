@@ -4,7 +4,9 @@
     config.json         モデルの種類 (model_type) と設定 (model_config / tokenizer_config / 生成で見る文脈の長さなど)
     model.safetensors   重みだけ (optimizer の状態・学習の設定・演奏者の一覧は入れない)
 
-1 つの repository に piano_ar/ と piano_cover/ を並べて置き、subfolder で選ぶ。
+1 つの repository に piano_ar/ と piano_cover/ を並べて置き、subfolder で選ぶ。直下にも config.json (repository の
+版と中身の一覧、REPO_CONFIG) を置く。Hugging Face はダウンロード数を直下の config.json への問い合わせで数えるので、
+repository から読むときは毎回それも取ってくる (subfolder の config.json は数えられない)。
 手元のフォルダ (export の出力) を渡せば、ネットにはつながずにそれを読む。
 """
 
@@ -17,7 +19,11 @@ from pathlib import Path
 import torch
 from torch import nn
 
-HF_REPO = "anime-song/tsumugi-piano-cover"
+# 公開した版。HF_REPO (from_pretrained の既定) は新しい版
+HF_REPO_V1 = "anime-song/tsumugi-piano-cover"  # 時刻のトークン、tsumugi の採譜だけを見る
+HF_REPO_V2 = "anime-song/tsumugi-piano-cover-v2"  # 拍のトークン、SheetSage2-Refined の拍・メロディと音声の特徴も見る
+HF_REPO = HF_REPO_V2
+HF_REPOS = (HF_REPO_V2, HF_REPO_V1)
 CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "model.safetensors"
 FORMAT_VERSION = 1
@@ -35,6 +41,24 @@ def save_pretrained(model: nn.Module, out_dir: str | Path, config: dict) -> Path
     config = {"format_version": FORMAT_VERSION, **config}
     (out / CONFIG_NAME).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return out
+
+
+def save_repo_config(repo_dir: str | Path, version: int, folders: dict[str, str]) -> Path:
+    """repository の直下の config.json (版と中身の一覧)。ダウンロード数を数えるのに使われる"""
+    path = Path(repo_dir) / CONFIG_NAME
+    config = {"model_type": "tsumugi-piano-cover", "version": version, "folders": folders}
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _count_download(repo_id: str, revision: str | None) -> None:
+    """直下の config.json を取ってくる (Hugging Face のダウンロード数に数えられる)。ないときやつながらないときは何もしない"""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(repo_id, CONFIG_NAME, revision=revision)
+    except Exception:  # noqa: BLE001, S110  数えるためだけなので、失敗しても読み込みは続ける
+        pass
 
 
 def shuffle_channels(embedding: nn.Embedding, order_path: str | Path = CHANNEL_ORDER) -> None:
@@ -72,6 +96,7 @@ def resolve_pretrained(name_or_path: str | Path, subfolder: str | None = None, r
 
     from huggingface_hub import snapshot_download
 
+    _count_download(str(name_or_path), revision)
     patterns = [f"{subfolder}/*"] if subfolder else None
     root = Path(snapshot_download(str(name_or_path), revision=revision, allow_patterns=patterns))
     path = root / subfolder if subfolder else root

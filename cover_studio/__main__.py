@@ -17,7 +17,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from piano_ar.hub import HF_REPO
+from piano_ar.hub import HF_REPOS
 
 from .app import create_app
 from .engine import REPO_ROOT, Engine, TsumugiSetup, find_models
@@ -45,7 +45,12 @@ def main(argv=None) -> None:
         default=REPO_ROOT / "checkpoints",
         help="学習のチェックポイント (**/best.pt) を探すフォルダ (空文字で探さない)",
     )
-    parser.add_argument("--hub-repo", default=HF_REPO, help="Hugging Face の repository (空文字で使わない)")
+    parser.add_argument(
+        "--hub-repo",
+        nargs="*",
+        default=list(HF_REPOS),
+        help="Hugging Face の repository (並べた順に一覧の先頭に出し、最初のものが既定。何も渡さなければ使わない)",
+    )
     parser.add_argument("--device", default="auto", help="auto / cuda / cpu")
     parser.add_argument("--tsumugi-dir", type=Path, default=None, help="tsumugi のリポジトリ (既定 .tsumugi/tsumugi)")
     parser.add_argument("--tsumugi-python", type=Path, default=None, help="tsumugi の環境の Python (既定 その .venv)")
@@ -74,7 +79,7 @@ def main(argv=None) -> None:
 
     import uvicorn
 
-    models = find_models(args.pretrained_dir, args.checkpoints_dir, args.hub_repo or None)
+    models = find_models(args.pretrained_dir, args.checkpoints_dir, [repo for repo in args.hub_repo if repo])
     tsumugi = TsumugiSetup.detect(args.tsumugi_dir, args.tsumugi_python, args.ffmpeg_dir)
     if tsumugi is not None:
         tsumugi.compile = args.tsumugi_compile

@@ -3,7 +3,7 @@
 モデルの候補 (find_models):
   export     piano_cover.export の出力 (既定 pretrained/ の下)
   checkpoint 学習のチェックポイント (既定 checkpoints/**/best.pt。隣に planner*.pt があれば差し替えた版も)
-  hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPO。初回にダウンロードする)
+  hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPOS の V2・V1。初回にダウンロードする)。一覧の先頭 (既定) は V2
 """
 
 from __future__ import annotations
@@ -57,8 +57,17 @@ def _is_cover_checkpoint(path: Path) -> bool:
         return False
 
 
-def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repo: str | None) -> list[ModelEntry]:
-    entries: list[ModelEntry] = []
+def find_models(
+    pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repos: list[str] | tuple[str, ...]
+) -> list[ModelEntry]:
+    """画面の一覧の先頭が既定のモデルになるので、Hugging Face の公開した重み (hub_repos の順) を先に並べる"""
+    from piano_ar.hub import HF_REPO_V1, HF_REPO_V2
+
+    names = {HF_REPO_V2: "V2", HF_REPO_V1: "V1"}
+    entries: list[ModelEntry] = [
+        ModelEntry(f"hub:{repo}", f"{names[repo]} ({repo})" if repo in names else f"{repo} (Hugging Face)", "hub", repo)
+        for repo in hub_repos
+    ]
     if pretrained_dir is not None and pretrained_dir.is_dir():
         for config_path in sorted(pretrained_dir.rglob("config.json")):
             try:
@@ -91,8 +100,6 @@ def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_r
                         str(planner),
                     )
                 )
-    if hub_repo:
-        entries.append(ModelEntry(f"hub:{hub_repo}", f"{hub_repo} (Hugging Face)", "hub", hub_repo))
     return entries
 
 
@@ -260,10 +267,12 @@ class Engine:
 
         out = project.dir / "frames.npz"
         audio = project.audio_path
-        if not self.frames_pca.is_file():
-            raise FileNotFoundError(f"原曲の音声の特徴を作る PCA がありません: {self.frames_pca} (--frames-pca で指定)")
+        # 公開した重みは重みの隣の PCA、学習のチェックポイントは --frames-pca (既定は手元で作ったもの)
+        pca = Path(getattr(self._model, "frames_pca_path", None) or self.frames_pca)
+        if not pca.is_file():
+            raise FileNotFoundError(f"原曲の音声の特徴を作る PCA がありません: {pca} (--frames-pca で指定)")
         sha1 = project.data.get("audio_sha1")
-        pca_sha1 = hashlib.sha1(self.frames_pca.read_bytes()).hexdigest()
+        pca_sha1 = hashlib.sha1(pca.read_bytes()).hexdigest()
         if out.is_file():
             saved = np.load(out)
             if str(saved["audio_sha1"]) == str(sha1) and str(saved["pca_sha1"]) == pca_sha1:
@@ -278,7 +287,7 @@ class Engine:
         log(f"原曲の音声の特徴を作っています: {audio.name}")
         extractor = FrameExtractor(self.sheetsage_model, device=str(self.device))
         try:
-            frames = FrameProjector(extractor, self.frames_pca)(audio)
+            frames = FrameProjector(extractor, pca)(audio)
         finally:
             del extractor
             gc.collect()
