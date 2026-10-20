@@ -179,6 +179,7 @@ const ja = {
   stopping: "止めています",
   preparingModel: "モデルを準備しています",
   startingTsumugi: "tsumugi を起動しています",
+  analyzingBeats: "原曲の拍とメロディを予測しています",
   stopped: "止めました",
   notes: (n: number | null) => `${n} 音`,
   favorite: "お気に入り (F)",
@@ -388,6 +389,7 @@ const en: Dict = {
   stopping: "Stopping",
   preparingModel: "Preparing the model",
   startingTsumugi: "Starting tsumugi",
+  analyzingBeats: "Predicting the beats and melody of the original",
   stopped: "Stopped",
   notes: (n) => `${n} notes`,
   favorite: "Favorite (F)",
@@ -468,6 +470,7 @@ export function progressText(t: Dict, message: string | undefined): string | nul
   if (message === "loading") return t.preparingModel;
   if (message === "stopping") return t.stopping;
   if (message === "starting") return t.startingTsumugi;
+  if (message === "beats") return t.analyzingBeats;
   const m = message.match(/^(\d+)\/(\d+)$/);
   if (m) return `${m[1]} / ${m[2]} ${t.sec}`;
   return message;

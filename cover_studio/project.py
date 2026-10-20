@@ -133,7 +133,7 @@ class Project:
         tmp = self.source_path.with_suffix(".mid.tmp")
         shutil.copy2(midi, tmp)
         tmp.replace(self.source_path)
-        self.update(source={"origin": origin, "created": now(), "filename": midi.name})
+        self.update(source={"origin": origin, "created": now()})
 
     # ------------------------------------------------------------ テイク
     @property

@@ -129,10 +129,12 @@ class Engine:
         models: list[ModelEntry],
         device: str = "auto",
         tsumugi: TsumugiSetup | None = None,
+        sheetsage_model: str | None = None,
     ) -> None:
         self.models = models
         self.device_name = device
         self.tsumugi = tsumugi
+        self.sheetsage_model = sheetsage_model  # None なら sheetsage2_refined の既定 (Hugging Face)
         self._model = None
         self._model_id: str | None = None
         self._sources: OrderedDict[tuple, object] = OrderedDict()
@@ -188,37 +190,60 @@ class Engine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _source(self, project: Project, model):
+    def _source(self, project: Project, model, progress: Callable[[float, str], None], log: Callable[[str], None]):
+        from piano_ar.beat_tokenizer import BeatTokenizer
         from piano_cover.generate import prepare_source
 
         path = project.source_path
-        annotation = project.dir / "sheetsage.json"
-        if not annotation.is_file() and hasattr(model.tokenizer, "ticks_per_beat"):
-            names = []
-            if project.audio_path is not None:
-                names.append(project.audio_path.stem)
-            original_name = (project.data.get("source") or {}).get("filename")
-            if original_name:
-                names.append(Path(original_name).stem)
-            for name in names:
-                candidate = REPO_ROOT / "data" / "sheetsage" / "original" / f"{name}.json"
-                if candidate.is_file():
-                    annotation = candidate
-                    break
-            if not annotation.is_file():
-                raise FileNotFoundError(
-                    f"SheetSage注釈がありません。{annotation} に拍・メロディのJSONを置いてください"
-                )
-        key = (str(path), path.stat().st_mtime_ns, self._model_id, str(annotation),
-               annotation.stat().st_mtime_ns if annotation.is_file() else None)
+        annotation = None
+        c = model.config
+        if c.sheetsage_beats or c.sheetsage_melody or isinstance(model.tokenizer, BeatTokenizer):
+            annotation = self._sheetsage(project, progress, log)
+        key = (
+            str(path),
+            path.stat().st_mtime_ns,
+            self._model_id,
+            annotation and (str(annotation), annotation.stat().st_mtime_ns),
+        )
         if key not in self._sources:
-            self._sources[key] = prepare_source(
-                path, model.tokenizer, model.config, annotation if annotation.is_file() else None
-            )
+            self._sources[key] = prepare_source(path, model.tokenizer, model.config, annotation)
             while len(self._sources) > 8:
                 self._sources.popitem(last=False)
         self._sources.move_to_end(key)
         return self._sources[key]
+
+    def _sheetsage(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """原曲の音声の拍とメロディを SheetSage2-Refined (HeadBeats / HeadMelody) で予測し、project/sheetsage.json に置く。
+        音声が同じ (audio_sha1) なら前回の結果を使う"""
+        out = project.dir / "sheetsage.json"
+        audio = project.audio_path
+        sha1 = project.data.get("audio_sha1")
+        if out.is_file() and (audio is None or json.loads(out.read_text(encoding="utf-8")).get("audio_sha1") == sha1):
+            return out
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError(
+                "このモデルは原曲の音声から拍とメロディを予測して使います。音源のあるプロジェクトで生成してください"
+            )
+        import torch
+
+        from piano_ar.sheetsage import SheetSageAnnotator
+
+        progress(0.0, "beats")  # 画面が言語に合わせて訳す (web/src/i18n.ts の progressText)
+        log(f"原曲の拍とメロディを予測しています: {audio.name}")
+        annotator = SheetSageAnnotator(self.sheetsage_model, device=str(self.device))
+        try:
+            result = annotator.annotate(audio)
+        finally:
+            del annotator
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        result["audio_sha1"] = sha1
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(out)
+        log(f"拍 {len(result['beats'])}・メロディ {len(result['melody'])} 音")
+        return out
 
     # ------------------------------------------------------------ 生成
     def generate(
@@ -245,7 +270,7 @@ class Engine:
             params = CoverParams.from_dict(first["params"])
             if params.channel and entry.num_channels and params.channel >= entry.num_channels:
                 raise ValueError(f"演奏者の番号は 1〜{entry.num_channels - 1} です")
-            source = self._source(project, model)
+            source = self._source(project, model, progress, log)
             tokenizer = model.tokenizer
             frame_rate = tokenizer.config.frame_rate
 
