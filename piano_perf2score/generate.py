@@ -33,7 +33,7 @@ from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
 from piano_score.tokenizer import EOS, PAD, ScoreTokenizer
 
-from .beat_input import BEAT_SECONDS, on_beats
+from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .render import Performance, measure_qpm, render
@@ -77,10 +77,18 @@ def read_performance(path: str | Path) -> Performance:
     return Performance(notes, pedal, np.zeros(0))
 
 
-def performance_batch(performance: Performance, max_rows: int = 160) -> dict[str, torch.Tensor]:
-    """演奏を、モデルの演奏エンコーダに入れる形 (data.collate の perf_* と同じ、バッチ 1) にする"""
-    vocab = PerformanceVocab()
+def performance_batch(
+    performance: Performance,
+    max_rows: int = 160,
+    vocab: PerformanceVocab | None = None,
+    drop_durations: bool = False,
+) -> dict[str, torch.Tensor]:
+    """演奏を、モデルの演奏エンコーダに入れる形 (data.collate の perf_* と同じ、バッチ 1) にする。
+    vocab はモデルのもの (メロディの印の列の有無)。drop_durations なら音の長さの列を消す"""
+    vocab = vocab or PerformanceVocab()
     features, onset = vocab.rows(performance)
+    if drop_durations:
+        features[:, 3] = 0
     end_frame = int(onset.max()) + 1 if len(onset) else 1
     perf_features, perf_onset, perf_valid = patch_rows(features, onset, max_rows, end_frame)
     item = {
@@ -154,12 +162,15 @@ def transcribe_on_beats(
     top_p: float = 0.95,
     banned: torch.Tensor | None = None,
     search_measures: int = 8,
+    drop_durations: bool = True,
 ) -> list[list[int]]:
     """拍の時刻の演奏 (beat_input.on_beats、measure_starts に小節線) から楽譜を生成する。小節の開始は与えたものを使い、
     MTIME はそこから決める。最初の小節の 4 分音符の長さは、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭
-    search_measures 小節を生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ"""
+    search_measures 小節を生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ。
+    drop_durations なら音の長さを消して入れる (カバーの短い打鍵をそのまま音価にしない)"""
     device = next(model.parameters()).device
-    batch = {k: v.to(device) for k, v in performance_batch(performance).items()}
+    batch = performance_batch(performance, vocab=model.vocab, drop_durations=drop_durations)
+    batch = {k: v.to(device) for k, v in batch.items()}
     memory = model.encode_performance(batch)
     starts = np.asarray(performance.measure_starts, dtype=np.float64) * FRAMES_PER_SECOND
     end_frame = float(performance.notes[:, 0].max() * FRAMES_PER_SECOND) if len(performance.notes) else 0.0
@@ -183,7 +194,7 @@ def transcribe_on_beats(
 
 def beat_performance(midi: str | Path, annotation: dict) -> Performance:
     """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から、拍の時刻の演奏を作る。
-    小節は注釈の小節の頭で区切り、音のある小節だけを残す"""
+    小節は注釈の小節の頭で区切り、音のある小節だけを残す。注釈のメロディから、メロディの印も付ける"""
     from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
     from piano_ar.config import TokenizerConfig
     from piano_ar.tokenizer import PianoTokenizer
@@ -197,7 +208,8 @@ def beat_performance(midi: str | Path, annotation: dict) -> Performance:
         raise ValueError("拍が足りない")
     bar_frames = grid.beats[grid.bar_starts]  # 各小節の頭と、最後の小節の終わり
     keep = (bar_frames[1:] > first) & (bar_frames[:-1] <= last)
-    performance, _ = on_beats(events, grid, bar_frames[:-1][keep], tokenizer)
+    performance, origin = on_beats(events, grid, bar_frames[:-1][keep], tokenizer)
+    performance.melody = melody_from_annotation(performance, annotation, grid, origin)
     return performance
 
 

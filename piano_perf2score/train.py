@@ -21,7 +21,10 @@ V2 のカバー -> 楽譜 (拍の上の演奏、piano_perf2score.beat_input) は
 合わせた合成演奏を楽譜の拍で丸めたもので、曲は beat_input が選んだもの (beat_songs.npz)。
 
     python -m piano_perf2score.beat_input                     # 曲を選ぶ (beat_songs.npz)
-    python -m piano_perf2score.train --beat-input --init-from checkpoints/piano_perf2score_asap/best.pt --new-run         --out-dir checkpoints/piano_perf2score_beat ...
+    python -m piano_perf2score.train --beat-input --init-from checkpoints/piano_perf2score/best.pt --new-run \
+        --out-dir checkpoints/piano_perf2score_beat ...
+--melody-rows 1 でメロディの印の列を足し (--init-from の重みに列がなければ、その行だけ新しく初期化する)、
+--drop-durations で音の長さの列を消す窓の割合を決める。
 """
 
 from __future__ import annotations
@@ -64,6 +67,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--ref-noise-sigma", type=float, default=0.15, help="基準のずれ (前の小節の長さに対する標準偏差)")
     parser.add_argument(
         "--beat-input", action="store_true", help="拍の上の演奏 (V2 のカバー) を楽譜にする学習 (beat_input)"
+    )
+    parser.add_argument(
+        "--drop-durations", type=float, default=0.0, help="--beat-input で、音の長さの列を消す窓の割合"
     )
     parser.add_argument("--window-measures", type=int, default=32)
     parser.add_argument("--context-measures", type=int, default=2, help="窓の前に演奏を描き出す小節数")
@@ -199,11 +205,12 @@ def main() -> None:
         if args.real_cache_dir:
             raise SystemExit("--beat-input と --real-cache-dir は一緒に使えない")
         common["ref_noise"] = None  # 小節線は与えられるので、基準のずれは起きない
+        beat = {"melody": bool(args.melody_rows), "drop_durations": args.drop_durations}
         train_set = BeatSynthWindowDataset(
             cache, split="train", augment=augment, song_start_prob=args.song_start_prob,
-            songs=load_songs(cache, "train"), **common,
+            songs=load_songs(cache, "train"), **beat, **common,
         )  # fmt: skip
-        val_set = BeatSynthWindowDataset(cache, split="val", songs=load_songs(cache, "val"), **common)
+        val_set = BeatSynthWindowDataset(cache, split="val", songs=load_songs(cache, "val"), **beat, **common)
     else:
         train_set = SynthWindowDataset(
             cache, split="train", augment=augment, song_start_prob=args.song_start_prob, **common
@@ -273,7 +280,16 @@ def main() -> None:
     restart_step = None
     if args.init_from:
         checkpoint = torch.load(args.init_from, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+        state = checkpoint["model"]
+        own = model.state_dict()
+        for name, value in list(state.items()):
+            # 演奏の行の埋め込み表が大きくなった (メロディの印の列を足した) ときは、前の行だけを写して残りは初期値のまま
+            if name in own and value.shape != own[name].shape and value.shape[1:] == own[name].shape[1:]:
+                grown = own[name].clone()
+                grown[: value.shape[0]] = value
+                state[name] = grown
+                print(f"{name}: {tuple(value.shape)} -> {tuple(grown.shape)} (足した行は初期値)")
+        missing, unexpected = model.load_state_dict(state, strict=False)
         if unexpected:
             raise SystemExit(f"チェックポイントにあってモデルにない重み: {unexpected}")
         added = sorted({".".join(name.split(".")[:2]) for name in missing})

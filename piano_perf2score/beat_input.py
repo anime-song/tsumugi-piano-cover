@@ -15,6 +15,13 @@ V2 の拍は SheetSage2-Refined の拍なので、楽譜の拍と階層が違う
 (音高の 5〜95%) が MIN_PITCH_SPAN 以上の、カバーに近い曲だけにする (local/probe_score_input_gap.py の測定)。
 拍子より長い小節を含む窓は使わない。
 
+カバーには手の情報がないので、メロディが中央の C あたりまで下がると左手の段に書いてしまう。そこで演奏の行にメロディの
+印を付ける (モデルの melody_rows)。学習では楽譜の上の段の一番上の音、生成では原曲の SheetSage2-Refined のメロディと
+同じ位置 (MELODY_TICKS 刻み以内)・同じ音名の音のうち一番高いもの (melody_from_annotation)。生成で印が外れても困らないよう、
+学習では MELODY_DROP_SONG の窓で印をすべて消し、残りも MELODY_DROP_NOTE の音で消す。
+音の長さ (V2 のカバーはペダルで響きを残して鍵盤を早く離す) をそのまま音価に写さないよう、学習では drop_durations の割合の
+窓で長さの列を消す。生成では長さを消して入れる (generate.transcribe_on_beats)。
+
     python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth     # beat_songs.npz を作る
 """
 
@@ -35,21 +42,24 @@ from piano_score.data import ScoreCache
 from piano_score.quality import low_quality
 from piano_score.tokenizer import ScoreTokenizer
 
-from .data import FRAMES_PER_SECOND, UNMARKED_TEMPO, SynthWindowDataset, make_item
-from .render import COVER_RENDER, Performance, measure_qpm, render
+from .data import FRAMES_PER_SECOND, UNMARKED_TEMPO, PerformanceVocab, SynthWindowDataset, make_item
+from .render import COVER_RENDER, Performance, _score_notes, beat_positions, measure_qpm, render
 
 BEAT_SECONDS = 0.48  # 拍の時刻での 1 拍 (1 刻み = 4 フレーム)
 MIN_PITCH_SPAN = 39  # カバーの音域の下位 25% (local/probe_score_input_gap.py)
 # 丸める格子の拍: 楽譜の拍 1 つを何拍にするか。0.5 は 2 拍をまとめて 1 拍 (小節の拍の数が偶数のときだけ)
 LEVEL_PROBS = {1: 0.7, 2: 0.15, 0.5: 0.1, 3: 0.05}
 SONGS_FILE = "beat_songs.npz"
+MELODY_TICKS = 2  # メロディの音と演奏の音を同じ位置とみなすずれ (刻み)
+MELODY_DROP_SONG = 0.3
+MELODY_DROP_NOTE = 0.1
 
 
 def on_beats(
     events: np.ndarray, grid: BeatGrid, measure_frames: np.ndarray, tokenizer: BeatTokenizer
-) -> tuple[Performance, np.ndarray]:
+) -> tuple[Performance, float]:
     """イベント配列 (フレーム、piano_ar のイベントの形) を拍の刻みに丸めて、拍の時刻の演奏にする。
-    (演奏 (最初の音 = 0), 各小節の開始の拍の時刻 (同じ原点)) を返す"""
+    (演奏 (最初の音 = 0、measure_starts に各小節の開始), 原点 (丸めた拍の時刻での最初の音)) を返す"""
     q = tokenizer.quantize(events, grid)
     tpb = tokenizer.ticks_per_beat
     seconds = q.tick / tpb * BEAT_SECONDS
@@ -65,7 +75,39 @@ def on_beats(
     notes[:, :2] -= origin
     pedal = pedal.reshape(-1, 2)
     pedal[:, 0] -= origin
-    return Performance(notes, pedal, starts - origin), starts - origin
+    return Performance(notes, pedal, starts - origin), origin
+
+
+def mark_melody(performance: Performance, times: np.ndarray, pitches: np.ndarray, octave_free: bool) -> np.ndarray:
+    """拍の時刻の演奏の音のうち、メロディの音 (拍の時刻 times・音高 pitches) と同じ位置 (MELODY_TICKS 刻み以内) の音に
+    印を付ける。octave_free なら音名だけで比べ、同じ位置の候補のうち一番高い音にする"""
+    notes = performance.notes
+    marked = np.zeros(len(notes), dtype=bool)
+    if not len(notes) or not len(times):
+        return marked
+    tolerance = MELODY_TICKS / BeatTokenizer().ticks_per_beat * BEAT_SECONDS + 1e-6
+    order = np.argsort(notes[:, 0])
+    onsets = notes[order, 0]
+    for t, p in zip(times.tolist(), pitches.tolist()):
+        lo, hi = np.searchsorted(onsets, t - tolerance), np.searchsorted(onsets, t + tolerance, side="right")
+        candidates = order[lo:hi]
+        if octave_free:
+            candidates = [i for i in candidates if int(notes[i, 2]) % 12 == int(p) % 12]
+        else:
+            candidates = [i for i in candidates if int(notes[i, 2]) == int(p)]
+        if candidates:
+            marked[max(candidates, key=lambda i: (notes[i, 2], -abs(notes[i, 0] - t)))] = True
+    return marked
+
+
+def melody_from_annotation(performance: Performance, annotation: dict, grid: BeatGrid, origin: float) -> np.ndarray:
+    """原曲の SheetSage2-Refined のメロディ (秒) から、拍の時刻の演奏の音にメロディの印を付ける"""
+    melody = annotation.get("melody") or []
+    if not melody:
+        return np.zeros(len(performance.notes), dtype=bool)
+    frames = np.array([float(m["start"]) for m in melody]) * FRAMES_PER_SECOND
+    times = grid.beat_position(frames) * BEAT_SECONDS - origin
+    return mark_melody(performance, times, np.array([int(m["pitch"]) for m in melody]), octave_free=True)
 
 
 def performance_events(performance: Performance) -> np.ndarray:
@@ -120,11 +162,23 @@ def level_grid(beat_times: np.ndarray, beat_measures: np.ndarray, level: float) 
 class BeatSynthWindowDataset(SynthWindowDataset):
     """楽譜の窓と、それを描き出して拍の刻みに丸めた演奏 (拍の時刻) の組。窓の取り方は SynthWindowDataset と同じ"""
 
-    def __init__(self, cache: ScoreCache, *, level_probs: dict | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        cache: ScoreCache,
+        *,
+        level_probs: dict | None = None,
+        melody: bool = False,
+        drop_durations: float = 0.0,
+        **kwargs,
+    ) -> None:
         kwargs.setdefault("render_config", COVER_RENDER)
         super().__init__(cache, **kwargs)
         self.beat_tokenizer = BeatTokenizer()
         self.level_probs = LEVEL_PROBS if level_probs is None else level_probs
+        self.melody = melody
+        self.vocab = PerformanceVocab(melody=melody)
+        # 長さの列を消す窓の割合。検証は曲ごとに固定 (曲の番号の偶奇で、消す・消さないを半分ずつ)
+        self.drop_durations = drop_durations
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         song = int(self.songs[index])
@@ -174,12 +228,35 @@ class BeatSynthWindowDataset(SynthWindowDataset):
             if not self.train:
                 raise ValueError(f"拍の格子を作れない曲: {self.cache.ids[song]}")
             return self[random.randrange(len(self))]
-        on_grid, _ = on_beats(events, grid, measure_frames, self.beat_tokenizer)
+        on_grid, origin = on_beats(events, grid, measure_frames, self.beat_tokenizer)
+        if self.melody and (not self.train or random.random() >= MELODY_DROP_SONG):
+            on_grid.melody = self._score_melody(measures, performance, grid, origin, on_grid)
+        if self.train:
+            drop = random.random() < self.drop_durations
+        else:
+            drop = self.drop_durations > 0 and song % 2 == 0
         lengths = np.array([float(m.length) for m in measures])
         return make_item(
             self.tokenizer, self.vocab, bodies, lengths, on_grid, start=start, stop=stop, first=first,
             window_measures=W, max_rows=self.max_rows, train=self.train, noise=None, exact_starts=True,
+            drop_durations=drop,
         )  # fmt: skip
+
+    def _score_melody(self, measures, performance: Performance, grid: BeatGrid, origin: float, on_grid: Performance):
+        """楽譜の上の段の一番上の音を、拍の時刻の演奏の音に写してメロディの印にする"""
+        offsets = np.concatenate([[0.0], np.cumsum([float(m.length) for m in measures])])
+        positions, _ = beat_positions(measures, offsets)
+        if len(positions) < 2:
+            return np.zeros(len(on_grid.notes), dtype=bool)
+        top = [n for n in _score_notes(measures, offsets) if n.top and n.group.staff == 1]
+        if not top:
+            return np.zeros(len(on_grid.notes), dtype=bool)
+        seconds = np.interp([n.on for n in top], positions, performance.beat_times)
+        times = grid.beat_position(seconds * FRAMES_PER_SECOND) * BEAT_SECONDS - origin
+        marked = mark_melody(on_grid, times, np.array([n.pitch for n in top]), octave_free=False)
+        if self.train:
+            marked &= np.array([random.random() >= MELODY_DROP_NOTE for _ in range(len(marked))], dtype=bool)
+        return marked
 
 
 def song_pitch_spans(cache: ScoreCache) -> np.ndarray:
