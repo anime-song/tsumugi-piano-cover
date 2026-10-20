@@ -43,7 +43,7 @@ def main(argv=None) -> None:
         "--checkpoints-dir",
         type=_optional_dir,
         default=REPO_ROOT / "checkpoints",
-        help="学習のチェックポイント (*/best.pt) を探すフォルダ (空文字で探さない)",
+        help="学習のチェックポイント (**/best.pt) を探すフォルダ (空文字で探さない)",
     )
     parser.add_argument("--hub-repo", default=HF_REPO, help="Hugging Face の repository (空文字で使わない)")
     parser.add_argument("--device", default="auto", help="auto / cuda / cpu")

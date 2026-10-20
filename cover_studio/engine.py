@@ -2,7 +2,7 @@
 
 モデルの候補 (find_models):
   export     piano_cover.export の出力 (既定 pretrained/ の下)
-  checkpoint 学習のチェックポイント (既定 checkpoints/*/best.pt。隣に planner*.pt があれば差し替えた版も)
+  checkpoint 学習のチェックポイント (既定 checkpoints/**/best.pt。隣に planner*.pt があれば差し替えた版も)
   hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPO。初回にダウンロードする)
 """
 
@@ -75,7 +75,7 @@ def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_r
                 )
             )
     if checkpoints_dir is not None and checkpoints_dir.is_dir():
-        found = [p for p in checkpoints_dir.glob("*/best.pt") if _is_cover_checkpoint(p)]
+        found = [p for p in checkpoints_dir.rglob("best.pt") if _is_cover_checkpoint(p)]
         for path in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True):
             rel = path.relative_to(checkpoints_dir).as_posix()
             entries.append(ModelEntry(f"checkpoint:{rel}", rel, "checkpoint", str(path)))
@@ -192,9 +192,29 @@ class Engine:
         from piano_cover.generate import prepare_source
 
         path = project.source_path
-        key = (str(path), path.stat().st_mtime_ns, self._model_id)
+        annotation = project.dir / "sheetsage.json"
+        if not annotation.is_file() and hasattr(model.tokenizer, "ticks_per_beat"):
+            names = []
+            if project.audio_path is not None:
+                names.append(project.audio_path.stem)
+            original_name = (project.data.get("source") or {}).get("filename")
+            if original_name:
+                names.append(Path(original_name).stem)
+            for name in names:
+                candidate = REPO_ROOT / "data" / "sheetsage" / "original" / f"{name}.json"
+                if candidate.is_file():
+                    annotation = candidate
+                    break
+            if not annotation.is_file():
+                raise FileNotFoundError(
+                    f"SheetSage注釈がありません。{annotation} に拍・メロディのJSONを置いてください"
+                )
+        key = (str(path), path.stat().st_mtime_ns, self._model_id, str(annotation),
+               annotation.stat().st_mtime_ns if annotation.is_file() else None)
         if key not in self._sources:
-            self._sources[key] = prepare_source(path, model.tokenizer, model.config)
+            self._sources[key] = prepare_source(
+                path, model.tokenizer, model.config, annotation if annotation.is_file() else None
+            )
             while len(self._sources) > 8:
                 self._sources.popitem(last=False)
         self._sources.move_to_end(key)
@@ -234,7 +254,11 @@ class Engine:
             if keep:
                 # 指定した時刻を含まないパッチまで (生成は原曲の最初の音から始まるので lead を引く)
                 patches = project.take_patches(keep["take"])
-                count = int((keep["seconds"] * frame_rate - source.lead) // tokenizer.patch_frames)
+                if source.grid is not None:
+                    starts = source.grid.beats[source.grid.bar_starts]
+                    count = int(np.searchsorted(starts, keep["seconds"] * frame_rate, side="right") - 1)
+                else:
+                    count = int((keep["seconds"] * frame_rate - source.lead) // tokenizer.patch_frames)
                 prompt = patches[: max(0, min(count, len(patches)))] or None
 
             for take_id in take_ids:
@@ -243,8 +267,14 @@ class Engine:
             def on_patch(done: int, total: int) -> None:
                 if should_stop():
                     raise Cancelled()
-                seconds = tokenizer.config.patch_seconds
-                progress(done / total, f"{done * seconds:.0f}/{total * seconds:.0f}")  # 生成した秒数/全体の秒数
+                if source.grid is not None:
+                    starts = source.grid.beats[source.grid.bar_starts]
+                    elapsed = starts[min(done, len(starts) - 1)] / frame_rate
+                    duration = starts[min(total, len(starts) - 1)] / frame_rate
+                else:
+                    elapsed = done * tokenizer.config.patch_seconds
+                    duration = total * tokenizer.config.patch_seconds
+                progress(done / total, f"{elapsed:.0f}/{duration:.0f}")
 
             seed = first["seed"]
             torch.manual_seed(seed)
