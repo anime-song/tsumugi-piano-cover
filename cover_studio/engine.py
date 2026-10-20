@@ -130,11 +130,14 @@ class Engine:
         device: str = "auto",
         tsumugi: TsumugiSetup | None = None,
         sheetsage_model: str | None = None,
+        frames_pca: Path | None = None,
     ) -> None:
         self.models = models
         self.device_name = device
         self.tsumugi = tsumugi
         self.sheetsage_model = sheetsage_model  # None なら sheetsage2_refined の既定 (Hugging Face)
+        # 原曲の音声の特徴を使うモデル (frame_dims) の、特徴を作る PCA (piano_cover.audio_frames fit の出力)
+        self.frames_pca = frames_pca or REPO_ROOT / "data" / "audio_frames" / "original" / "pca.npz"
         self._model = None
         self._model_id: str | None = None
         self._sources: OrderedDict[tuple, object] = OrderedDict()
@@ -205,8 +208,13 @@ class Engine:
             self._model_id,
             annotation and (str(annotation), annotation.stat().st_mtime_ns),
         )
+        frames = self._frames(project, progress, log) if c.frame_dims else None
+        if frames is not None:
+            key += (str(frames), frames.stat().st_mtime_ns)
         if key not in self._sources:
-            self._sources[key] = prepare_source(path, model.tokenizer, model.config, annotation)
+            self._sources[key] = prepare_source(
+                path, model.tokenizer, model.config, annotation, np.load(frames)["frames"] if frames else None
+            )
             while len(self._sources) > 8:
                 self._sources.popitem(last=False)
         self._sources.move_to_end(key)
@@ -243,6 +251,43 @@ class Engine:
         tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
         tmp.replace(out)
         log(f"拍 {len(result['beats'])}・メロディ {len(result['melody'])} 音")
+        return out
+
+    def _frames(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """原曲の音声の特徴 (piano_cover.audio_frames) を作り、project/frames.npz に置く。
+        音声 (audio_sha1) と PCA が同じなら前回の結果を使う"""
+        import hashlib
+
+        out = project.dir / "frames.npz"
+        audio = project.audio_path
+        if not self.frames_pca.is_file():
+            raise FileNotFoundError(f"原曲の音声の特徴を作る PCA がありません: {self.frames_pca} (--frames-pca で指定)")
+        sha1 = project.data.get("audio_sha1")
+        pca_sha1 = hashlib.sha1(self.frames_pca.read_bytes()).hexdigest()
+        if out.is_file():
+            saved = np.load(out)
+            if str(saved["audio_sha1"]) == str(sha1) and str(saved["pca_sha1"]) == pca_sha1:
+                return out
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError("このモデルは原曲の音声の特徴を使います。音源のあるプロジェクトで生成してください")
+        import torch
+
+        from piano_cover.audio_frames import FrameExtractor, FrameProjector
+
+        progress(0.0, "beats")
+        log(f"原曲の音声の特徴を作っています: {audio.name}")
+        extractor = FrameExtractor(self.sheetsage_model, device=str(self.device))
+        try:
+            frames = FrameProjector(extractor, self.frames_pca)(audio)
+        finally:
+            del extractor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        tmp = out.with_suffix(".tmp.npz")
+        np.savez(tmp, frames=frames, audio_sha1=np.str_(sha1), pca_sha1=np.str_(pca_sha1))
+        tmp.replace(out)
+        log(f"特徴 {len(frames)} フレーム")
         return out
 
     # ------------------------------------------------------------ 生成

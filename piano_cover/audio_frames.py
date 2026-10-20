@@ -105,19 +105,30 @@ def fit(extractor: FrameExtractor, files: list[Path], out: Path, stride: int = 5
     print(f"[fit] {count} 行、{DIMS} 次元で分散の {explained:.1%}")
 
 
+class FrameProjector:
+    """fit で求めた PCA (pca.npz) で、音声から保存する形の特徴 [フレーム, DIMS] (float16) を作る"""
+
+    def __init__(self, extractor: FrameExtractor, pca_path: str | Path) -> None:
+        pca = np.load(pca_path)
+        self.extractor = extractor
+        self.mean = torch.from_numpy(pca["mean"]).to(extractor.device)
+        self.components = torch.from_numpy(pca["components"]).to(extractor.device)
+
+    def __call__(self, audio: str | Path) -> np.ndarray:
+        x = (self.extractor.features(self.extractor.load(Path(audio))) - self.mean) @ self.components
+        return x.half().cpu().numpy()
+
+
 def extract(extractor: FrameExtractor, files: list[Path], root: Path, out: Path) -> None:
-    pca = np.load(out / "pca.npz")
-    mean = torch.from_numpy(pca["mean"]).to(extractor.device)
-    components = torch.from_numpy(pca["components"]).to(extractor.device)
+    project = FrameProjector(extractor, out / "pca.npz")
     started, done = time.time(), 0
     for i, path in enumerate(files):
         target = out / path.relative_to(root).with_suffix(".npy")
         if target.exists():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        x = (extractor.features(extractor.load(path)) - mean) @ components
         tmp = target.with_suffix(".tmp.npy")
-        np.save(tmp, x.half().cpu().numpy())
+        np.save(tmp, project(path))
         tmp.replace(target)
         done += 1
         if done % 20 == 0:

@@ -57,6 +57,12 @@ def main(argv=None) -> None:
         default=None,
         help="拍とメロディを予測する SheetSage2-Refined (Hugging Face の repository か手元のフォルダ。既定 anime-song/SheetSage2-Refined)",
     )
+    parser.add_argument(
+        "--frames-pca",
+        type=Path,
+        default=None,
+        help="原曲の音声の特徴を使うモデルの、特徴を作る PCA (既定 data/audio_frames/original/pca.npz)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--no-browser", action="store_true")
@@ -80,7 +86,7 @@ def main(argv=None) -> None:
     if not args.no_web_download:
         ensure_web()  # 無ければ GitHub の Release からビルド済みのものを取ってくる (Node.js が要らない)
 
-    app = create_app(args.root, Engine(models, args.device, tsumugi, args.sheetsage_model))
+    app = create_app(args.root, Engine(models, args.device, tsumugi, args.sheetsage_model, args.frames_pca))
     if not args.no_browser:
         threading.Timer(1.5, webbrowser.open, [f"http://{args.host}:{args.port}/"]).start()
     uvicorn.run(app, host=args.host, port=args.port)
