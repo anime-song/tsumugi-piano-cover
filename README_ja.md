@@ -2,11 +2,19 @@
 
 **ポピュラー楽曲の音源からピアノカバーMIDIを生成するリポジトリです。** 原曲音源を [tsumugi](https://github.com/anime-song/tsumugi) で複数楽器のMIDIに自動採譜し、約3,000時間のピアノ演奏データで事前学習した自己回帰モデルによってピアノアレンジを生成します。
 
-[English README](README.md) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) | [![Model on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm.svg)](https://huggingface.co/anime-song/tsumugi-piano-cover) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_ja.ipynb)
+[English README](README.md) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) | [![Model on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm.svg)](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_ja.ipynb)
 
 - 🎹 **原曲と完全同期**: 原曲音源のタイムラインに合わせてカバーが生成され、重ねて同時再生可能
 - 🎚️ **柔軟な編曲コントロール**: 原曲再現度、強弱ダイナミクス、オブリガート（合いの手）、音域、演奏者スタイルを指定可能
 - 🔁 **Cover Studio**: パラメータ調整、テイク比較、任意位置からの部分再生成（インペインティング）に対応したWeb UI
+
+## 📢 更新情報
+
+- **2026-10-20 — V2 を公開しました**（[anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2)）
+  - **リズムの崩れが減りました**: [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) で推定した拍の上で、小節ごとに生成するようにしました。
+  - **原曲の再現度が上がりました**: SheetSage2-Refined のメロディと原曲音源の特徴もモデルに渡すことで、メロディがよく再現されるようになりました。
+  - Cover Studio と Colab ノートブックは V2 が既定です。V1 も引き続き選択でき、MIDI ファイルだけでも生成できます（V2 は原曲の音源が必要です）。
+  - 以下の Python API・アーキテクチャ・学習の説明は V1 のものです。V2 の使い方と詳細は [V2 のモデルカード](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) を参照してください。
 
 ---
 
@@ -139,10 +147,11 @@ python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --second
 ## ライセンス
 
 - ソースコード: [MIT License](LICENSE)
-- モデル重み（[Hugging Face](https://huggingface.co/anime-song/tsumugi-piano-cover)）: [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.ja)（非商用利用のみ）
+- モデル重み（[V2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) / [V1](https://huggingface.co/anime-song/tsumugi-piano-cover)）: [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.ja)（非商用利用のみ）。V2 が拍とメロディの推定に使う [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) も非商用です
 
 ## 謝辞
 
 - [tsumugi](https://github.com/anime-song/tsumugi) — 原曲音源のマルチトラック自動採譜
+- [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) — 拍とメロディの推定（V2）
 - [smplr](https://github.com/danigb/smplr) — Cover Studio のブラウザ内ピアノ再生音源
 - [audio2chordpro](https://github.com/anime-song/audio2chordpro) — Cover Studio の設計ベース

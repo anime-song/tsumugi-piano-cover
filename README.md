@@ -2,11 +2,19 @@
 
 **Generate piano covers of pop songs as MIDI.** The system first transcribes an audio track into multi-instrument MIDI using [tsumugi](https://github.com/anime-song/tsumugi), then generates an arrangement using an autoregressive piano model pretrained on ~3,000 hours of piano performances.
 
-[日本語 README](README_ja.md) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) | [![Model on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm.svg)](https://huggingface.co/anime-song/tsumugi-piano-cover) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_en.ipynb)
+[日本語 README](README_ja.md) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) | [![Model on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm.svg)](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi-piano-cover/blob/main/notebooks/cover_studio_colab_en.ipynb)
 
 - 🎹 **Aligned to Original Timeline**: Play back covers synchronously with the original audio track.
 - 🎚️ **Controllable Arrangements**: Fine-tune fidelity to the source, dynamics, fills, pitch range, and performer styles.
 - 🔁 **Cover Studio**: Interactive web UI for iterative generation, comparing takes, and inpainting/regenerating from any point.
+
+## 📢 Updates
+
+- **2026-10-20 — V2 released** ([anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2))
+  - **Fewer rhythm breakdowns**: covers are now generated bar by bar on the beat grid estimated by [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined).
+  - **Closer to the original**: the melody is reproduced more faithfully, because the model also reads the SheetSage2-Refined melody and audio features of the original recording.
+  - Cover Studio and the Colab notebooks use V2 by default. V1 can still be selected, and works with a MIDI file alone (V2 needs the original audio).
+  - The API, architecture, and training sections below describe V1. See the [V2 model card](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) for V2 usage and details.
 
 ---
 
@@ -139,10 +147,11 @@ To export custom checkpoints to the release format: `python -m piano_cover.expor
 ## License
 
 - Code: [MIT License](LICENSE)
-- Model Weights ([Hugging Face](https://huggingface.co/anime-song/tsumugi-piano-cover)): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (Non-Commercial Use Only)
+- Model Weights ([V2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) / [V1](https://huggingface.co/anime-song/tsumugi-piano-cover)): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (Non-Commercial Use Only). [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined), which V2 uses for beats and melody, is also non-commercial.
 
 ## Acknowledgements
 
 - [tsumugi](https://github.com/anime-song/tsumugi) — Multi-instrument automatic music transcription
+- [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) — Beat and melody estimation (V2)
 - [smplr](https://github.com/danigb/smplr) — In-browser piano sample player
 - [audio2chordpro](https://github.com/anime-song/audio2chordpro) — Architecture reference for Cover Studio
