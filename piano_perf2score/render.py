@@ -773,8 +773,11 @@ def _resolve_overlaps(notes: np.ndarray) -> np.ndarray:
 
 
 # V2 のカバー -> 楽譜の学習で使う描き出し。実際のカバーの分布 (local/probe_score_input_gap.py) に合わせて、
-# 早く離す音を足し、強さの幅を広げて平均を上げ、ペダルを踏む曲を増やす
+# 早く離す音を足し、強さの幅を広げて平均を上げ、ペダルを踏む曲を増やす。カバーは原曲に合わせて弾くのでテンポは
+# ほぼ一定 (8 拍平均のテンポの幅 p90/p10 はカバー 1.045、既定の描き出しは 1.159) なので、揺れと曲の最後の rit. を減らす
 COVER_RENDER = RenderConfig(
+    tempo_wander=0.01,
+    final_rit_prob=0.3,
     release_short_prob=(0.4, 0.8),
     velocity_spread=(1.0, 1.8),
     velocity_shift=(0.0, 18.0),
