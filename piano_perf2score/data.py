@@ -119,7 +119,7 @@ def patch_rows(
     patch = onset // PATCH_FRAMES
     counts = np.bincount(patch, minlength=S)
     R = max(1, min(max_rows, int(counts.max()) if len(counts) else 1))
-    out_features = np.zeros((S, R, features.shape[1] if len(features) else 4), dtype=np.int64)
+    out_features = np.zeros((S, R, features.shape[1] if features.ndim == 2 else 4), dtype=np.int64)
     out_onset = np.zeros((S, R), dtype=np.int64)
     valid = np.zeros((S, R), dtype=bool)
     starts = np.concatenate([[0], np.cumsum(counts)])
