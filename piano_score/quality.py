@@ -15,16 +15,19 @@
                        出し、その音が休符の直前のこちらの段の単音から 1 オクターブ以内 (線がつながっている) で、同じ拍の
                        中でもう片方の段にも休符がある (分散和音の 4 つ目だけを右手の段に書くなど。音高で段を機械的に
                        分けた取り込みや初心者の書き方)。低音と後打ちの和音を分け合う伴奏 (和音か、離れた音) は数えない
-    ledger             ト音記号の段で加線 4 本を超える低い音・ヘ音記号の段で加線 4 本を超える高い音
-    odd_measure        拍子と長さが合わない小節 (曲の最初と最後の小節は除く。弱起と終わりの短い小節は正しい書き方)
+    ledger             加線が 6 本以上の音 (音部記号・オクターブ記号 8va などを考えた見た目の位置で数える)。ある小節から先が
+                       オクターブ違う・音部記号を間違えた楽譜で多い。高い音域をヘ音記号のまま書く程度 (加線 4〜5 本) は数えない
+    odd_measure        拍子より長い小節 (和音の印が落ちて音が順に並んだ壊れた MusicXML など)。短い小節は、弱起や繰り返しの
+                       区切りで 1 小節を 2 つに分けた正しい書き方が多いので数えない
 曲ごとの印 (0 / 1):
     tab                TAB 譜 (TAB の音部記号かフレットの番号がある)
     no_time            拍子記号がどこにもない
 
-low_quality が外す基準。ユーザーが良い・微妙・悪いを付けた見本 (2026-10-21、30 曲 + 確認済みの悪い 3 曲) に合わせた:
-悪い楽譜は、段に合わない音域の音 (ある小節から先がオクターブ違う・音部記号の誤り) と TAB 譜がいちばん目立ち、
-拍をまたぐ連符・タイの鎖・旋律の線の段の分け方がそれに続く。細切れの休符と拍をまたぐ音価は、良い楽譜にも多いので使わない。
-拍子と合わない小節が多い楽譜 (拍子記号がない楽譜を含む) は、見た目が良くても小節の拍子を学べないので外す。
+low_quality が外す基準。ユーザーが良い・微妙・悪いを付けた見本 (2026-10-21、outputs/score_label の 1〜50 番 + 確認済みの
+悪い 3 曲) に合わせた: 悪い楽譜は、加線の多い音 (ある小節から先がオクターブ違う・音部記号の誤り) と TAB 譜がいちばん目立ち、
+拍をまたぐ連符・タイの鎖・旋律の線の段の分け方がそれに続く。細切れの休符と拍をまたぐ音価は、良い楽譜にも多いので使わない
+(休符は楽譜のトークンに入れず書き出しで付け直すので、元の楽譜の休符の書き方は学習に関係しない)。
+拍子より長い小節のある楽譜と拍子記号のない楽譜は、見た目が良くても小節の拍子を学べないので外す。
 """
 
 from __future__ import annotations
@@ -38,16 +41,20 @@ from fractions import Fraction
 from pathlib import Path
 
 STEP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+DIATONIC = "CDEFGAB"
+# 段のいちばん上の線といちばん下の線の位置 (全音階の番号 = オクターブ x 7 + 音名の番号)。G: F5 / E4、F: A3 / G2、C (アルト): G4 / F3
+STAFF_LINES = {"G": (5 * 7 + 3, 4 * 7 + 2), "F": (3 * 7 + 5, 2 * 7 + 4), "C": (4 * 7 + 4, 3 * 7 + 3)}
+LEDGER_LINES = 6
 # 1 つの音符で書ける長さ (4 分音符単位): 全音符〜64 分音符と、その付点・複付点
 NOTE_VALUES = {Fraction(4, 2**k) * m for k in range(7) for m in (Fraction(1), Fraction(3, 2), Fraction(7, 4))}
 RULES = ("tuplet_misaligned", "redundant_tie", "rest_split", "beat_cross", "staff_split", "ledger")
 # low_quality で外すしきい値 (この値を超えたら外す)
 LIMITS = {
-    "ledger": 0.04,
+    "ledger": 0.01,
     "tuplet_misaligned": 0.01,
     "redundant_tie": 0.05,
     "staff_split": 0.02,
-    "odd_measure": 0.2,
+    "odd_measure": 0.02,  # 1 小節だけ長いような楽譜は残す (学習の窓で、その小節を含む窓を外す)
 }
 EPS = Fraction(1, 256)
 
@@ -67,6 +74,8 @@ def lint(path: str | Path) -> dict:
         divisions = 1
         beats, beat_type = 4, 4
         clefs: dict[str, str] = {}
+        clef_octaves: dict[str, int] = {}  # 段 -> 音部記号のオクターブの変更 (ト音記号の下の 8 など)
+        octave_shift: dict[str, int] = {}  # 段 -> 8va などで見た目を実音から動かすオクターブ数
         measures = part.findall("measure")
         measures_total += len(measures)
         for mi, measure in enumerate(measures):
@@ -87,6 +96,14 @@ def lint(path: str | Path) -> dict:
                         beats, beat_type = int(time.findtext("beats")), int(time.findtext("beat-type"))
                     for clef in el.findall("clef"):
                         clefs[clef.get("number", "1")] = clef.findtext("sign") or "G"
+                        clef_octaves[clef.get("number", "1")] = int(clef.findtext("clef-octave-change") or 0)
+                if el.tag == "direction":
+                    for shift in el.iter("octave-shift"):
+                        octaves = {8: 1, 15: 2, 22: 3}.get(int(shift.get("size", "8")), 1)
+                        kind = shift.get("type")
+                        # type="down" は 8va (実音より下に書いて見せる)。音高は実音で入っている
+                        offset = -octaves if kind == "down" else octaves if kind == "up" else 0
+                        octave_shift[el.findtext("staff") or "1"] = offset
                 compound = beat_type in (8, 16) and beats % 3 == 0 and beats > 3
                 beat = Fraction(4, beat_type) * (3 if compound else 1)
                 nominal = Fraction(4 * beats, beat_type)
@@ -102,10 +119,12 @@ def lint(path: str | Path) -> dict:
                     at = pos - duration if chord else pos
                     if not chord:
                         pos += duration
-                    end_pos = max(end_pos, pos)
                     staff = el.findtext("staff") or "1"
                     voice = (staff, el.findtext("voice") or "1")
                     rest = el.find("rest") is not None
+                    # 小節全体の休符を全休符の長さで書いたもの (6/8 の小節に 4 拍分) は、表示は正しいので長さに数えない
+                    if not (rest and at == 0 and duration >= nominal):
+                        end_pos = max(end_pos, pos)
                     modification = el.find("time-modification")
                     in_tuplet = modification is not None
                     if in_tuplet and not chord:
@@ -126,8 +145,16 @@ def lint(path: str | Path) -> dict:
                         alter = round(float(el.findtext("pitch/alter") or 0))
                         pitch = 12 * (int(el.findtext("pitch/octave") or 4) + 1) + STEP[step] + alter
                         sign = clefs.get(staff, "G" if staff == "1" else "F")
-                        if (sign == "G" and pitch < 53) or (sign == "F" and pitch > 69):
-                            counts["ledger"] += 1
+                        if sign in STAFF_LINES:
+                            octave = (
+                                int(el.findtext("pitch/octave") or 4)
+                                + octave_shift.get(staff, 0)
+                                - clef_octaves.get(staff, 0)
+                            )
+                            position = octave * 7 + DIATONIC.index(step)
+                            top, bottom = STAFF_LINES[sign]
+                            if max(position - top, bottom - position) // 2 >= LEDGER_LINES:
+                                counts["ledger"] += 1
                         staff_onsets[staff].setdefault(at, []).append(pitch)
                         if not chord:
                             notes_total += 1
@@ -137,7 +164,7 @@ def lint(path: str | Path) -> dict:
                         staff_rests[staff].append((at, duration))
                     tie_start = any(t.get("type") == "start" for t in el.findall("tie"))
                     voice_items[voice].append((at, duration, rest, tie_start, pitch, in_tuplet))
-            if 0 < mi < len(measures) - 1 and end_pos != nominal:
+            if end_pos > nominal:
                 counts["odd_measure"] += 1
             for items in voice_items.values():
                 items.sort(key=lambda x: x[0])
