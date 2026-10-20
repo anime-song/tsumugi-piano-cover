@@ -53,6 +53,7 @@ from .source import (
 
 # 原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の出力) の置き場所
 SHEETSAGE_DIR = Path("data/sheetsage/original")
+FRAMES_DIR = Path("data/audio_frames/original")
 
 
 @dataclass
@@ -104,10 +105,16 @@ class Cover:
 
 
 def prepare_source(
-    path: str | Path, tokenizer: PianoTokenizer, cover_config: CoverConfig, sheetsage: str | Path | None = None
+    path: str | Path,
+    tokenizer: PianoTokenizer,
+    cover_config: CoverConfig,
+    sheetsage: str | Path | None = None,
+    frames: str | Path | np.ndarray | None = None,
 ) -> PreparedSource:
     """sheetsage は原曲の音声の SheetSage2-Refined の注釈 (piano_ar.sheetsage の JSON)。SheetSage で学習したモデル
-    (cover_config.sheetsage_beats / sheetsage_melody) では要る。省略すると data/sheetsage/original/<原曲>.json を探す"""
+    (cover_config.sheetsage_beats / sheetsage_melody) では要る。省略すると data/sheetsage/original/<原曲>.json を探す。
+    frames は原曲の音声の特徴 (piano_cover.audio_frames の .npy か配列)。特徴で学習したモデル (cover_config.frame_dims)
+    では要る。省略すると data/audio_frames/original/<原曲>.npy を探す"""
     rows, end_frame = load_source(path, tokenizer.config.frame_rate)
     beat_tokens = isinstance(tokenizer, BeatTokenizer)
     if cover_config.sheetsage_beats or cover_config.sheetsage_melody or beat_tokens:
@@ -125,8 +132,20 @@ def prepare_source(
             melody=cover_config.sheetsage_melody,
         )
         rows = rows[rows[:, ROW_ONSET] < end_frame]
+    if cover_config.frame_dims:
+        if not beat_tokens:
+            raise ValueError("原曲の音声の特徴は拍のトークンのモデルでだけ使える")
+        if not isinstance(frames, np.ndarray):
+            frames_path = Path(frames) if frames else FRAMES_DIR / f"{Path(path).stem}.npy"
+            if not frames_path.exists():
+                raise FileNotFoundError(
+                    f"{frames_path} がありません。原曲の音声に python -m piano_cover.audio_frames extract をかけて作ってください"
+                )
+            frames = np.load(frames_path)
+    else:
+        frames = None
     if beat_tokens:
-        return _prepare_beats(rows, end_frame, annotation, tokenizer, cover_config)
+        return _prepare_beats(rows, end_frame, annotation, tokenizer, cover_config, frames)
     rows, lead = trim_lead(rows)
     features = source_features(
         rows, end_frame - lead, tokenizer, SourceVocab(tokenizer.config), cover_config.max_source_rows
@@ -135,7 +154,12 @@ def prepare_source(
 
 
 def _prepare_beats(
-    rows: np.ndarray, end_frame: int, annotation: dict, tokenizer: BeatTokenizer, cover_config: CoverConfig
+    rows: np.ndarray,
+    end_frame: int,
+    annotation: dict,
+    tokenizer: BeatTokenizer,
+    cover_config: CoverConfig,
+    frames: np.ndarray | None = None,
 ) -> PreparedSource:
     """拍のトークンのモデルの原曲: 原曲の拍で小節ごとのパッチにし、原曲の最初の音を含む小節から生成する
     (それより前は無音か拍だけなので、学習で見た曲の始まりと合わない。時刻のトークンの trim_lead と同じ理由)"""
@@ -145,13 +169,19 @@ def _prepare_beats(
     )
     if grid is None:
         raise ValueError("原曲の拍が少なすぎます")
-    return prepare_beats_source(rows, end_frame, grid, tokenizer, cover_config)
+    return prepare_beats_source(rows, end_frame, grid, tokenizer, cover_config, frames)
 
 
 def prepare_beats_source(
-    rows: np.ndarray, end_frame: int, grid: BeatGrid, tokenizer: BeatTokenizer, cover_config: CoverConfig
+    rows: np.ndarray,
+    end_frame: int,
+    grid: BeatGrid,
+    tokenizer: BeatTokenizer,
+    cover_config: CoverConfig,
+    frames: np.ndarray | None = None,
 ) -> PreparedSource:
-    """原曲の行と拍 (grid) から、拍のトークンのモデルに渡す形を作る (学習中の生成評価からも使う)"""
+    """原曲の行と拍 (grid) から、拍のトークンのモデルに渡す形を作る (学習中の生成評価からも使う)。
+    frames は原曲の音声の特徴 (25 Hz、音声の頭から)"""
     fr = tokenizer.config.frame_rate
     notes = rows[rows[:, ROW_TYPE] == TYPE_NOTE]
     first = float(notes[:, ROW_ONSET].min()) if len(notes) else 0.0
@@ -159,7 +189,7 @@ def prepare_beats_source(
     grid = BeatGrid(grid.beats, grid.bar_starts[max(first_bar, 0) :])
     features = source_features(
         rows, end_frame, PianoTokenizer(), SourceVocab(tokenizer.config), cover_config.max_source_rows,
-        grid=grid, ticks_per_beat=tokenizer.ticks_per_beat,
+        grid=grid, ticks_per_beat=tokenizer.ticks_per_beat, frames=frames, max_frame_rows=cover_config.max_frame_rows,
     )  # fmt: skip
     S = len(features["features"])
     bar_beats = grid.bar_beats[:S]

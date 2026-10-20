@@ -113,6 +113,12 @@ def build_args() -> argparse.Namespace:
         "--melody-dropout", type=float, default=0.2, help="tsumugi と SheetSage のメロディをそれぞれ外す確率"
     )
     parser.add_argument(
+        "--frame-dropout",
+        type=float,
+        default=0.3,
+        help="原曲の音声の特徴 (--frame-dims) を外す確率。外した窓だけ移調する (音声は移調できないので)",
+    )
+    parser.add_argument(
         "--drift-prob", type=float, default=0.5, help="窓の前半の時刻をずらして後半で原曲に戻らせる確率 (0 で使わない)"
     )
     parser.add_argument(
@@ -341,7 +347,8 @@ def sample_evaluation_beats(
         rows = cache.source_rows(source)
         end = int(cache.source_end_frames[source])
         grid = cache.source_grid(source, end, tokenizer.config.max_bar_beats)
-        prepared = prepare_beats_source(rows, end, grid, tokenizer, model.config)
+        frames = cache.source_frames(source) if model.config.frame_dims else None
+        prepared = prepare_beats_source(rows, end, grid, tokenizer, model.config, frames)
         params = CoverParams(
             channel=int(cache.channels[cover]), temperature=args.sample_temperature, top_p=args.sample_top_p,
             source_cfg=args.sample_source_cfg, dynamics=1.0, arrangement=False, seconds=args.sample_seconds,
@@ -449,6 +456,10 @@ def main() -> None:
         sheetsage_beats=bool(sheetsage.get("beats", False)),
         sheetsage_melody=bool(sheetsage.get("melody", False)),
     )
+    if cover_config.frame_dims and not (args.beat_tokens and cache.has_frames):
+        raise SystemExit(
+            "--frame-dims には拍のトークンと、原曲の音声の特徴のあるキャッシュ (piano_cover.prepare_frames) が要ります"
+        )
     decoder_from = None
     if args.decoder_from:
         if not args.init_cover:
@@ -529,6 +540,7 @@ def main() -> None:
             source_dropout=args.source_dropout,
             structure_dropout=args.structure_dropout,
             melody_dropout=args.melody_dropout,
+            frame_dropout=args.frame_dropout,
             pretraining=pretraining,
             sync_mask=not args.no_sync_mask,
             dynamics_dropout=args.dynamics_dropout,

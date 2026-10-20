@@ -50,7 +50,8 @@ DYNAMICS_MIN_NOTES = 3
 
 
 class BeatCoverCache(CoverCache):
-    """prepare_beats が作ったキャッシュ (CoverCache に、カバーと原曲の拍を足したもの)"""
+    """prepare_beats が作ったキャッシュ (CoverCache に、カバーと原曲の拍を足したもの)。
+    piano_cover.prepare_frames の frames.npy / frames_index.npz があれば、原曲の音声の特徴も読める (source_frames)"""
 
     def __init__(self, cache_dir: str | Path) -> None:
         super().__init__(cache_dir)
@@ -64,6 +65,28 @@ class BeatCoverCache(CoverCache):
         self.source_beat_offsets = source["offsets"]
         self.source_beats = source["beats"]
         self.source_down = source["downbeat"]
+        self.has_frames = (self.cache_dir / "frames_index.npz").exists()
+        if self.has_frames:
+            index = np.load(self.cache_dir / "frames_index.npz")
+            self.frame_offsets = index["offsets"]
+            self.frame_hz = float(index["frame_rate"])
+        self._frames = None  # DataLoader の各ワーカーで遅延して mmap で開く
+
+    def __getstate__(self) -> dict:
+        state = super().__getstate__()
+        state["_frames"] = None
+        return state
+
+    def source_frames(self, source: int) -> np.ndarray | None:
+        """原曲の音声の特徴 [フレーム, D] (float16、frame_hz、0 番目は音声の頭)。ない原曲は None"""
+        if not self.has_frames:
+            return None
+        lo, hi = self.frame_offsets[source], self.frame_offsets[source + 1]
+        if hi <= lo:
+            return None
+        if self._frames is None:
+            self._frames = np.load(self.cache_dir / "frames.npy", mmap_mode="r")
+        return np.asarray(self._frames[lo:hi])
 
     def has_beats(self, cover: int) -> bool:
         source = int(self.source_index[cover])
@@ -125,6 +148,7 @@ class BeatCoverDataset(Dataset):
         source_dropout: float = 0.1,
         structure_dropout: float = 0.2,
         melody_dropout: float = 0.0,
+        frame_dropout: float = 0.0,
         pretraining=None,
         memory_bars: int = 0,
         val_start_bar: int = 0,
@@ -148,6 +172,10 @@ class BeatCoverDataset(Dataset):
         self.source_dropout = source_dropout
         self.structure_dropout = structure_dropout if self.train else 0.0
         self.melody_dropout = melody_dropout if self.train else 0.0
+        # 原曲の音声の特徴を使うか (cover_config.frame_dims) と、学習で外す確率。音声は移調できないので、
+        # 特徴を使う窓は移調せず、外した窓だけ移調する
+        self.use_frames = bool(cover_config.frame_dims) and cache.has_frames
+        self.frame_dropout = frame_dropout if self.train else 0.0
         self.dynamics_bins = dynamics_bins
         self.dynamics_dropout = dynamics_dropout if self.train else 0.0
         self.arrangement = arrangement and dynamics_bins > 0
@@ -188,10 +216,11 @@ class BeatCoverDataset(Dataset):
         rows = cache.source_rows(source)
         source_end = int(cache.source_end_frames[source])
 
+        frames = cache.source_frames(source) if self.use_frames and random.random() >= self.frame_dropout else None
         tempo_rate = float(fr)
         if self.augment is not None:
             a = self.augment
-            if a.transpose > 0:
+            if a.transpose > 0 and frames is None:
                 shift = random.randint(-a.transpose, a.transpose)
                 events = transpose_events(events, shift, cache.tokenizer_config)
                 rows = transpose_rows(rows, shift)
@@ -273,7 +302,9 @@ class BeatCoverDataset(Dataset):
                 rows = rows[~drop]
             features = source_features(
                 rows, source_end, self.source_tokenizer, self.vocab, self.cover_config.max_source_rows,
-                grid=source_grid, ticks_per_beat=tpb,
+                grid=source_grid, ticks_per_beat=tpb, frames=frames,
+                frame_hz=cache.frame_hz if frames is not None else 25.0,
+                max_frame_rows=self.cover_config.max_frame_rows,
             )  # fmt: skip
             item_source = source_tensors(features)
             item_source["src_patch_start"] = torch.from_numpy(features["patch_start"])

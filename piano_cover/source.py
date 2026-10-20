@@ -334,6 +334,8 @@ class SourceVocab:
             "mode": 2,
             # 以前のチェックポイントの表 (source_vocab_size) はここまで。SheetSage のメロディ (歌 / 楽器) は後ろに足す
             "sheetsage": 2,
+            # 原曲の音声の特徴の行 (piano_cover.audio_frames)。中身は CoverModel.frame_projection で足す
+            "frame": 1,
         }
         self.offset: dict[str, int] = {}
         next_index = 1
@@ -351,17 +353,26 @@ def source_features(
     max_rows: int,
     grid=None,
     ticks_per_beat: int = 12,
+    frames: np.ndarray | None = None,
+    frame_hz: float = 25.0,
+    max_frame_rows: int = 128,
 ) -> dict[str, np.ndarray]:
     """行をパッチごとに並べる。
 
     grid (piano_ar.beat_tokenizer.BeatGrid、原曲の拍) を渡すと、1 パッチ = 原曲の 1 小節にし、行の位置を原曲の拍の
     刻み (拍の番号 x ticks_per_beat) にする (拍のトークンのカバーモデル)。音の長さとベロシティの番号はフレームのまま。
 
+    frames [T, D] (原曲の音声の特徴、frame_hz、0 番目は音声の頭。piano_cover.audio_frames) を渡すと、各パッチの行の後ろに
+    特徴の行 (種類は SourceVocab の frame) を足す。行数の上限 max_rows とは別に、1 パッチ max_frame_rows 行まで
+    (多ければ等間隔に間引く)。そのときは frame_index と frames も返す。
+
     返り値 (S = 曲のパッチ数, R = 1 パッチの行数の最大):
         features [S, R, 5] int16  埋め込み表の番号 (種類, 属性 4 つ)。0 はパディング
         onset    [S, R] int32     行の絶対フレーム (grid があれば絶対の刻み。Local の cross-attention の位置に使う)
         valid    [S, R] bool
         patch_start [S] int64     パッチの始まり (フレーム、grid があれば刻み)
+        frame_index [S, R] int32  特徴の行が frames の何番目か (特徴の行でなければ -1。frames を渡したときだけ)
+        frames      [Nf, D]       特徴の行の中身 (float16)
     """
     rows = rows.astype(np.int64)
     if grid is None:
@@ -429,10 +440,40 @@ def source_features(
     feature[key, 1] = o["tonic"] + a[key]
     feature[key, 2] = o["mode"] + b[key]
 
+    position = rows[:, ROW_ONSET]
+    frame_rows = None
+    if frames is not None:
+        # 特徴の行: 各フレームの中央の時刻を、行と同じ位置 (フレーム、grid があれば刻み) にする
+        times = (np.arange(len(frames)) + 0.5) * tokenizer.config.frame_rate / frame_hz
+        frame_pos = np.round(grid.beat_position(times) * ticks_per_beat) if grid is not None else np.round(times)
+        frame_ids = np.flatnonzero((frame_pos >= starts[0]) & (frame_pos < end))
+        frame_pos = frame_pos[frame_ids].astype(np.int64)
+        frame_patch = patch_of(frame_pos)
+        frame_rank = np.arange(len(frame_patch)) - np.searchsorted(frame_patch, np.arange(num_patches))[frame_patch]
+        count = np.bincount(frame_patch, minlength=num_patches)[frame_patch]
+        # 多いパッチは等間隔に max_frame_rows 個だけ残す
+        slot = frame_rank * max_frame_rows // np.maximum(count, 1)
+        keep = (count <= max_frame_rows) | (frame_rank == 0) | (slot != (frame_rank - 1) * max_frame_rows // count)
+        frame_ids, frame_pos, frame_patch = frame_ids[keep], frame_pos[keep], frame_patch[keep]
+        frame_rank = np.arange(len(frame_patch)) - np.searchsorted(frame_patch, np.arange(num_patches))[frame_patch]
+        frame_rank = frame_rank + np.bincount(patch, minlength=num_patches)[frame_patch]  # 音などの行の後ろ
+        width = max(width, int(frame_rank.max(initial=-1)) + 1)
+        frame_rows = (frame_patch, frame_rank, frame_pos)
+
     features = np.zeros((num_patches, width, 5), dtype=np.int16)
     onset = np.zeros((num_patches, width), dtype=np.int32)
     valid = np.zeros((num_patches, width), dtype=bool)
     features[patch, rank] = feature
-    onset[patch, rank] = rows[:, ROW_ONSET]
+    onset[patch, rank] = position
     valid[patch, rank] = True
-    return {"features": features, "onset": onset, "valid": valid, "patch_start": starts.astype(np.int64)}
+    out = {"features": features, "onset": onset, "valid": valid, "patch_start": starts.astype(np.int64)}
+    if frame_rows is not None:
+        frame_patch, frame_rank, frame_pos = frame_rows
+        frame_index = np.full((num_patches, width), -1, dtype=np.int32)
+        features[frame_patch, frame_rank, 0] = o["frame"]
+        onset[frame_patch, frame_rank] = frame_pos
+        valid[frame_patch, frame_rank] = True
+        frame_index[frame_patch, frame_rank] = np.arange(len(frame_ids))
+        out["frame_index"] = frame_index
+        out["frames"] = np.asarray(frames[frame_ids], dtype=np.float16)
+    return out

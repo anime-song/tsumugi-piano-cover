@@ -5,6 +5,7 @@
     Global: 数ブロックごとに、対応する時刻 ± global_cross_window パッチの原曲のメモリへ cross-attention
     Local : 数ブロックごとに、対応するパッチ ± local_cross_radius パッチの原曲の各行へ cross-attention
 
+    frame_dims > 0 なら、原曲の音声の特徴 (piano_cover.audio_frames) の行も原曲の行に混ぜる (中身は frame_projection で足す)
     onset_head_dim > 0 なら OnsetHead: Local の TIME の予測に、候補の各時刻の近くにある原曲の onset を直接足す
     planner_dim > 0 なら Planner: SongEncoder の出力から、パッチごとの強弱と音の多さの曲線を予測する (生成でデコーダの条件にする)。
     デコーダの条件の列が 2 より多ければ (ModelConfig.dynamics_columns)、後ろの列は編曲の性質 (piano_cover.arrangement) で、
@@ -212,6 +213,7 @@ class CoverModel(nn.Module):
         K = cover_config.source_latents
         self.source_embedding = nn.Embedding(source_vocab_size, dim, padding_idx=0)
         self.source_onset = nn.Embedding(tokenizer.patch_frames, dim)
+        self.frame_projection = nn.Linear(cover_config.frame_dims, dim) if cover_config.frame_dims else None
         self.latent_queries = nn.Parameter(torch.randn(K, dim) * 0.02)
         self.latent_slot = nn.Embedding(K, dim)
         self.patch_encoder = Transformer(source_config, cover_config.source_patch_layers, causal=False)
@@ -246,6 +248,8 @@ class CoverModel(nn.Module):
         for module in (self.source_embedding, self.source_onset, self.latent_slot, self.patch_encoder,
                        self.song_encoder, self.global_cross, self.local_cross):  # fmt: skip
             module.apply(PianoARModel._init_weights)
+        if self.frame_projection is not None:
+            self.frame_projection.apply(PianoARModel._init_weights)
         with torch.no_grad():
             self.source_embedding.weight[0].zero_()
             for block in (*self.global_cross, *self.local_cross):
@@ -304,33 +308,49 @@ class CoverModel(nn.Module):
         else:
             patch_start = flat[:, 1:2] * self.patch_frames
         local_onset = (onset - patch_start).clamp(0, self.patch_frames - 1)
+        # 原曲の音声の特徴の行: 学習では曲をつなげた [Nf, D]、生成ではバッチの次元を足した [1, Nf, D]
+        frames = batch.get("src_frames")
+        patch_frame_index = None
+        if frames is not None and self.frame_projection is not None:
+            frames = frames.reshape(-1, frames.shape[-1])
+            patch_frame_index = batch["src_frame_index"][patch_valid].long()
         needed_flat = needed[patch_valid]
         lookup_flat = torch.where(needed_flat, needed_flat.long().cumsum(0) - 1, -1)
         num_needed = int(needed_flat.sum())
         lengths = patch_rows_valid.sum(-1)
         row_width = max(1, int(lengths[needed_flat].max())) if num_needed else 1
 
-        def encode_patches(features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor) -> tuple[Tensor, Tensor]:
+        def add_frames(rows: Tensor, frame_index: Tensor | None) -> Tensor:
+            """特徴の行 (frame_index >= 0) に、原曲の音声の特徴を線形に写したものを足す"""
+            if frame_index is None:
+                return rows
+            weight = self.frame_projection.weight
+            value = self.frame_projection(frames[frame_index.clamp(min=0)].to(weight.dtype))
+            return rows + torch.where((frame_index >= 0)[..., None], value, 0).to(rows.dtype)
+
+        def encode_patches(
+            features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor, frame_index: Tensor | None
+        ) -> tuple[Tensor, Tensor]:
             n, length = valid.shape
             # 行の特徴 (5 列) の埋め込みの和。embedding + sum だと [n, length, 5, D] の中間が要るので embedding_bag で直接足す
             rows = F.embedding_bag(
                 features.reshape(-1, features.shape[-1]), self.source_embedding.weight, mode="sum", padding_idx=0
             ).reshape(n, length, -1)
-            rows = rows + self.source_onset(onset)
+            rows = add_frames(rows + self.source_onset(onset), frame_index)
             queries = self.latent_queries.to(rows.dtype).expand(n, -1, -1)
             key_valid = torch.cat((torch.ones_like(valid[:, :1]).expand(-1, K), valid), dim=1)
             out = self.patch_encoder(torch.cat((queries, rows), dim=1), key_valid)
             return out[:, :K], out[keep, K : K + min(length, row_width)]
 
         def encode_packed(
-            features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor
+            features: Tensor, onset: Tensor, valid: Tensor, keep: Tensor, frame_index: Tensor | None
         ) -> tuple[Tensor, Tensor]:
             """encode_patches と同じ計算を、パッチ (K 個の要約のクエリ + 行) をパディングせずにつなげて行う。
             返す行は Local が見るパッチ (keep) の有効な行だけを、パッチ順・行順に並べたもの [行数, D]"""
             n = valid.shape[0]
             counts = valid.sum(-1)
             rows = F.embedding_bag(features[valid], self.source_embedding.weight, mode="sum", padding_idx=0)
-            rows = rows + self.source_onset(onset[valid])
+            rows = add_frames(rows + self.source_onset(onset[valid]), None if frame_index is None else frame_index[valid])
             seq_lengths = counts + K
             cu_seqlens = F.pad(seq_lengths.cumsum(0), (1, 0)).int()
             total = int(cu_seqlens[-1])
@@ -366,6 +386,7 @@ class CoverModel(nn.Module):
                     local_onset[index, :width],
                     patch_rows_valid[index, :width],
                     keep,
+                    None if patch_frame_index is None else patch_frame_index[index, :width],
                 )
                 if self.gradient_checkpointing and self.training:
                     latents, kept_rows = checkpoint(encode_packed, *args, use_reentrant=False)
@@ -392,6 +413,7 @@ class CoverModel(nn.Module):
                     local_onset[index, :length],
                     patch_rows_valid[index, :length],
                     keep,
+                    None if patch_frame_index is None else patch_frame_index[index, :length],
                 )
                 if self.gradient_checkpointing and self.training:
                     latents, kept_rows = checkpoint(encode_patches, *args, use_reentrant=False)
@@ -465,7 +487,8 @@ class CoverModel(nn.Module):
         if keep is not None:
             valid = valid & keep[:, None]
         # 生成の CUDA Graph を使い回せるよう、原曲の行の数を最大 (パッチごとの行の上限 x パッチ数) にそろえる (足した行は見ない)
-        pad = max(0, index.shape[1] * self.config.max_source_rows - rows.shape[1])
+        max_rows = self.config.max_source_rows + (self.config.max_frame_rows if self.config.frame_dims else 0)
+        pad = max(0, index.shape[1] * max_rows - rows.shape[1])
         rows, k_pos, valid = F.pad(rows, (0, 0, 0, pad)), F.pad(k_pos, (0, pad)), F.pad(valid, (0, pad), value=False)
         # パッチ内の onset を、そのパッチに対応する原曲の区間に線形に写す (q_pos = q_scale * onset)
         tensors = {"mask": valid[:, None, :], "q_scale": (end - start).float() / self.patch_frames}

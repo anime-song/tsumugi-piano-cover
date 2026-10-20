@@ -185,12 +185,16 @@ def patch_sync(
 
 
 def source_tensors(features: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
-    return {
+    out = {
         "src_features": torch.from_numpy(features["features"]),
         "src_onset": torch.from_numpy(features["onset"]),
         "src_valid": torch.from_numpy(features["valid"]),
         "src_patch_valid": torch.ones(features["features"].shape[0], dtype=torch.bool),
     }
+    if "frames" in features:  # 原曲の音声の特徴の行 (source_features の frames)
+        out["src_frame_index"] = torch.from_numpy(features["frame_index"])
+        out["src_frames"] = torch.from_numpy(features["frames"])
+    return out
 
 
 class CoverWindowDataset(Dataset):
@@ -464,7 +468,16 @@ class CoverWindowDataset(Dataset):
         return patch_loss
 
 
-SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid", "plan_target", "src_patch_start")
+SOURCE_KEYS = (
+    "src_features",
+    "src_onset",
+    "src_valid",
+    "src_patch_valid",
+    "plan_target",
+    "src_patch_start",
+    "src_frame_index",
+    "src_frames",
+)
 
 
 def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -489,6 +502,20 @@ def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
             if "src_patch_start" in item:
                 starts[i, : len(item["src_patch_start"])] = item["src_patch_start"]
         out["src_patch_start"] = starts
+    if any("src_frames" in item for item in batch):
+        # 原曲の音声の特徴: 曲ごとの特徴をつなげ、行の番号をつなげた中の番号にする (特徴のない行は -1)
+        frame_index = torch.full((len(batch), num_patches, num_rows), -1, dtype=torch.int32)
+        frames, total = [], 0
+        for i, item in enumerate(batch):
+            if "src_frames" not in item:
+                continue
+            index = item["src_frame_index"]
+            s, r = index.shape
+            frame_index[i, :s, :r] = torch.where(index >= 0, index + total, -1)
+            frames.append(item["src_frames"])
+            total += len(item["src_frames"])
+        out["src_frame_index"] = frame_index
+        out["src_frames"] = torch.cat(frames)
     if any("plan_target" in item for item in batch):
         # 原曲のない行 (事前学習の曲) の正解は列が少ない (すべて NaN) ので、一番多い列に合わせる
         columns = max(item["plan_target"].shape[1] for item in batch if "plan_target" in item)
