@@ -37,8 +37,9 @@ API_VERSION = 2
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 # 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
-# 聴いて決めた: 原曲のリズムに寄せ、強弱と編曲の性質は学習データのまま
-STUDIO_DEFAULTS = {"onset_bias": 4.0, "dynamics": 1.0, "fill": 0.0, "span": 0.0}
+# 聴いて決めた: 原曲のリズムに寄せ、強弱と編曲の性質は学習データのまま。演奏者は公開番号 227 (Hugging Face の V1 / V2 の
+# 番号。学習のチェックポイントは学習時の番号なので、同じ 227 でも別の演奏者になる)
+STUDIO_DEFAULTS = {"onset_bias": 4.0, "dynamics": 1.0, "fill": 0.0, "span": 0.0, "channel": 227}
 
 
 def studio_params(values: dict | None = None) -> dict:
