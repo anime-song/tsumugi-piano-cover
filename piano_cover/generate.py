@@ -216,6 +216,10 @@ def generate_covers(
         )
         common["time_bias"] = torch.from_numpy(bias).to(device)
     tensors = {key: value.to(device) for key, value in source_tensors(source.features).items()}
+    if source.grid is not None:
+        # 小節の長さは曲ごとに異なり、patch * max_bar_ticks では原曲の位置とずれる。
+        # 学習時と同じ小節開始の刻みを SourceCondition に渡す。
+        tensors["src_patch_start"] = torch.from_numpy(source.features["patch_start"]).to(device)
     # bf16 を持たない GPU (Colab の T4 など) では、エミュレーションで遅くなったり失敗したりしないよう fp32 のまま動かす
     bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported(including_emulation=False)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):

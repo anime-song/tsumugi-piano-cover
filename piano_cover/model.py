@@ -715,7 +715,9 @@ class SourceCondition:
     """原曲 1 曲を条件にして生成する (PianoARModel.generate の condition に渡す)。原曲の時間軸の上に生成する"""
 
     def __init__(self, model: CoverModel, source: dict[str, Tensor]) -> None:
-        """source は piano_cover.data.source_tensors の出力 (バッチの次元なし)"""
+        """source は source_tensors の出力に、拍トークンなら src_patch_start を足したもの (バッチの次元なし)"""
+        if hasattr(model.tokenizer, "ticks_per_beat") and "src_patch_start" not in source:
+            raise ValueError("拍トークンの生成には原曲の小節開始位置 src_patch_start が必要です")
         self.model = model
         batch = {key: value[None] for key, value in source.items()}
         self.num_patches = int(batch["src_patch_valid"].shape[1])
