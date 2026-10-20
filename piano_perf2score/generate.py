@@ -12,6 +12,8 @@
 
 拍の上の演奏 (V2 のカバー、beat_input) は --beat-midi と --sheetsage で渡す。拍の格子から小節線が決まるので、
 MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
+書き出す前に、片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
+スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
 
     python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
         --beat-midi projects/<曲>/takes/t0001/cover.mid --sheetsage projects/<曲>/sheetsage.json --out 楽譜.musicxml
@@ -31,11 +33,12 @@ from piano_score.config import ScoreTokenizerConfig
 from piano_score.generate import unseen_tokens
 from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
-from piano_score.tokenizer import EOS, PAD, ScoreTokenizer
+from piano_score.tokenizer import EOS, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
 
 from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
+from .playability import make_playable
 from .render import Performance, measure_qpm, render
 
 PEDAL_THRESHOLD = 64
@@ -163,6 +166,7 @@ def transcribe_on_beats(
     banned: torch.Tensor | None = None,
     search_measures: int = 8,
     drop_durations: bool = True,
+    slur_bias: float = 0.0,
 ) -> list[list[int]]:
     """拍の時刻の演奏 (beat_input.on_beats、measure_starts に小節線) から楽譜を生成する。小節の開始は与えたものを使い、
     MTIME はそこから決める。最初の小節の 4 分音符の長さは、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭
@@ -175,6 +179,7 @@ def transcribe_on_beats(
     starts = np.asarray(performance.measure_starts, dtype=np.float64) * FRAMES_PER_SECOND
     end_frame = float(performance.notes[:, 0].max() * FRAMES_PER_SECOND) if len(performance.notes) else 0.0
     common = {"memory": memory, "end_frame": end_frame, "context_measures": context_measures, "banned": banned}
+    common["slur_bias"] = slur_bias
     beat_frames = BEAT_SECONDS * FRAMES_PER_SECOND
     spq = [beat_frames / q for q in SEARCH_BEAT_QUARTERS]
     best = 0
@@ -265,6 +270,7 @@ def _decode(
     top_p: float,
     banned: torch.Tensor | None,
     given_starts: np.ndarray | None = None,
+    slur_bias: float = 0.0,
 ) -> tuple[list[list[list[int]]], list[float], list[float]]:
     """小節を 1 つずつ生成する。first_spq の数だけの行 (曲の最初の小節の 4 分音符の長さだけが違う) を、バッチとして同時に
     進める。Local は 1 トークンずつ KV cache で計算し、演奏の行の k / v は小節ごとに作り置く。文法は行ごとに CPU で確かめる。
@@ -364,6 +370,8 @@ def _decode(
             logits = decoder.local_step(
                 token, step, context, cache, torch.tensor(q, device=device), condition, tensors
             ).float()
+            if slur_bias:
+                logits[:, [SLUR_START, SLUR_STOP]] += slur_bias
             allowed = torch.stack([g.allowed() for g in grammars]).to(device)
             logits = logits.masked_fill(~allowed, float("-inf"))
             if s == 0 and given_starts is not None:
@@ -446,6 +454,10 @@ def main() -> None:
         "--beat-midi", default=None, help="拍の上で作った演奏の MIDI (V2 のカバー)。--sheetsage と一緒に"
     )
     parser.add_argument("--sheetsage", default=None, help="--beat-midi の拍 (SheetSage2-Refined の注釈の JSON)")
+    parser.add_argument(
+        "--slur-bias", type=float, default=0.0, help="--beat-midi で、スラーのトークンの logit に足す値"
+    )
+    parser.add_argument("--no-playable", action="store_true", help="--beat-midi で、片手で弾けない和音を直さない")
     parser.add_argument("--out", default=None, help="--midi のときの出力 (省略で MIDI と同じ名前の .musicxml)")
     parser.add_argument("--val-songs", type=int, default=0, help="検証曲を合成演奏にして楽譜に戻す曲数")
     parser.add_argument("--val-measures", type=int, default=16, help="--val-songs で使う冒頭の小節数")
@@ -479,10 +491,14 @@ def main() -> None:
         performance = beat_performance(args.beat_midi, annotation)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             patches = transcribe_on_beats(
-                model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned
-            )
+                model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned,
+                slur_bias=args.slur_bias,
+            )  # fmt: skip
         out = Path(args.out or Path(args.beat_midi).with_suffix(".musicxml"))
-        write_musicxml(tokenizer.decode(patches)[0], out)
+        measures = tokenizer.decode(patches)[0]
+        if not args.no_playable:
+            print(make_playable(measures))
+        write_musicxml(measures, out)
         print(f"{len(patches)} 小節 -> {out}")
     if args.midi:
         patches = run(read_performance(args.midi), args.max_measures)
