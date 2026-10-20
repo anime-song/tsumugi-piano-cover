@@ -204,6 +204,7 @@ class Engine:
         from piano_ar.beat_tokenizer import BeatTokenizer
         from piano_cover.generate import prepare_source
 
+        self._source_beats(project, progress, log)
         path = project.source_path
         annotation = None
         c = model.config
@@ -226,6 +227,26 @@ class Engine:
                 self._sources.popitem(last=False)
         self._sources.move_to_end(key)
         return self._sources[key]
+
+    def _source_beats(
+        self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]
+    ) -> None:
+        """原曲の MIDI の拍 (テンポと拍子) を、音源から予測した SheetSage2-Refined の拍にする (音などの秒の位置は変えない)。
+        画面の拍の線・カバーの MIDI に写すテンポと拍子・V1 のモデルが読む拍が、どれも SheetSage の拍になる。
+        音源のないプロジェクトは tsumugi の拍のまま。音源ごとに 1 回だけ (source の beats に印を付ける)"""
+        from piano_cover.metadata import apply_sheetsage_beats
+
+        audio = project.audio_path
+        if audio is None or not audio.is_file() or not project.has_source:
+            return
+        source = project.data.get("source") or {}
+        sha1 = project.data.get("audio_sha1")
+        if source.get("beats") == "sheetsage" and source.get("beats_audio_sha1") == sha1:
+            return
+        annotation = json.loads(self._sheetsage(project, progress, log).read_text(encoding="utf-8"))
+        if apply_sheetsage_beats(project.source_path, annotation):
+            project.update(source={**source, "beats": "sheetsage", "beats_audio_sha1": sha1})
+            log("原曲の MIDI の拍を SheetSage2-Refined の拍にしました")
 
     def _sheetsage(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
         """原曲の音声の拍とメロディを SheetSage2-Refined (HeadBeats / HeadMelody) で予測し、project/sheetsage.json に置く。
@@ -476,6 +497,7 @@ class Engine:
         if code != 0 or not out.is_file():
             raise RuntimeError(f"tsumugi が失敗しました (終了コード {code})。ログを確かめてください")
         project.set_source(out, "tsumugi")
+        self._source_beats(project, progress, log)
         out.unlink()
 
     def describe(self) -> dict:
