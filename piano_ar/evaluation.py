@@ -64,7 +64,10 @@ def synthesize(events: np.ndarray, frame_rate: int, sample_rate: int = 16000) ->
         for k, amplitude in enumerate(harmonics, 1):
             if f0 * k < sample_rate / 2:
                 tone += amplitude * np.sin(2 * np.pi * f0 * k * t) * np.exp(-t * k * 0.5)
-        audio[start : start + length] += (tone * envelope * (velocity / 127) ** 1.5).astype(np.float32)
+        sound = (tone * envelope * (velocity / 127) ** 1.5).astype(np.float32)
+        if start < 0:  # 拍のトークンでは、原曲の最初の拍より前の小節の音が負の時刻になる。0 秒より前は切る
+            sound, start = sound[-start:], 0
+        audio[start : start + len(sound)] += sound
     peak = float(np.abs(audio).max())
     return audio / peak * 0.9 if peak > 0 else audio
 
