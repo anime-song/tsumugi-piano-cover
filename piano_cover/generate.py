@@ -7,6 +7,7 @@ python -m piano_cover.generate --checkpoint anime-song/tsumugi-piano-cover-v2 --
 
 SheetSage2-Refined の拍とメロディや、原曲の音声の特徴を使うモデル (V2) では、--audio に原曲の音声を渡すと、
 それらを作ってから生成する (--out-dir に <音声>.sheetsage.json と <音声>.frames.npy を残す)。
+SheetSage の注釈 (--audio か --sheetsage) があれば、出力の MIDI のテンポと拍子もその拍にする。
 
 原曲の時間軸の上に生成するので、出力は原曲と同じタイミング・テンポになる。
 生成は原曲の最初の音から始め (trim_lead)、出力はそのぶん後ろにずらして原曲の時刻に戻す。
@@ -38,10 +39,10 @@ from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
 from piano_ar.tokenizer import PianoTokenizer
 
 from .arrangement import measurable
-from .metadata import copy_metadata
 from .config import CoverConfig
 from .data import source_tensors
 from .hub import load_cover
+from .metadata import score_for_cover, set_sheetsage_beats
 from .model import CoverModel, SourceCondition
 from .source import (
     ROW_ONSET,
@@ -379,12 +380,18 @@ def main() -> None:
     source = prepare_source(args.source, tokenizer, model.config, sheetsage, frames)
     covers = generate_covers(model, source, params, num_samples=args.num_samples)
 
+    from symusic import Score
+
+    source_score = Score(str(args.source)).to("second")
+    annotation = json.loads(Path(sheetsage).read_text(encoding="utf-8")) if sheetsage else None
     for i, cover in enumerate(covers):
         manner = f"ch{channel}" + (f"_onset{args.onset_bias:g}" if args.onset_bias else "")
         path = out_dir / f"{Path(args.source).stem}_{manner}_{i}.mid"
-        tokenizer.events_to_midi(cover.events, path)
-        # 原曲のテンポ・拍子・調・コードマーカーを写す
-        copy_metadata(args.source, path)
+        # 原曲の調・コードマーカーと、テンポ・拍子 (SheetSage の注釈があればその拍) を入れて 1 回だけ書き出す
+        score = score_for_cover(tokenizer, cover.events, source_score)
+        if annotation is not None:
+            set_sheetsage_beats(score, annotation)
+        score.dump_midi(str(path))
         if args.wav:
             write_wav(synthesize(cover.events, tokenizer.config.frame_rate), path.with_suffix(".wav"))
         seconds = (cover.events[:, 0].max(initial=0) - cover.events[:, 0].min(initial=0)) / tokenizer.config.frame_rate

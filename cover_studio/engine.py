@@ -28,6 +28,8 @@ from .project import Project
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "tsumugi_worker.py"
+# 原曲の MIDI に書く SheetSage の拍の形 (小節ごとに 1 つのテンポ)。変えたら既存のプロジェクトの MIDI とテイクを書き直す
+BEATS_MAP = "bar"
 
 
 class Cancelled(Exception):
@@ -233,7 +235,8 @@ class Engine:
     ) -> None:
         """原曲の MIDI の拍 (テンポと拍子) を、音源から予測した SheetSage2-Refined の拍にする (音などの秒の位置は変えない)。
         画面の拍の線・カバーの MIDI に写すテンポと拍子・V1 のモデルが読む拍が、どれも SheetSage の拍になる。
-        音源のないプロジェクトは tsumugi の拍のまま。音源ごとに 1 回だけ (source の beats に印を付ける)"""
+        音源のないプロジェクトは tsumugi の拍のまま。音源と書き方 (beats_map、小節ごとのテンポは "bar") ごとに 1 回だけ
+        (source の beats に印を付ける)"""
         from piano_cover.metadata import apply_sheetsage_beats
 
         audio = project.audio_path
@@ -241,11 +244,15 @@ class Engine:
             return
         source = project.data.get("source") or {}
         sha1 = project.data.get("audio_sha1")
-        if source.get("beats") == "sheetsage" and source.get("beats_audio_sha1") == sha1:
+        if (
+            source.get("beats") == "sheetsage"
+            and source.get("beats_audio_sha1") == sha1
+            and source.get("beats_map") == BEATS_MAP
+        ):
             return
         annotation = json.loads(self._sheetsage(project, progress, log).read_text(encoding="utf-8"))
         if apply_sheetsage_beats(project.source_path, annotation):
-            project.update(source={**source, "beats": "sheetsage", "beats_audio_sha1": sha1})
+            project.update(source={**source, "beats": "sheetsage", "beats_audio_sha1": sha1, "beats_map": BEATS_MAP})
             log("原曲の MIDI の拍を SheetSage2-Refined の拍にしました")
 
     def _sheetsage(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
@@ -393,6 +400,7 @@ class Engine:
             except Exception:
                 log("原曲のメタデータを読めなかったので、メタデータなしで書き出します")
         source_created = (project.data.get("source") or {}).get("created")
+        source_beats = (project.data.get("source") or {}).get("beats_map")
 
         for take_id, cover in zip(take_ids, covers):
             d = project.take_dir(take_id)
@@ -412,6 +420,7 @@ class Engine:
                 notes=notes,
                 # どの原曲から作ったかと、メタデータを入れ終えた印 (古いテイクを後から直すときに使う)
                 source_created=source_created,
+                source_beats=source_beats,
                 metadata_copied=metadata_copied,
             )
 

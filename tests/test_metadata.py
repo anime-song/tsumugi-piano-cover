@@ -12,7 +12,8 @@ import pytest
 from symusic import KeySignature, Note, Score, Tempo, TextMeta, TimeSignature, Track
 
 from piano_ar.tokenizer import KIND_NOTE, KIND_PEDAL_ON, PianoTokenizer
-from piano_cover.metadata import copy_metadata, lyrics_of, score_for_cover
+from piano_cover.metadata import apply_sheetsage_beats, copy_metadata, lyrics_of, score_for_cover
+from piano_cover.source import ROW_A, ROW_ONSET, ROW_TYPE, TYPE_BEAT, load_source
 
 FRAME_RATE = 100  # 10 ms
 
@@ -111,3 +112,42 @@ def test_single_copy_drift_is_bounded(tmp_path, tpq):
     after = sorted((n.time, n.pitch) for t in Score(str(plain)).to("second").tracks for n in t.notes)
     drift = max(abs(a - b) for (a, _), (b, _) in zip(after, before))
     assert drift < 0.002
+
+
+def jittery_annotation(seed: int = 0):
+    """186 bpm・4/4、拍ごとに ±10 ms の推定の誤差、1 拍の弱起、最初の拍は 0.3 秒"""
+    rng = np.random.default_rng(seed)
+    beat = 60 / 186
+    beats = 0.3 + np.arange(41) * beat + rng.uniform(-0.01, 0.01, 41)
+    starts = beats[1::4]
+    bars = [{"start": float(t), "beats": 4, "unit": 4, "meter": "4/4"} for t in starts]
+    return {"beats": beats.tolist(), "downbeats": starts.tolist(), "bars": bars}
+
+
+def test_sheetsage_beats_one_tempo_per_bar(tmp_path):
+    """テンポは小節ごとに 1 つで、小節の頭は SheetSage の小節の頭に、小節の中の拍は SheetSage の拍の近くに乗る"""
+    annotation = jittery_annotation()
+    source_path = tmp_path / "source.mid"
+    write_source(source_path, tpq=480)
+    before = sorted((n.time, n.pitch) for t in Score(str(source_path)).to("second").tracks for n in t.notes)
+
+    assert apply_sheetsage_beats(source_path, annotation) is True
+
+    score = Score(str(source_path)).to("second")
+    qpm = [t.qpm for t in score.tempos]
+    # 先頭の小節 (最初の拍まで + 弱起) と SheetSage の 10 小節。拍ごとなら ±6 bpm 揺れる誤差が、小節の頭の誤差 (±10 ms / 1.3 秒) だけになる
+    assert len(qpm) == 1 + len(annotation["bars"])
+    assert max(abs(q - 186) for q in qpm[1:]) < 3.5
+    rows, _ = load_source(source_path, 1000)
+    rows = rows[rows[:, ROW_TYPE] == TYPE_BEAT]
+    midi_beats = rows[:, ROW_ONSET] / 1000
+    midi_downbeats = rows[rows[:, ROW_A] == 1, ROW_ONSET] / 1000
+    covered = midi_beats.max() + 1e-3  # load_source は原曲の音の終わりまでしか拍を出さない
+    assert covered > 3.0
+    for start in [t for t in annotation["downbeats"] if t < covered]:
+        assert np.abs(midi_downbeats - start).min() < 0.002
+    for t in [t for t in annotation["beats"] if t < covered]:
+        assert np.abs(midi_beats - t).min() < 0.02
+    assert midi_beats.min() < 0.002  # 0 秒が小節の頭
+    after = sorted((n.time, n.pitch) for t in score.tracks for n in t.notes)
+    assert max(abs(a - b) for (a, _), (b, _) in zip(after, before)) < 0.002  # 音の秒は動かない

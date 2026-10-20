@@ -374,12 +374,15 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             same_source = recorded == source_created
         else:  # 印がない古いテイク: 原曲がテイクより後に作られていれば、別の原曲に入れ替わっている
             same_source = source_created is None or source_created <= (take.get("created") or "")
-        if p.has_source and not take.get("metadata_copied") and same_source:
+        # 原曲の拍を書き直した (SheetSage の拍にした・小節ごとのテンポにした) 後のテイクも、同じように 1 回だけ写し直す
+        source_beats = (p.data.get("source") or {}).get("beats_map")
+        stale = not take.get("metadata_copied") or take.get("source_beats") != source_beats
+        if p.has_source and stale and same_source:
             try:
                 from piano_cover.metadata import copy_metadata
 
                 copy_metadata(p.source_path, path)
-                p.update_take(tid, metadata_copied=True)
+                p.update_take(tid, metadata_copied=True, source_beats=source_beats)
             except Exception:  # 写せなくても、中身 (音) は返す
                 log.exception("cover.mid にメタデータを写せませんでした: %s", path)
         name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
