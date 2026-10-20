@@ -16,6 +16,12 @@ optimizer の状態は作り直すので、--rewarmup-steps の間は学習率�
 --real-cache-dir の組 (asap.py) と合成演奏を --real-ratio の割合で混ぜる (実演奏の楽譜は 200 曲ほどしかないので、
 それだけで学習すると楽譜を覚えてしまう)。検証は両方で測り、best.pt は実演奏の検証の損失で選ぶ。
 --ref-noise-prob で小節の基準のずれ (data.RefNoise) を入れる。
+
+V2 のカバー -> 楽譜 (拍の上の演奏、piano_perf2score.beat_input) は --beat-input で学習する。演奏はカバーの弾き方に
+合わせた合成演奏を楽譜の拍で丸めたもので、曲は beat_input が選んだもの (beat_songs.npz)。
+
+    python -m piano_perf2score.beat_input                     # 曲を選ぶ (beat_songs.npz)
+    python -m piano_perf2score.train --beat-input --init-from checkpoints/piano_perf2score_asap/best.pt --new-run         --out-dir checkpoints/piano_perf2score_beat ...
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from piano_ar.train import limit_gpu_memory, lr_at, to_device
 from piano_score.data import ScoreAugmentConfig, ScoreCache, sampler_weights
 from piano_score.tokenizer import TOKEN_GROUPS, ScoreTokenizer
 
+from .beat_input import BeatSynthWindowDataset, load_songs
 from .data import PairCache, RealWindowDataset, RefNoise, SynthWindowDataset, collate
 from .model import Perf2ScoreConfig, Perf2ScoreModel
 
@@ -55,6 +62,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--real-val-songs", type=int, default=0, help="実演奏の検証に使う組の数 (0 なら全部)")
     parser.add_argument("--ref-noise-prob", type=float, default=0.0, help="小節の基準をずらす小節の割合 (data.RefNoise)")
     parser.add_argument("--ref-noise-sigma", type=float, default=0.15, help="基準のずれ (前の小節の長さに対する標準偏差)")
+    parser.add_argument(
+        "--beat-input", action="store_true", help="拍の上の演奏 (V2 のカバー) を楽譜にする学習 (beat_input)"
+    )
     parser.add_argument("--window-measures", type=int, default=32)
     parser.add_argument("--context-measures", type=int, default=2, help="窓の前に演奏を描き出す小節数")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -185,8 +195,20 @@ def main() -> None:
     noise = RefNoise(prob=args.ref_noise_prob, sigma=args.ref_noise_sigma) if args.ref_noise_prob > 0 else None
     common = {"window_measures": args.window_measures, "context_measures": args.context_measures, "ref_noise": noise}
     augment = None if args.no_augment else ScoreAugmentConfig()
-    train_set = SynthWindowDataset(cache, split="train", augment=augment, song_start_prob=args.song_start_prob, **common)
-    val_set = SynthWindowDataset(cache, split="val", **common)
+    if args.beat_input:
+        if args.real_cache_dir:
+            raise SystemExit("--beat-input と --real-cache-dir は一緒に使えない")
+        common["ref_noise"] = None  # 小節線は与えられるので、基準のずれは起きない
+        train_set = BeatSynthWindowDataset(
+            cache, split="train", augment=augment, song_start_prob=args.song_start_prob,
+            songs=load_songs(cache, "train"), **common,
+        )  # fmt: skip
+        val_set = BeatSynthWindowDataset(cache, split="val", songs=load_songs(cache, "val"), **common)
+    else:
+        train_set = SynthWindowDataset(
+            cache, split="train", augment=augment, song_start_prob=args.song_start_prob, **common
+        )
+        val_set = SynthWindowDataset(cache, split="val", **common)
     val_set.songs = val_set.songs[: args.val_songs]
     weights = sampler_weights(train_set, args.rare_meter_weight)
     datasets: list = [train_set]

@@ -9,6 +9,12 @@
 小節を 1 つずつ生成する。小節 p を生成し始めるときに分かっているのは、それまでに生成した MTIME から戻した各小節の開始時刻
 だけなので、学習と同じく「前の小節の開始」を基準にして演奏を見る (piano_perf2score.model)。
 演奏の最後の音より後に始まる小節を生成したら、そこで止める。--temperature 0 (既定) なら毎回いちばん確率の高いトークンを選ぶ。
+
+拍の上の演奏 (V2 のカバー、beat_input) は --beat-midi と --sheetsage で渡す。拍の格子から小節線が決まるので、
+MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
+
+    python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
+        --beat-midi projects/<曲>/takes/t0001/cover.mid --sheetsage projects/<曲>/sheetsage.json --out 楽譜.musicxml
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
 from piano_score.tokenizer import EOS, PAD, ScoreTokenizer
 
+from .beat_input import BEAT_SECONDS, on_beats
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .render import Performance, measure_qpm, render
@@ -132,6 +139,68 @@ def transcribe(
     return patches[0]
 
 
+# 拍の上の演奏の最初の小節で試す、1 拍の長さ (4 分音符いくつ分): 4 分・付点 4 分 (複合拍子)・2 分・8 分
+SEARCH_BEAT_QUARTERS = (1.0, 1.5, 2.0, 0.5)
+
+
+@torch.no_grad()
+def transcribe_on_beats(
+    model: Perf2ScoreModel,
+    tokenizer: ScoreTokenizer,
+    performance: Performance,
+    *,
+    context_measures: int = 32,
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    banned: torch.Tensor | None = None,
+    search_measures: int = 8,
+) -> list[list[int]]:
+    """拍の時刻の演奏 (beat_input.on_beats、measure_starts に小節線) から楽譜を生成する。小節の開始は与えたものを使い、
+    MTIME はそこから決める。最初の小節の 4 分音符の長さは、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭
+    search_measures 小節を生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ"""
+    device = next(model.parameters()).device
+    batch = {k: v.to(device) for k, v in performance_batch(performance).items()}
+    memory = model.encode_performance(batch)
+    starts = np.asarray(performance.measure_starts, dtype=np.float64) * FRAMES_PER_SECOND
+    end_frame = float(performance.notes[:, 0].max() * FRAMES_PER_SECOND) if len(performance.notes) else 0.0
+    common = {"memory": memory, "end_frame": end_frame, "context_measures": context_measures, "banned": banned}
+    beat_frames = BEAT_SECONDS * FRAMES_PER_SECOND
+    spq = [beat_frames / q for q in SEARCH_BEAT_QUARTERS]
+    best = 0
+    if len(starts) > 1:
+        stop = float(starts[min(search_measures, len(starts) - 1)])
+        _, logprob, covered = _decode(
+            model, tokenizer, first_spq=spq, max_measures=len(starts), stop_frame=stop, temperature=0.0, top_p=1.0,
+            given_starts=starts, **common,
+        )  # fmt: skip
+        best = int(np.argmax([lp / max(cv, 1.0) for lp, cv in zip(logprob, covered)]))
+    patches, _, _ = _decode(
+        model, tokenizer, first_spq=[spq[best]], max_measures=len(starts), stop_frame=None,
+        temperature=temperature, top_p=top_p, given_starts=starts, **common,
+    )  # fmt: skip
+    return patches[0]
+
+
+def beat_performance(midi: str | Path, annotation: dict) -> Performance:
+    """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から、拍の時刻の演奏を作る。
+    小節は注釈の小節の頭で区切り、音のある小節だけを残す"""
+    from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
+    from piano_ar.config import TokenizerConfig
+    from piano_ar.tokenizer import PianoTokenizer
+
+    fr = FRAMES_PER_SECOND
+    events, _ = PianoTokenizer(TokenizerConfig(frame_rate=fr)).midi_to_events(midi, trim=False)
+    tokenizer = BeatTokenizer()
+    first, last = float(events[:, 0].min()), float((events[:, 0] + events[:, 3]).max())
+    grid = BeatGrid.build(annotation["beats"], annotation["downbeats"], fr, first, last, tokenizer.config.max_bar_beats)
+    if grid is None:
+        raise ValueError("拍が足りない")
+    bar_frames = grid.beats[grid.bar_starts]  # 各小節の頭と、最後の小節の終わり
+    keep = (bar_frames[1:] > first) & (bar_frames[:-1] <= last)
+    performance, _ = on_beats(events, grid, bar_frames[:-1][keep], tokenizer)
+    return performance
+
+
 class _StepCondition:
     """Local を 1 トークンずつ生成するときの cross-attention (piano_ar.model.StepCondition)。演奏の行の k / v は
     小節ごとに作り置き (tensors)、onset には各行のクエリの時刻 (基準の時刻からの相対フレーム) を渡す"""
@@ -183,11 +252,14 @@ def _decode(
     temperature: float,
     top_p: float,
     banned: torch.Tensor | None,
+    given_starts: np.ndarray | None = None,
 ) -> tuple[list[list[list[int]]], list[float], list[float]]:
     """小節を 1 つずつ生成する。first_spq の数だけの行 (曲の最初の小節の 4 分音符の長さだけが違う) を、バッチとして同時に
     進める。Local は 1 トークンずつ KV cache で計算し、演奏の行の k / v は小節ごとに作り置く。文法は行ごとに CPU で確かめる。
     行ごとに (小節ごとのトークン列, 選んだトークンの対数尤度の和, 生成した小節が覆う時間 (フレーム)) を返す。
-    stop_frame を渡すと、そこより後に始まる小節の手前でその行を止める"""
+    stop_frame を渡すと、そこより後に始まる小節の手前でその行を止める。
+    given_starts (各小節の開始のフレーム) を渡すと、MTIME はそこから決めて (予測させず)、小節の開始と基準の時刻もその値を
+    そのまま使い (学習の data.exact_measure_times と同じ)、その小節の数だけ生成する"""
     device = memory.song.device
     decoder = model.decoder
     c = model.config
@@ -219,6 +291,8 @@ def _decode(
     total_logprob = [0.0] * R
     covered = [0.0] * R
     for p in range(max_measures):
+        if given_starts is not None and p >= len(given_starts):
+            break
         if not any(active):
             break
         for r in range(R):
@@ -280,7 +354,13 @@ def _decode(
             ).float()
             allowed = torch.stack([g.allowed() for g in grammars]).to(device)
             logits = logits.masked_fill(~allowed, float("-inf"))
-            next_token = _sample(logits, temperature, top_p)
+            if s == 0 and given_starts is not None:
+                # 与えた小節線から MTIME を決める (曲の最初の小節は最初の音より前の秒数、それ以降は前の小節の開始から)
+                seconds = -given_starts[0] if p == 0 else given_starts[p] - given_starts[p - 1]
+                forced = mtime_first + tokenizer.mtime_bin(max(float(seconds) / FRAMES_PER_SECOND, 0.0))
+                next_token = torch.full((R,), forced, dtype=torch.long, device=device)
+            else:
+                next_token = _sample(logits, temperature, top_p)
             chosen = logits.log_softmax(-1).gather(1, next_token[:, None])[:, 0].tolist()
             values = next_token.tolist()
             for r, g in enumerate(grammars):
@@ -292,6 +372,8 @@ def _decode(
                     # MTIME から小節の開始と 4 分音符の長さの見積もりを決める (学習の data.py と同じ)
                     value = float(mtime_values[values[r] - mtime_first])
                     start[r] = -value if p == 0 else ref[r] + value
+                    if given_starts is not None:
+                        start[r] = float(given_starts[p])
                     if p > 0:
                         spq[r] = (start[r] - ref[r]) / max(lengths[r][-1], 1e-3)
             if head is not None and s == 0:
@@ -336,6 +418,11 @@ def _decode(
             if len(starts[r]) <= p:
                 starts[r].append(starts[r][-1] if starts[r] else 0.0)
                 lengths[r].append(lengths[r][-1] if lengths[r] else 4.0)
+    if given_starts is not None:
+        # 与えた小節を全部作ったら、最後の小節で曲を終える
+        for r in range(R):
+            if active[r] and patches[r] and patches[r][-1][-1] != EOS:
+                patches[r][-1] = patches[r][-1][:-1] + [EOS]
     return patches, total_logprob, covered
 
 
@@ -343,6 +430,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--midi", default=None, help="楽譜にする演奏の MIDI")
+    parser.add_argument(
+        "--beat-midi", default=None, help="拍の上で作った演奏の MIDI (V2 のカバー)。--sheetsage と一緒に"
+    )
+    parser.add_argument("--sheetsage", default=None, help="--beat-midi の拍 (SheetSage2-Refined の注釈の JSON)")
     parser.add_argument("--out", default=None, help="--midi のときの出力 (省略で MIDI と同じ名前の .musicxml)")
     parser.add_argument("--val-songs", type=int, default=0, help="検証曲を合成演奏にして楽譜に戻す曲数")
     parser.add_argument("--val-measures", type=int, default=16, help="--val-songs で使う冒頭の小節数")
@@ -369,6 +460,18 @@ def main() -> None:
             given = {"first_qpm": first_qpm} if first_qpm is not None else {}
             return transcribe(model, tokenizer, performance, max_measures=max_measures, **(options | given))
 
+    if args.beat_midi:
+        import json
+
+        annotation = json.loads(Path(args.sheetsage).read_text(encoding="utf-8"))
+        performance = beat_performance(args.beat_midi, annotation)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            patches = transcribe_on_beats(
+                model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned
+            )
+        out = Path(args.out or Path(args.beat_midi).with_suffix(".musicxml"))
+        write_musicxml(tokenizer.decode(patches)[0], out)
+        print(f"{len(patches)} 小節 -> {out}")
     if args.midi:
         patches = run(read_performance(args.midi), args.max_measures)
         out = Path(args.out or Path(args.midi).with_suffix(".musicxml"))

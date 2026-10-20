@@ -13,12 +13,13 @@
 楽譜に書いていない演奏の要素 (テンポの揺れ・rit. などの速度の変化・強弱・アーティキュレーション・タイミングのずれ・
 ペダル) は乱数で付ける。ペダル記号のない曲にも確率でペダルを足し、自動採譜の誤り (音の抜け・余計な音・オクターブの誤り)
 も確率で混ぜる。小節の開始時刻 (MTIME の正解) は、最初の音ではなくテンポから決まる小節線の時刻。
+楽譜の拍の時刻 (Performance.beat_times、score_beats の数え方) も返す (拍のトークンの入力 beat_input で使う)。
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
@@ -96,6 +97,42 @@ class Performance:
     notes: np.ndarray  # [N, 4] 打鍵の時刻・離鍵の時刻 (秒)・音高・ベロシティ。打鍵の順
     pedal: np.ndarray  # [K, 2] 時刻・踏んでいるか (1 / 0)。時刻の順
     measure_starts: np.ndarray  # [M] 各小節の小節線の時刻 (秒)。最初の音 = 0
+    beat_times: np.ndarray = field(default_factory=lambda: np.zeros(0))  # [B] 楽譜の拍の時刻 (秒、score_beats)
+    beat_measures: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # [B] その拍の小節の番号
+
+
+def score_beats(measure: Measure) -> tuple[Fraction, int]:
+    """楽譜の拍 (拍の長さ (4 分音符単位), 1 小節の拍の数)。複合拍子 (分子が 6・9・12… で分母が 8・16) は付点の拍、
+    それ以外は拍子の分母の音符 (ASAP の注釈と同じ数え方)"""
+    n, d = measure.time_signature
+    if d in (8, 16) and n % 3 == 0 and n > 3:
+        return Fraction(12, d), n // 3
+    return Fraction(4, d), n
+
+
+def beat_positions(measures: list[Measure], offsets: np.ndarray) -> tuple[list[float], list[int]]:
+    """各小節の拍の位置 (曲の頭からの 4 分音符単位) と小節の番号。弱起などの短い小節は、小節の終わりから数える"""
+    positions, owners = [], []
+    for i, m in enumerate(measures):
+        unit, _ = score_beats(m)
+        start = Fraction(offsets[i]).limit_denominator(1 << 16)
+        end = start + m.length
+        if m.length < m.nominal_length:
+            items = []
+            q = end - unit
+            while q >= start - Fraction(1, 64):
+                items.append(q)
+                q -= unit
+            items.reverse()
+        else:
+            items = []
+            q = start
+            while q < end - Fraction(1, 64):
+                items.append(q)
+                q += unit
+        positions += [float(q) for q in items]
+        owners += [i] * len(items)
+    return positions, owners
 
 
 @dataclass
@@ -235,13 +272,15 @@ def render(
         performance = _transcription_errors(performance, rng, c)
     performance = _resolve_overlaps(performance)
     starts = np.array([timeline.time(offsets[i]) for i in range(len(measures))])
+    positions, owners = beat_positions(measures, offsets)
+    beat_times = np.array([timeline.time(q) for q in positions], dtype=np.float64)
 
     # 最初の音を 0 秒にする
     origin = performance[:, 0].min() if len(performance) else 0.0
     performance[:, :2] -= origin
     if len(pedal):
         pedal[:, 0] -= origin
-    return Performance(performance, pedal, starts - origin)
+    return Performance(performance, pedal, starts - origin, beat_times - origin, np.asarray(owners, dtype=np.int64))
 
 
 # ----------------------------------------------------------------------

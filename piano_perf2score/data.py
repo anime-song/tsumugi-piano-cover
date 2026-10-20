@@ -26,6 +26,7 @@ MTIME の正解をずらした基準から測り直す (本当の小節線に戻
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import random
@@ -154,6 +155,15 @@ def measure_times(
     return bins, decoded * FRAMES_PER_SECOND, ref * FRAMES_PER_SECOND
 
 
+def exact_measure_times(tokenizer: ScoreTokenizer, starts: np.ndarray) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """measure_times と同じ形で、開始と基準の時刻を本当の時刻 (フレーム) にしたもの。MTIME のビンは前の小節の本当の開始から測る"""
+    starts = np.asarray(starts, dtype=np.float64)
+    bins = [tokenizer.mtime_bin(max(-float(starts[0]), 0.0))] if len(starts) else []
+    bins += [tokenizer.mtime_bin(max(float(b - a), 0.0)) for a, b in itertools.pairwise(starts)]
+    ref = np.concatenate([[0.0], starts[:-1]]) if len(starts) else np.zeros(0)
+    return bins, starts * FRAMES_PER_SECOND, ref * FRAMES_PER_SECOND
+
+
 def make_item(
     tokenizer: ScoreTokenizer,
     vocab: PerformanceVocab,
@@ -168,9 +178,13 @@ def make_item(
     max_rows: int,
     train: bool,
     noise: RefNoise | None,
+    exact_starts: bool = False,
 ) -> dict[str, torch.Tensor]:
     """窓の前の文脈 first..start-1・窓 start..stop-1・その後ろの小節のトークン列 (bodies、MTIME なし) と、それを弾いた演奏
-    (measure_starts は bodies と同じ小節の並び) から、学習の 1 件を作る"""
+    (measure_starts は bodies と同じ小節の並び) から、学習の 1 件を作る。
+
+    exact_starts なら、小節の開始と基準の時刻に MTIME から戻した時刻ではなく本当の時刻を使う (拍の上の演奏
+    beat_input: 生成でも小節線が与えられるので、MTIME のビンの粗さで 4 分音符の長さの見積もりをずらさない)"""
     W = window_measures
     window = range(start - first, stop - first)
     noisy = None
@@ -178,7 +192,10 @@ def make_item(
         # DataLoader のワーカーごとに種が変わるのは random の方なので、numpy の乱数は使わない
         noisy = np.zeros(len(bodies), dtype=bool)
         noisy[list(window)] = [random.random() < noise.prob for _ in window]
-    bins, decoded, ref_all = measure_times(tokenizer, performance.measure_starts, noisy, noise)
+    if exact_starts:
+        bins, decoded, ref_all = exact_measure_times(tokenizer, performance.measure_starts)
+    else:
+        bins, decoded, ref_all = measure_times(tokenizer, performance.measure_starts, noisy, noise)
     ref = np.array([ref_all[k] for k in window])
     spq = np.array([(decoded[k] - ref_all[k]) / lengths[k - 1] if k > 0 else DEFAULT_SPQ for k in window])
     if start == 0 and len(decoded) > 1:
