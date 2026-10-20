@@ -69,6 +69,10 @@ class RenderConfig:
     staccatissimo: tuple[float, float] = (0.18, 0.3)
     detached: tuple[float, float] = (0.82, 0.97)  # スラーもテヌートもない音
     legato_overlap: tuple[float, float] = (0.0, 0.04)  # スラーの中で次の音に重ねる秒数
+    # 早く離す音 (カバーの弾き方: ペダルで響きを残して鍵盤は早く離す)。曲ごとに割合を選び、その割合の音を
+    # 楽譜どおりの長さの release_short 倍で離す。(0, 0) なら使わない (乱数も引かない)
+    release_short_prob: tuple[float, float] = (0.0, 0.0)
+    release_short: tuple[float, float] = (0.25, 0.7)  # 次の打鍵までの間隔に対する比
     # 強さ
     velocity_spread: tuple[float, float] = (0.6, 1.2)  # 強弱記号の差をどれだけ付けるか
     velocity_shift: tuple[float, float] = (-10.0, 8.0)
@@ -76,6 +80,10 @@ class RenderConfig:
     melody_boost: tuple[float, float] = (3.0, 10.0)
     # ペダル
     auto_pedal_prob: float = 0.75  # ペダル記号のない曲にペダルを足す確率
+    # 足したペダルの踏み替えで、踏み直さずに次の踏み替えまで上げておく割合 (曲ごとに選ぶ) と、上げる時刻を
+    # 踏み替えの位置より前にずらす秒数。どちらも (0, 0) なら使わない
+    pedal_rest_prob: tuple[float, float] = (0.0, 0.0)
+    pedal_lift_early: tuple[float, float] = (0.0, 0.0)
     # 自動採譜の誤り
     noise_prob: float = 0.5  # 誤りを混ぜる曲の割合
     drop_rate: tuple[float, float] = (0.0, 0.03)
@@ -138,11 +146,14 @@ def render(
         "detached": rng.uniform(*c.detached),
         "lead": rng.uniform(*c.melody_lead),
         "spread": rng.uniform(*c.velocity_spread),
+        "noise": c.velocity_noise,
         "shift": rng.uniform(*c.velocity_shift),
         "boost": rng.uniform(*c.melody_boost),
         "rate": rng.uniform(*c.ornament_rate),
         "arpeggio": rng.uniform(*c.arpeggio_gap),
     }
+    if c.release_short_prob[1] > 0:
+        song["short"] = rng.uniform(*c.release_short_prob)
     dynamics = _Dynamics(measures, offsets, rng)
 
     # 位置ごとのずれ (同じ位置の音はまとめてずらす)
@@ -161,6 +172,9 @@ def render(
     roll_offset = {
         (on, p): k * song["arpeggio"] for on, pitches in rolls.items() for k, p in enumerate(sorted(set(pitches)))
     }
+
+    # 次の (別の位置の) 打鍵の位置 (早く離す音の長さの基準)
+    positions = np.unique([n.on for n in notes]) if notes else np.zeros(0)
 
     out: list[list[float]] = []  # [on, off, pitch, velocity]
     for n in notes:
@@ -181,6 +195,12 @@ def render(
             off = written_end + (rng.uniform(*c.legato_overlap) if id(n.group) in legato else 0.0)
         else:
             off = on + span * song["detached"] * rng.uniform(0.97, 1.03)
+        if "short" in song and not n.cut and not {"staccato", "staccatissimo"} & set(arts):
+            k = int(np.searchsorted(positions, n.on, side="right"))
+            gap = timeline.time(positions[k]) - timeline.time(n.on) if k < len(positions) else span
+            # 次の打鍵より長く書いた音 (伸ばしておく低音など) は早く離すことが少ない
+            if rng.random() < song["short"] * (1.0 if span <= gap * 1.5 else 0.3):
+                off = on + min(span, gap) * rng.uniform(*c.release_short)
         off = max(off, on + 0.03)
         velocity = dynamics.velocity(n, song, rng)
         if n.ornament is not None:
@@ -636,7 +656,7 @@ class _Dynamics:
             v += song["boost"]
         elif n.group.staff == 2:
             v -= 3
-        v += rng.normal(0.0, 5.0)
+        v += rng.normal(0.0, song["noise"])
         return float(np.clip(v, 8, 127))
 
 
@@ -663,6 +683,8 @@ def _pedal(
             else:
                 events.append((t + rng.uniform(0.04, 0.12), 1))
     elif rng.random() < c.auto_pedal_prob:
+        rest = rng.uniform(*c.pedal_rest_prob) if c.pedal_rest_prob[1] > 0 else 0.0
+        early = c.pedal_lift_early[1] > 0
         # 拍の頭にある下段の音で、最も低い音が前と変わるところ。スタッカートの多い小節では踏まない
         bass: dict[float, int] = {}
         for n in notes:
@@ -688,10 +710,16 @@ def _pedal(
                 continue
             t = timeline.time(at)
             if down:
-                events.append((t + rng.uniform(0.0, 0.03), 0))
+                lift = t + rng.uniform(0.0, 0.03)
+                if early:  # 前の踏み込みより前には戻さない
+                    lift = max(lift - rng.uniform(*c.pedal_lift_early), events[-1][0] + 0.05)
+                events.append((lift, 0))
+            previous = bass[at]
+            if rest and rng.random() < rest:
+                down = False
+                continue
             events.append((t + rng.uniform(0.05, 0.14), 1))
             down = True
-            previous = bass[at]
         if down:
             events.append((timeline.time(offsets[-1]) + rng.uniform(0.2, 1.0), 0))
     events.sort()
@@ -742,3 +770,16 @@ def _resolve_overlaps(notes: np.ndarray) -> np.ndarray:
     notes = notes[keep]
     notes[:, 1] = np.maximum(notes[:, 1], notes[:, 0] + 0.01)
     return notes[np.argsort(notes[:, 0], kind="stable")]
+
+
+# V2 のカバー -> 楽譜の学習で使う描き出し。実際のカバーの分布 (local/probe_score_input_gap.py) に合わせて、
+# 早く離す音を足し、強さの幅を広げて平均を上げ、ペダルを踏む曲を増やす
+COVER_RENDER = RenderConfig(
+    release_short_prob=(0.4, 0.8),
+    velocity_spread=(1.0, 1.8),
+    velocity_shift=(0.0, 18.0),
+    velocity_noise=8.5,
+    auto_pedal_prob=0.95,
+    pedal_rest_prob=(0.0, 0.3),
+    pedal_lift_early=(0.0, 0.25),
+)
