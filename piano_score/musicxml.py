@@ -1143,6 +1143,10 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
                     end_state[int(name[6]) - 1] = name.split("_", 1)[1]
             following = measures[mi + 1].ottavas
             extra += [(measure.length, f"ottava{s}_none") for s in (1, 2) if end_state[s - 1] != following[s - 1]]
+        # 同じ位置でペダルを離して踏むのは踏み替えの記号 1 つにする
+        changes = {p for p, name in extra if name == "pedal_stop"} & {p for p, name in extra if name == "pedal_start"}
+        extra = [(p, name) for p, name in extra if not (p in changes and name in ("pedal_stop", "pedal_start"))]
+        extra += [(p, "pedal_change") for p in changes]
         # 同じ位置ではペダルや松葉の終わりを始まりより先に書く (後に書くと始めた直後に止めたことになる)
         for position, value in sorted(extra, key=lambda e: (e[0], not str(e[1]).endswith("_stop"))):
             target = ticks(position)

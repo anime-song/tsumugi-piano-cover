@@ -12,7 +12,8 @@
 
 拍の上の演奏 (V2 のカバー、beat_input) は --beat-midi と --sheetsage で渡す。拍の格子から小節線が決まるので、
 MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
-書き出す前に、片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
+書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直し (tidy.tidy_score)、
+片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
 スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
 
     python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
@@ -40,6 +41,7 @@ from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .playability import make_playable
 from .render import Performance, measure_qpm, render
+from .tidy import tidy_score
 
 PEDAL_THRESHOLD = 64
 
@@ -496,6 +498,7 @@ def main() -> None:
             )  # fmt: skip
         out = Path(args.out or Path(args.beat_midi).with_suffix(".musicxml"))
         measures = tokenizer.decode(patches)[0]
+        print(tidy_score(measures))
         if not args.no_playable:
             print(make_playable(measures))
         write_musicxml(measures, out)
