@@ -80,21 +80,23 @@ def performance_events(performance: Performance) -> np.ndarray:
         rows.append(
             np.stack([onset, np.full_like(onset, KIND_NOTE), notes[:, 2].astype(np.int64), duration, velocity], 1)
         )
-    # ペダルは踏む・離すが交互になるように並べる (BeatTokenizer.quantize の前提)
+    # ペダルは踏む・離すが交互になるように並べ、踏んだままなら最後に離す (BeatTokenizer.quantize の前提)
     down = False
     pedal_rows = []
     for time, value in performance.pedal.tolist():
         if bool(value) != down:
             down = bool(value)
             pedal_rows.append([round(time * fr), KIND_PEDAL_ON if down else KIND_PEDAL_OFF, 0, 0, 0])
-    if down and len(notes):
-        pedal_rows.append([round(float(notes[:, 1].max()) * fr) + 1, KIND_PEDAL_OFF, 0, 0, 0])
+    if down:
+        end = max(pedal_rows[-1][0], round(float(notes[:, 1].max()) * fr) if len(notes) else 0)
+        pedal_rows.append([end + 1, KIND_PEDAL_OFF, 0, 0, 0])
     if pedal_rows:
         rows.append(np.asarray(pedal_rows, dtype=np.int64))
     if not rows:
         return np.zeros((0, 5), dtype=np.int64)
     table = np.concatenate(rows)
-    return table[np.lexsort((table[:, 1], table[:, 0]))]
+    # 同じフレームの離す・踏むの順を崩さないよう、時刻だけで安定に並べる
+    return table[np.argsort(table[:, 0], kind="stable")]
 
 
 def level_grid(beat_times: np.ndarray, beat_measures: np.ndarray, level: float) -> np.ndarray | None:
