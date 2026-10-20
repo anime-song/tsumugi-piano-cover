@@ -6,3 +6,5 @@ huggingface_hub
 fastapi
 uvicorn
 python-multipart
+# V2 のモデルが使う、原曲の音声の拍・メロディと音声の特徴 (torch / torchaudio / numba / soundfile は tsumugi の環境のもの)
+sheetsage2-refined @ git+https://github.com/anime-song/SheetSage2-Refined
