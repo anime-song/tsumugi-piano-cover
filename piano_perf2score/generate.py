@@ -16,7 +16,6 @@ MTIME は与えた小節線から決めてモデルには予測させず (transc
 片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
 --chords に原曲の MIDI (Cover Studio の source.mid) を渡すと、tsumugi のコードマーカーをコード記号として置く
 (chords.place_chords)。省略したときは --beat-midi にマーカーがあればそれを使う。
-スイングの曲は、入力の裏拍をまっすぐにしてから楽譜にし、Swing の指定を書く (swing.straighten_swing、--no-swing で外す)。
 スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
 
     python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
@@ -45,7 +44,6 @@ from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .playability import make_playable
 from .render import Performance, measure_qpm, render
-from .swing import mark_swing, straighten_swing
 from .tidy import tidy_score
 
 PEDAL_THRESHOLD = 64
@@ -469,7 +467,6 @@ def main() -> None:
         "--slur-bias", type=float, default=0.0, help="--beat-midi で、スラーのトークンの logit に足す値"
     )
     parser.add_argument("--no-playable", action="store_true", help="--beat-midi で、片手で弾けない和音を直さない")
-    parser.add_argument("--no-swing", action="store_true", help="--beat-midi で、スイングの曲の裏拍をまっすぐにしない")
     parser.add_argument(
         "--chords", default=None, help="--beat-midi で、コードマーカーを読む MIDI (原曲。省略で --beat-midi)"
     )
@@ -505,7 +502,6 @@ def main() -> None:
         annotation = json.loads(Path(args.sheetsage).read_text(encoding="utf-8"))
         chords = read_chord_markers(args.chords or args.beat_midi)
         performance = beat_performance(args.beat_midi, annotation, chords)
-        swing = None if args.no_swing else straighten_swing(performance)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             patches = transcribe_on_beats(
                 model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned,
@@ -517,8 +513,6 @@ def main() -> None:
         print(tidied)
         if not args.no_playable:
             print(make_playable(measures))
-        if swing is not None and swing.any():
-            print(f"スイングの小節 {mark_swing(measures, swing, tidied.rests)} 個")
         if performance.chords:
             print(f"コード記号 {place_chords(measures, performance, performance.chords, tidied.rests)} 個")
         write_musicxml(measures, out)
