@@ -85,8 +85,10 @@ MELODY_RANGE = (60, 84)  # 旋律の音域 (C4〜C6)
 MELODY_RANGES = {"plain": MELODY_RANGE, "chordal": (67, 88), "octave": (64, 86), "offbeat": (64, 86), "pulse": (67, 88)}
 SWING_SECTIONS = 0.75  # スイングの曲で、区間をスイングにする割合
 LOWEST_RIGHT = 55  # 右手の旋律の下に付ける和音の一番下 (G3。これより下は濁るので付けない)
-# 左手が低音域だけを弾く伴奏型 (低いオクターブ) では、右手が旋律の下の和音をここ (D3) まで受け持つ
+# 左手が低音域だけを弾く伴奏型 (低いオクターブ・和音の打ち込み・先取り) では、右手が旋律の下の和音をここ (D3) まで受け持つ
 RIGHT_FLOOR = 50
+# 和音の打ち込み (block・push) の左手の押さえ方。低音と中音域の 3 和音を同時に左手に書くと片手で届かない (19 半音〜)
+REACH_STYLES = ("fifth_octave", "octave", "fifth")
 LOW_OCTAVE_ROOT = 31  # 低いオクターブの根音の一番下 (G1。根音は G1〜F#2、上の音は G2〜F#3)
 LH_PATTERNS = (
     "block", "oompah", "broken", "alberti", "octave", "pop8", "two_voice", "handoff", "bassline", "bassline", "wide", "wide",
@@ -333,11 +335,20 @@ def shell(pcs: list[int]) -> list[int]:
     return [root, next(p for p in range(root + 13, root + 25) if p % 12 == pcs[1])]
 
 
+def left_reach(pcs: list[int], style: str) -> list[int]:
+    """左手が片手で押さえる低音 (根音 C2〜B2 から 1 オクターブ以内)。style は "fifth_octave" (根音・5 度・8 度)、
+    "octave" (根音・8 度)、"fifth" (根音・5 度)。その上の和音は右手が旋律の下で弾く"""
+    root = 36 + (pcs[0] - 36) % 12
+    return {"fifth_octave": [root, root + 7, root + 12], "octave": [root, root + 12], "fifth": [root, root + 7]}[style]
+
+
 def right_floor(pattern: str, pcs: list[int]) -> int:
     """右手の旋律の下に置く和音の一番下。左手が低音域だけを弾く伴奏型では RIGHT_FLOOR (D3) まで下げ、左手が根音と
     7 度を弾くときはその上から。どちらも左手の一番上の音より上に置く"""
     if pattern == "low_octave":
         return max(RIGHT_FLOOR, low_octave(pcs)[1] + 3)
+    if pattern in ("block", "push"):
+        return max(RIGHT_FLOOR, left_reach(pcs, "octave")[1] + 1)
     if pattern == "shell":
         return shell(pcs)[1] + 1
     return LOWEST_RIGHT
@@ -603,12 +614,15 @@ def left_hand(
         pulses = [(s - span_start, n) for s, n in song.pulses if span_start <= s < span_start + bar]
         root = 36 + (pcs[0] - 36) % 12  # C2〜B2
         chord = voicing(pcs[:3], 45 + (pcs[0] - 45) % 12 if rng.random() < 0.5 else 50, 3)  # A2〜D4 から
+        if pattern in ("block", "push") and "reach" not in bass:
+            bass["reach"] = rng.choice(REACH_STYLES)  # 区間で同じ押さえ方
+        reach = bass.get("reach")
         if pattern == "block":
             if rng.random() < song.rolled:  # 広げた和音 (根音・5 度・10 度) をアルペジオで
                 tenth = next(p for p in range(root + 13, root + 25) if p % 12 == pcs[1])
                 put(F(0), bar, [root, root + 7, tenth], articulations=("arpeggiate",))
             else:
-                put(F(0), bar, [root, *chord])
+                put(F(0), bar, left_reach(pcs, reach))
         elif pattern == "oompah":
             if song.irregular:
                 # まとまりごとに、頭で低音、残りで和音 (7/8 の 2+2+3 なら 低-和 低-和 低-和和)
@@ -727,9 +741,6 @@ def left_hand(
                 put(F(1, 2), bar - F(1, 2), upper, voice=1)  # 8 分遅れて入り、区間の終わりまで伸ばす
         elif pattern == "push":
             # 次のコードを小節の最後の 8 分で先取りし、小節線をまたいで次の小節の頭へタイでつなぐ
-            def notes_of(p):
-                return [36 + (p[0] - 36) % 12, *voicing(p[:3], 50, 3)]
-
             pushed = bass.pop("pushed", None) if span_start == 0 else None
             last = span_start + bar == song.bar
             push = last and not bass.get("last") and next_pcs != pcs and bar >= 2 and rng.random() < 0.7
@@ -737,14 +748,14 @@ def left_hand(
             hits = [F(0), F(3, 2)] if bar == 4 else [F(0)]
             pedal_points = [] if pedal_points is None else pedal_points
             for k, t in enumerate(hits):
-                group = put(t, (hits[k + 1] if k + 1 < len(hits) else end) - t, notes_of(pcs))[0]
+                group = put(t, (hits[k + 1] if k + 1 < len(hits) else end) - t, left_reach(pcs, reach))[0]
                 if k == 0 and pushed is not None:
                     for note in pushed.notes:
                         note.tie = any(n.pitch == note.pitch for n in group.notes)
             if pushed is None:
                 pedal_points.append(span_start)
             if push:
-                bass["pushed"] = put(end, F(1, 2), notes_of(next_pcs))[0]
+                bass["pushed"] = put(end, F(1, 2), left_reach(next_pcs, reach))[0]
                 pedal_points.append(span_start + end)
         elif pattern == "triplet":
             # 3 連符の分散和音: 拍ごとに 8 分の 3 連符で 根音 -> 5 度 -> 8 度 -> 10 度 -> 8 度 -> 5 度
@@ -1034,7 +1045,9 @@ def generate(rng: random.Random) -> Song:
             pattern = "broken"  # 3 連符の分散和音は 4 分の拍の拍子だけ
         level = rng.choice(DYNAMIC_LEVELS[1:5])
         texture = rng.choice(TEXTURES) if label != "A" or rng.random() < 0.6 else "plain"
-        if pattern == "low_octave" and texture in ("plain", "octave"):
+        if texture in ("plain", "octave") and (
+            pattern == "low_octave" or pattern in ("block", "push") and rng.random() < 0.5
+        ):
             texture = rng.choice(("chordal", "offbeat", "pulse"))  # 左手は低音だけなので、和音は右手が持つ
         elif pattern == "shell":
             texture = "chordal"
