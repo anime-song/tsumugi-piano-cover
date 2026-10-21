@@ -7,6 +7,7 @@ import { Icon } from "../components/Icon";
 import { LiveTranscription } from "../components/LiveTranscription";
 import { PianoRoll } from "../components/PianoRoll";
 import { PlayerBar, usePlayerState } from "../components/PlayerBar";
+import { ScoreViewer } from "../components/ScoreViewer";
 import { TakeCard, TakeDetail } from "../components/Takes";
 import { progressText, useT } from "../i18n";
 import { formatTime } from "../params";
@@ -14,6 +15,17 @@ import { downloadCoverWav, getPlayer, type Player } from "../player";
 
 // 「作る」欄の設定は曲をまたいで同じものを使う (別の曲へ移っても、変えた設定のまま続けられる)
 const DRAFT_KEY = "cover-studio:draft";
+// 楽譜化のモデルの選択も曲をまたいで覚えておく
+const SCORE_MODEL_KEY = "cover-studio:score-model";
+
+function loadScoreModel(config: Config): string | null {
+  try {
+    const id = localStorage.getItem(SCORE_MODEL_KEY);
+    return id && (config.score_models ?? []).some((m) => m.id === id) ? id : null;
+  } catch {
+    return null;
+  }
+}
 
 // 携帯では 3 つの欄をタブで切り替える。
 // 幅のしきい値は styles.css の @media (max-width: 820px) と揃えること
@@ -77,6 +89,17 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
     saveDraft(d);
   };
   const [error, setError] = useState<string | null>(null);
+  const [scoreModel, setScoreModelState] = useState<string | null>(() => loadScoreModel(config));
+  const setScoreModel = (id: string) => {
+    setScoreModelState(id);
+    try {
+      localStorage.setItem(SCORE_MODEL_KEY, id);
+    } catch {
+      // 覚えておけなくても使える
+    }
+  };
+  // 楽譜を開いているテイク
+  const [scoreOpen, setScoreOpen] = useState<string | null>(null);
 
   const takes = data?.takes ?? [];
   const doneTakes = takes.filter((t) => t.state === "done");
@@ -427,12 +450,30 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                 })
               }
               onDelete={() => deleteTake(selectedTake)}
+              scoreModel={scoreModel}
+              scoreBlocked={data.audio ? null : t.scoreNeedsAudio}
+              scoreUrl={urls.takeScore(pid, selectedTake.id)}
+              onScoreModel={setScoreModel}
+              onScore={() => run(async () => refresh(await api.score(pid, selectedTake.id, scoreModel)))}
+              onCancelScore={() =>
+                selectedTake.score?.job && run(async () => (await api.cancelJob(selectedTake.score!.job!), refresh()))
+              }
+              onOpenScore={() => setScoreOpen(selectedTake.id)}
             />
           ) : (
             <div className="detail empty muted">{t.selectTakeHint}</div>
           )}
         </aside>
       </div>
+      {scoreOpen && takeById.get(scoreOpen)?.score?.state === "done" && (
+        <ScoreViewer
+          pid={pid}
+          tid={scoreOpen}
+          version={takeById.get(scoreOpen)!.score!.created}
+          title={`${data.title} — ${takeLabel(takeById.get(scoreOpen)!, t)}`}
+          onClose={() => setScoreOpen(null)}
+        />
+      )}
       <PlayerBar
         player={player}
         title={selectedTake ? `${takeLabel(selectedTake, t)} — ${data.title}` : data.title}

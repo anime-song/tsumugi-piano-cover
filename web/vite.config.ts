@@ -5,6 +5,7 @@ import { defineConfig } from "vite";
 // npm run build: cover_studio/static に書き出す (python -m cover_studio が / で配る)
 export default defineConfig({
   plugins: [react()],
-  build: { outDir: "../cover_studio/static", emptyOutDir: true },
+  // 楽譜を描く Verovio (WebAssembly を含む 8 MB ほど) は楽譜を開いたときだけ読む別の塊なので、大きさの警告は出さない
+  build: { outDir: "../cover_studio/static", emptyOutDir: true, chunkSizeWarningLimit: 9000 },
   server: { proxy: { "/api": "http://127.0.0.1:8100" } },
 });

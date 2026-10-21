@@ -207,6 +207,25 @@ const ja = {
   cover: "カバー",
   mixHelp: "原曲とカバーの配分 (ダブルクリックで半々)",
   mixLabel: "原曲とカバーの音量の配分",
+  // 楽譜
+  score: "楽譜",
+  scoreModel: "楽譜化のモデル",
+  makeScore: "楽譜にする",
+  remakeScore: "作り直す",
+  openScore: "楽譜を開く",
+  scoreHelp: "このテイクを楽譜 (MusicXML) にする。原曲の拍に合わせて小節線を引き、コード記号も付ける",
+  scoreQueued: "楽譜化の順番待ち",
+  scoring: "楽譜にしています",
+  scoreBars: (done: number, total: number) => `${done} / ${total} 小節`,
+  scoreDone: (n: number | null) => `${n ?? "?"} 小節`,
+  scoreNeedsAudio: "楽譜にするには原曲の音源 (拍) が要ります",
+  noScoreModels: "楽譜化のモデルがありません",
+  print: "印刷 / PDF",
+  printHelp: "ブラウザの印刷で紙か PDF にする (A4)",
+  zoomIn: "拡大",
+  zoomOut: "縮小",
+  scoreLoading: "楽譜を描いています…",
+  scoreRenderFailed: "楽譜を描けませんでした",
 };
 
 type Dict = typeof ja;
@@ -416,6 +435,24 @@ const en: Dict = {
   cover: "Cover",
   mixHelp: "Balance between original and cover (double-click to center)",
   mixLabel: "Volume balance between the original and the cover",
+  score: "Score",
+  scoreModel: "Score model",
+  makeScore: "Make score",
+  remakeScore: "Remake",
+  openScore: "Open score",
+  scoreHelp: "Turn this take into sheet music (MusicXML), with bar lines on the beats of the original and chord symbols",
+  scoreQueued: "Waiting to make the score",
+  scoring: "Making the score",
+  scoreBars: (done, total) => `${done} / ${total} bars`,
+  scoreDone: (n) => `${n ?? "?"} bars`,
+  scoreNeedsAudio: "Making a score needs the original audio (for its beats)",
+  noScoreModels: "No score model available",
+  print: "Print / PDF",
+  printHelp: "Print on paper or save as PDF with the browser (A4)",
+  zoomIn: "Zoom in",
+  zoomOut: "Zoom out",
+  scoreLoading: "Engraving the score…",
+  scoreRenderFailed: "Could not engrave the score",
 };
 
 const DICTS: Record<Lang, Dict> = { ja, en };
@@ -471,6 +508,8 @@ export function progressText(t: Dict, message: string | undefined): string | nul
   if (message === "stopping") return t.stopping;
   if (message === "starting") return t.startingTsumugi;
   if (message === "beats") return t.analyzingBeats;
+  const bars = message.match(/^bars:(\d+)\/(\d+)$/);
+  if (bars) return t.scoreBars(Number(bars[1]), Number(bars[2]));
   const m = message.match(/^(\d+)\/(\d+)$/);
   if (m) return `${m[1]} / ${m[2]} ${t.sec}`;
   return message;

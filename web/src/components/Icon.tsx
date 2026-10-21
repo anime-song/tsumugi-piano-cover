@@ -18,6 +18,10 @@ const PATHS: Record<string, string> = {
   sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
   layers: "M12 4 3 9l9 5 9-5zM3 14l9 5 9-5",
   chip: "M7 7h10v10H7zM9.5 3v4M14.5 3v4M9.5 17v4M14.5 17v4M3 9.5h4M3 14.5h4M17 9.5h4M17 14.5h4",
+  score: "M3 6h18M3 10h18M3 14h18M3 18h18M15 18V7.5M15 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0z",
+  print: "M7 9V4h10v5M7 17H4v-7h16v7h-3M7 14h10v6H7z",
+  zoomIn: "M10.5 17a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13zM15.5 15.5 20 20M10.5 8v5M8 10.5h5",
+  zoomOut: "M10.5 17a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13zM15.5 15.5 20 20M8 10.5h5",
 };
 
 export function Icon({ name, size = 18, filled }: { name: string; size?: number; filled?: boolean }) {

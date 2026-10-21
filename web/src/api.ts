@@ -27,10 +27,12 @@ export type ModelEntry = {
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
-export const API_VERSION = 2;
+export const API_VERSION = 3;
 
 export type Config = {
   models: ModelEntry[];
+  // 楽譜化のモデル (先頭が既定)
+  score_models: ModelEntry[];
   loaded: string | null;
   device: string;
   tsumugi: boolean;
@@ -42,6 +44,17 @@ export type Config = {
 export type TakeState = "queued" | "running" | "done" | "error" | "cancelled";
 
 export type ContinueFrom = { take: string; seconds: number };
+
+export type TakeScore = {
+  state: "queued" | "running" | "done" | "error" | "cancelled";
+  error: string | null;
+  model: { id: string; label: string };
+  measures?: number | null;
+  created?: string | null;
+  job?: string;
+  progress?: number | null;
+  message?: string;
+};
 
 export type Take = {
   id: string;
@@ -61,6 +74,7 @@ export type Take = {
   seed: number;
   count: number;
   continue_from: ContinueFrom | null;
+  score?: TakeScore | null;
   job?: string;
   progress?: number | null;
   message?: string;
@@ -183,6 +197,13 @@ export const api = {
     request<Take>(`${p(pid)}/takes/${tid}`, json("PATCH", body)),
   deleteTake: (pid: string, tid: string) => request<void>(`${p(pid)}/takes/${tid}`, { method: "DELETE" }),
   takeView: (pid: string, tid: string) => request<CoverView>(`${p(pid)}/takes/${tid}/view`),
+  score: (pid: string, tid: string, model: string | null) =>
+    request<ProjectDetail>(`${p(pid)}/takes/${tid}/score`, json("POST", { model })),
+  scoreXml: async (pid: string, tid: string) => {
+    const res = await fetch(urls.takeScore(pid, tid), { cache: "no-store" });
+    if (!res.ok) throw new ApiError(res.status, `${res.status} ${res.statusText}`);
+    return res.text();
+  },
   cancelJob: (jobId: string) => request<unknown>(`/api/jobs/${jobId}`, { method: "DELETE" }),
 };
 
@@ -190,4 +211,5 @@ export const urls = {
   audio: (pid: string) => `${p(pid)}/audio`,
   sourceMidi: (pid: string) => `${p(pid)}/source.mid`,
   takeMidi: (pid: string, tid: string) => `${p(pid)}/takes/${tid}/cover.mid`,
+  takeScore: (pid: string, tid: string) => `${p(pid)}/takes/${tid}/score.musicxml`,
 };

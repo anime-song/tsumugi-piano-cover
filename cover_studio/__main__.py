@@ -20,7 +20,7 @@ from pathlib import Path
 from piano_ar.hub import HF_REPOS
 
 from .app import create_app
-from .engine import REPO_ROOT, Engine, TsumugiSetup, find_models
+from .engine import REPO_ROOT, Engine, TsumugiSetup, find_models, find_score_models
 from .web import ensure_web
 
 
@@ -79,7 +79,9 @@ def main(argv=None) -> None:
 
     import uvicorn
 
-    models = find_models(args.pretrained_dir, args.checkpoints_dir, [repo for repo in args.hub_repo if repo])
+    hub_repos = [repo for repo in args.hub_repo if repo]
+    models = find_models(args.pretrained_dir, args.checkpoints_dir, hub_repos)
+    score_models = find_score_models(args.pretrained_dir, args.checkpoints_dir, hub_repos)
     tsumugi = TsumugiSetup.detect(args.tsumugi_dir, args.tsumugi_python, args.ffmpeg_dir)
     if tsumugi is not None:
         tsumugi.compile = args.tsumugi_compile
@@ -88,10 +90,12 @@ def main(argv=None) -> None:
     else:
         print("tsumugi が見つかりません。採譜は使えません (採譜済みの MIDI を音源と一緒に入れれば生成はできます)")
     print("モデル: " + (", ".join(m.label for m in models) or "なし"))
+    print("楽譜化のモデル: " + (", ".join(m.label for m in score_models) or "なし"))
     if not args.no_web_download:
         ensure_web()  # 無ければ GitHub の Release からビルド済みのものを取ってくる (Node.js が要らない)
 
-    app = create_app(args.root, Engine(models, args.device, tsumugi, args.sheetsage_model, args.frames_pca))
+    engine = Engine(models, args.device, tsumugi, args.sheetsage_model, args.frames_pca, score_models)
+    app = create_app(args.root, engine)
     if not args.no_browser:
         threading.Timer(1.5, webbrowser.open, [f"http://{args.host}:{args.port}/"]).start()
     uvicorn.run(app, host=args.host, port=args.port)

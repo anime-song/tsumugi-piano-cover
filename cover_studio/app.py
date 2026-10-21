@@ -27,13 +27,13 @@ from pydantic import BaseModel, Field
 
 from .engine import Engine
 from .jobs import Job, LiveTranscription, Runner
-from .project import Project, projects, safe_name
+from .project import Project, now, projects, safe_name
 from .web import STATIC_DIR
 
 log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
-API_VERSION = 2
+API_VERSION = 3
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 # 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
@@ -63,6 +63,10 @@ class GenerateIn(BaseModel):
 
 class ProjectPatch(BaseModel):
     title: str | None = None
+
+
+class ScoreIn(BaseModel):
+    model: str | None = None
 
 
 class TakePatch(BaseModel):
@@ -99,6 +103,13 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
                 live.on_log(line)
 
             engine.transcribe(p, progress, job._stop.is_set, log, live.on_live)
+        elif job.kind == "score":
+            take_id = job.takes[0]
+            p.update_take(take_id, score={**p.take(take_id)["score"], "state": "running", "error": None})
+            measures = engine.score(p, take_id, progress, job._stop.is_set, job.add_log)
+            p.update_take(
+                take_id, score={**p.take(take_id)["score"], "state": "done", "measures": measures, "created": now()}
+            )
         else:
             engine.generate(p, job.takes, progress, job._stop.is_set, job.add_log)
 
@@ -110,6 +121,15 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         if job.kind == "transcribe":
             state = {"done": "done", "cancelled": "cancelled"}.get(job.state, "error")
             p.update(transcribe={"state": state, "error": job.error})
+            return
+        if job.kind == "score":
+            try:
+                score = p.take(job.takes[0]).get("score") or {}
+            except KeyError:
+                return
+            if score.get("state") in ("queued", "running"):
+                state = "cancelled" if job.state == "cancelled" else "error"
+                p.update_take(job.takes[0], score={**score, "state": state, "error": job.error})
             return
         for take_id in job.takes:
             try:
@@ -134,16 +154,22 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     def detail(p: Project) -> dict:
         data = p.data
         jobs = runner.jobs(p.id)
-        live = {}
+        live, scoring = {}, {}
         for job in jobs:
             if job.active and job.kind == "generate":
                 for take_id in job.takes:
                     live[take_id] = job
+            elif job.active and job.kind == "score":
+                scoring[job.takes[0]] = job
         takes = []
         for take in p.takes():
             job = live.get(take["id"])
             if job is not None:
                 take = {**take, "job": job.id, "progress": job.progress, "message": job.message}
+            job = scoring.get(take["id"])
+            if job is not None and take.get("score"):
+                score = {**take["score"], "job": job.id, "progress": job.progress, "message": job.message}
+                take = {**take, "score": score}
             takes.append(take)
         transcribe = data.get("transcribe")
         job = next((j for j in jobs if j.kind == "transcribe"), None)
@@ -387,6 +413,40 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
                 log.exception("cover.mid にメタデータを写せませんでした: %s", path)
         name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
         return FileResponse(path, media_type="audio/midi", headers={"Content-Disposition": _attachment(name)})
+
+    @app.post("/api/projects/{pid}/takes/{tid}/score")
+    def score_take(pid: str, tid: str, body: ScoreIn):
+        """テイクを楽譜 (MusicXML) にするジョブを始める。原曲の拍 (SheetSage2-Refined) が要るので音源のあるプロジェクトだけ"""
+        p = open_project(pid)
+        take = find_take(p, tid)
+        if take["state"] != "done":
+            raise HTTPException(400, "生成が終わったテイクだけを楽譜にできます")
+        if p.audio_path is None and not (p.dir / "sheetsage.json").is_file():
+            raise HTTPException(400, "楽譜にするには原曲の拍が要ります。音源のあるプロジェクトで使ってください")
+        if any(j.kind == "score" and tid in j.takes for j in runner.active_for(pid)):
+            raise HTTPException(409, "このテイクは楽譜にしているところです")
+        try:
+            entry = engine.score_entry(body.model)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        score = {"state": "queued", "error": None, "model": {"id": entry.id, "label": entry.label}}
+        p.update_take(tid, score={**(take.get("score") or {}), **score})
+        runner.submit("score", pid, [tid])
+        return detail(p)
+
+    @app.get("/api/projects/{pid}/takes/{tid}/score.musicxml")
+    def get_take_score(pid: str, tid: str):
+        p = open_project(pid)
+        take = find_take(p, tid)
+        path = p.take_dir(tid) / "score.musicxml"
+        if not path.is_file():
+            raise HTTPException(404, "まだ楽譜にしていません")
+        name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.musicxml"
+        return FileResponse(
+            path,
+            media_type="application/vnd.recordare.musicxml+xml",
+            headers={"Content-Disposition": _attachment(name), "Cache-Control": "no-cache"},
+        )
 
     @app.get("/api/projects/{pid}/takes/{tid}/view")
     def get_take_view(pid: str, tid: str):

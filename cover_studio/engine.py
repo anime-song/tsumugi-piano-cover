@@ -4,6 +4,10 @@
   export     piano_cover.export の出力 (既定 pretrained/ の下)
   checkpoint 学習のチェックポイント (既定 checkpoints/**/best.pt。隣に planner*.pt があれば差し替えた版も)
   hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPOS の V2・V1。初回にダウンロードする)。一覧の先頭 (既定) は V2
+
+楽譜化のモデル (find_score_models、テイクを楽譜 (MusicXML) にする piano_perf2score) も同じ 3 種類から探す。
+Hugging Face の重みは V2 の repository の piano_perf2score/ (V1 にはない)。カバーモデルと楽譜化のモデルは
+VRAM を空けるため同時には持たず、使う方を読み直す。
 """
 
 from __future__ import annotations
@@ -47,16 +51,20 @@ class ModelEntry:
     num_channels: int | None = None
 
 
-def _is_cover_checkpoint(path: Path) -> bool:
-    """torch.save の zip の中の pickle に cover_config の名前があるか (重みを読まずに見分ける)"""
+def _checkpoint_has(path: Path, key: bytes) -> bool:
+    """torch.save の zip の中の pickle に key の名前があるか (重みを読まずに見分ける)"""
     try:
         with zipfile.ZipFile(path) as z:
             name = next(n for n in z.namelist() if n.endswith("/data.pkl"))
             with z.open(name) as f:
                 head = f.read(1 << 22)
-        return b"cover_config" in head
+        return key in head
     except (zipfile.BadZipFile, StopIteration, OSError):
         return False
+
+
+def _is_cover_checkpoint(path: Path) -> bool:
+    return _checkpoint_has(path, b"cover_config")
 
 
 def find_models(
@@ -105,6 +113,48 @@ def find_models(
     return entries
 
 
+def _is_beat_score_checkpoint(path: Path) -> bool:
+    """拍の上の演奏を楽譜にする学習 (--beat-input) のチェックポイントか。秒の演奏のもの (2・3 段目) は除く"""
+    if not _checkpoint_has(path, b"perf2score_config"):
+        return False
+    import torch
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        return bool((checkpoint.get("args") or {}).get("beat_input"))
+    except Exception:  # noqa: BLE001  読めないものは候補にしない
+        return False
+
+
+def find_score_models(
+    pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repos: list[str] | tuple[str, ...]
+) -> list[ModelEntry]:
+    """楽譜化のモデルの候補。一覧の先頭が既定なので、Hugging Face の公開した重みを先に並べる (V1 には楽譜化のモデルがない)"""
+    from piano_ar.hub import HF_REPO_V1, HF_REPO_V2
+
+    entries = [
+        ModelEntry(f"score:hub:{repo}", f"V2 ({repo})" if repo == HF_REPO_V2 else f"{repo} (Hugging Face)", "hub", repo)
+        for repo in hub_repos
+        if repo != HF_REPO_V1
+    ]
+    if pretrained_dir is not None and pretrained_dir.is_dir():
+        for config_path in sorted(pretrained_dir.rglob("config.json")):
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if config.get("model_type") == "piano_perf2score":
+                folder = config_path.parent
+                rel = folder.relative_to(pretrained_dir.parent).as_posix()
+                entries.append(ModelEntry(f"score:export:{rel}", rel, "export", str(folder)))
+    if checkpoints_dir is not None and checkpoints_dir.is_dir():
+        found = [p for p in checkpoints_dir.rglob("best.pt") if _is_beat_score_checkpoint(p)]
+        for path in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True):
+            rel = path.relative_to(checkpoints_dir).as_posix()
+            entries.append(ModelEntry(f"score:checkpoint:{rel}", rel, "checkpoint", str(path)))
+    return entries
+
+
 # ================================================================== tsumugi
 @dataclass
 class TsumugiSetup:
@@ -140,8 +190,10 @@ class Engine:
         tsumugi: TsumugiSetup | None = None,
         sheetsage_model: str | None = None,
         frames_pca: Path | None = None,
+        score_models: list[ModelEntry] | None = None,
     ) -> None:
         self.models = models
+        self.score_models = score_models or []
         self.device_name = device
         self.tsumugi = tsumugi
         self.sheetsage_model = sheetsage_model  # None なら sheetsage2_refined の既定 (Hugging Face)
@@ -177,6 +229,16 @@ class Engine:
                 return entry
         raise ValueError(f"モデルがありません: {model_id}")
 
+    def score_entry(self, model_id: str | None) -> ModelEntry:
+        if not self.score_models:
+            raise ValueError("楽譜化のモデルがありません (--hub-repo / --checkpoints-dir を確かめてください)")
+        if model_id is None:
+            return self.score_models[0]
+        for entry in self.score_models:
+            if entry.id == model_id:
+                return entry
+        raise ValueError(f"楽譜化のモデルがありません: {model_id}")
+
     def model(self, entry: ModelEntry, log: Callable[[str], None] = print):
         if self._model_id == entry.id:
             return self._model
@@ -189,8 +251,20 @@ class Engine:
         entry.num_channels = self._model.decoder.config.num_channels
         return self._model
 
+    def score_model(self, entry: ModelEntry, log: Callable[[str], None] = print):
+        """楽譜化のモデル (model, tokenizer, banned)。カバーモデルを持っていれば手放してから読む"""
+        if self._model_id == entry.id:
+            return self._model
+        self.unload()
+        from piano_perf2score.hub import load_perf2score
+
+        log(f"楽譜化のモデルを読んでいます: {entry.label}")
+        self._model = load_perf2score(entry.spec, device=self.device)
+        self._model_id = entry.id
+        return self._model
+
     def unload(self) -> None:
-        """モデルを手放して VRAM を空ける (採譜の前・UI のボタン)"""
+        """モデル (カバーか楽譜化) を手放して VRAM を空ける (採譜の前・UI のボタン)"""
         if self._model is None:
             return
         self._model = None
@@ -424,6 +498,50 @@ class Engine:
                 metadata_copied=metadata_copied,
             )
 
+    # ------------------------------------------------------------ 楽譜化
+    def score(
+        self,
+        project: Project,
+        take_id: str,
+        progress: Callable[[float, str], None],
+        should_stop: Callable[[], bool],
+        log: Callable[[str], None],
+    ) -> int:
+        """テイクのカバーを楽譜 (takes/<id>/score.musicxml) にし、小節の数を返す。モデルは take.json の score.model。
+        拍は原曲の音声の SheetSage2-Refined の拍 (V2 のカバーを作ったときのもの)、コード記号は原曲の MIDI のコードマーカー"""
+        from piano_perf2score.generate import score_from_cover
+        from piano_score.musicxml import write_musicxml
+
+        with self._lock:
+            take = project.take(take_id)
+            entry = self.score_entry(take["score"]["model"]["id"])
+            midi = project.take_midi(take_id)
+            if not midi.is_file():
+                raise FileNotFoundError("このテイクはまだ生成していません")
+            if project.audio_path is None and not (project.dir / "sheetsage.json").is_file():
+                raise FileNotFoundError("楽譜にするには原曲の拍が要ります。音源のあるプロジェクトで使ってください")
+            annotation = json.loads(self._sheetsage(project, progress, log).read_text(encoding="utf-8"))
+            progress(0.0, "loading")
+            model, tokenizer, banned = self.score_model(entry, log)
+
+            def on_measure(done: int, total: int) -> None:
+                if should_stop():
+                    raise Cancelled()
+                progress(done / max(total, 1), f"bars:{done}/{total}")
+
+            log(f"楽譜にしています: {take_id}")
+            chords = project.source_path if project.has_source else None
+            measures = score_from_cover(
+                model, tokenizer, midi, annotation, chords, banned=banned, on_measure=on_measure
+            )
+        name = take.get("name") or f"#{take['number']}"
+        out = project.take_dir(take_id) / "score.musicxml"
+        tmp = out.with_suffix(".tmp")
+        write_musicxml(measures, tmp, title=f"{project.data['title']} {name}")
+        tmp.replace(out)
+        log(f"{len(measures)} 小節")
+        return len(measures)
+
     # ------------------------------------------------------------ 採譜
     def transcribe(
         self,
@@ -512,6 +630,7 @@ class Engine:
     def describe(self) -> dict:
         return {
             "models": [asdict(m) for m in self.models],
+            "score_models": [asdict(m) for m in self.score_models],
             "loaded": self._model_id,
             "device": str(self.device),
             "tsumugi": self.tsumugi is not None,
