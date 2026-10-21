@@ -45,7 +45,7 @@ from .beat_tempo import apply_bar_tempos
 from .chords import place_chords, read_chord_markers
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
-from .playability import make_playable
+from .playability import make_playable, remove_unisons
 from .render import Performance, measure_qpm, render
 from .staves import readable_staves
 from .tidy import tidy_score
@@ -572,6 +572,7 @@ def main() -> None:
         print(tidied)
         if not args.no_playable:
             print(make_playable(measures))
+            print(f"両手で重なる同じ音 {remove_unisons(measures)} 個を消した")
         print(readable_staves(measures))
         apply_bar_tempos(measures, performance, tidied.rests)
         if performance.chords:

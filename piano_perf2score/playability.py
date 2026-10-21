@@ -9,6 +9,7 @@ V2 のカバーには、片手では届かない広い和音 (10 度を超える
        (移した先も片手で弾けるときだけ)
     3. それでも無理なら、上の段は下から、下の段は上から音を消す (上の段の一番上 = メロディと、下の段の一番下 = 低音は残す)
 タイでつながる音 (タイの始まり・続き) は、つながりを壊さないよう動かさない。
+両手 (と同じ段の別の声部) で同じ鍵盤を同時に鳴らす音は、旋律の一番上の音と低音を残して消す (remove_unisons)。
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from piano_score.musicxml import _tie_stops
-from piano_score.score import Measure
+from piano_score.score import Group, Measure, Note
+
+from .tidy import _drop_dangling_ties
 
 MAX_SPAN = 14  # 片手で届く広さ (半音、10 度の長 10 度まで)
 MAX_NOTES = 5
@@ -102,3 +105,34 @@ def make_playable(measures: list[Measure]) -> PlayableStats:
                     else:
                         stats.dropped += 1
     return stats
+
+
+def _keep_rank(g: Group, note: Note) -> int:
+    """同じ鍵盤が重なったときに残す順位: 旋律の一番上 > 低音 (下の段の声部 1 の一番下) > 上の段 > 下の段"""
+    if (g.staff, g.voice) == (1, 1) and note.pitch == max(n.pitch for n in g.notes):
+        return 3
+    if (g.staff, g.voice) == (2, 1) and note.pitch == min(n.pitch for n in g.notes):
+        return 2
+    return 1 if g.staff == 1 else 0
+
+
+def remove_unisons(measures: list[Measure]) -> int:
+    """別の声部 (両手や上の段の内声) で同じ鍵盤が同時に鳴る音を、残す順位の低いほうから消す。消してつながらなくなった
+    タイも消す。消した音の数を返す"""
+    removed = 0
+    for m in measures:
+        groups = [g for g in m.groups if g.duration.grace is None]
+        for g in groups:
+            for note in list(g.notes):
+                for h in groups:
+                    if h is g or (h.staff, h.voice) == (g.staff, g.voice) or not (h.onset < g.end and g.onset < h.end):
+                        continue
+                    other = next((n for n in h.notes if n.pitch == note.pitch), None)
+                    if other is None or note not in g.notes:
+                        continue
+                    loser, owner = (note, g) if _keep_rank(g, note) < _keep_rank(h, other) else (other, h)
+                    owner.notes.remove(loser)
+                    removed += 1
+        m.groups = [g for g in m.groups if g.notes]
+    _drop_dangling_ties(measures)
+    return removed

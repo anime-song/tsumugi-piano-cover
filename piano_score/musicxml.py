@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import bisect
 import copy
 import math
 import re
@@ -845,8 +846,39 @@ def _beam_levels(duration: Duration) -> int:
     return {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4, "128th": 5}.get(duration.type, 0)
 
 
-def _set_beams(items: list[_Item], time_signature: tuple[int, int]) -> None:
-    span = _beat_span(time_signature)
+def _groupings(beats: int) -> list[tuple[int, ...]]:
+    """8 分音符 beats 個を 2 と 3 のまとまりに分ける並び (7 なら 2+2+3・2+3+2・3+2+2)"""
+    if beats == 0:
+        return [()]
+    return [(g, *rest) for g in (2, 3) if g <= beats for rest in _groupings(beats - g)]
+
+
+def beam_starts(measure: Measure) -> list[Fraction]:
+    """連桁でまとめる範囲の頭の位置 (と小節の終わり)。5/8・7/8 のような 3 の倍数でない x/8 は、8 分音符を 2 と 3 の
+    まとまりに分ける並びのうち、まとまりの頭に低音 (下の段の低い音) があり、まとまりをまたぐ音が少ないものを選ぶ
+    (同点なら長いまとまりを後ろに置く並び。7/8 なら 2+2+3)。それ以外は拍子で決まる幅 (_beat_span) で区切る"""
+    beats, beat_type = measure.time_signature
+    if beat_type == 8 and beats % 3 != 0 and beats >= 5 and measure.length == measure.nominal_length:
+        groups = [g for g in measure.groups if g.duration.grace is None]
+        lower = [n.pitch for g in groups if g.staff == 2 for n in g.notes]
+        low = min(lower) + 7 if lower else -1
+        onsets = {g.onset for g in groups}
+        bass = {g.onset for g in groups if g.staff == 2 and min(n.pitch for n in g.notes) <= low}
+
+        def score(grouping: tuple[int, ...]) -> tuple:
+            starts = [sum((Fraction(n, 2) for n in grouping[:i]), Fraction(0)) for i in range(len(grouping))]
+            heads = sum((t in bass) + 0.5 * (t in onsets) for t in starts)
+            crossing = sum(any(g.onset < t < g.end for t in starts[1:]) for g in groups)
+            return heads - crossing, tuple(sorted(grouping)) == grouping
+
+        best = max(_groupings(beats), key=score)
+        return [sum((Fraction(n, 2) for n in best[:i]), Fraction(0)) for i in range(len(best) + 1)]
+    span = _beat_span(measure.time_signature)
+    count = math.ceil(measure.length / span)
+    return [min(span * i, measure.length) for i in range(count + 1)]
+
+
+def _set_beams(items: list[_Item], starts: list[Fraction]) -> None:
     runs: list[list[_Item]] = []
     run: list[_Item] = []
     for item in items:
@@ -856,9 +888,10 @@ def _set_beams(items: list[_Item], time_signature: tuple[int, int]) -> None:
             and item.duration.tuplet != TREMOLO_PAIR
             and _beam_levels(item.duration) > 0
         )
-        window = item.onset // span
-        same_window = beamable and (item.onset + item.quarters) <= (window + 1) * span
-        if run and (not same_window or run[-1].onset // span != window):
+        window = bisect.bisect_right(starts, item.onset) - 1
+        end = starts[window + 1] if window + 1 < len(starts) else item.onset + item.quarters
+        same_window = beamable and (item.onset + item.quarters) <= end
+        if run and (not same_window or bisect.bisect_right(starts, run[-1].onset) - 1 != window):
             runs.append(run)
             run = []
         if same_window:
@@ -952,7 +985,7 @@ def _voice_items(measure: Measure) -> dict[tuple[int, int], list[_Item]]:
             for rest in rests:
                 rest.hidden = hide
             items += rests
-        _set_beams(items, measure.time_signature)
+        _set_beams(items, beam_starts(measure))
         _set_tuplets(items)
         _set_tremolos(items)
         result[voice] = items
