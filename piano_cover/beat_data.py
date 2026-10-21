@@ -351,26 +351,33 @@ class BeatCoverDataset(Dataset):
         return item
 
     def plan_target(self, quantized, grid: BeatGrid, position: np.ndarray, source_grid: BeatGrid, S: int) -> np.ndarray:
-        """原曲の小節ごとの、カバーの強さと音の多さ (1 拍あたりの音の数の log) をカバーの中で標準化したもの [S, 2]
-        (piano_cover.data.plan_target の小節版)。カバーが弾いていない小節と、強さを測れない小節は NaN"""
-        out = np.full((S, 2), np.nan, dtype=np.float32)
-        note = quantized.kind == KIND_NOTE
-        if note.sum() < 10:
-            return out
-        beats = quantized.tick[note] / self.tokenizer.ticks_per_beat
-        source_beats = np.interp(beats, np.arange(len(position)), position)
-        bar = np.searchsorted(source_grid.bar_starts[: S + 1], source_beats, side="right") - 1
-        inside_note = (bar >= 0) & (bar < S)
-        bar, velocity = bar[inside_note], quantized.velocity[note][inside_note].astype(np.float64)
-        count = np.bincount(bar, minlength=S).astype(np.float64)
-        mean = np.bincount(bar, weights=velocity, minlength=S) / np.maximum(count, 1)
-        lo, hi = (int(bar.min()) + 1, int(bar.max())) if len(bar) else (0, 0)
-        inside = np.zeros(S, dtype=bool)
-        inside[max(lo, 0) : max(hi, 0)] = True
-        loud = inside & (count >= DYNAMICS_MIN_NOTES)
-        if loud.sum() >= 5 and mean[loud].std() > 0:
-            out[loud, 0] = (mean[loud] - mean[loud].mean()) / mean[loud].std()
-        density = np.log1p(count / np.maximum(source_grid.bar_beats[:S], 1))[inside]
-        if inside.sum() >= 5 and density.std() > 0:
-            out[inside, 1] = (density - density.mean()) / density.std()
+        return bar_plan_target(quantized, self.tokenizer, position, source_grid, S)
+
+
+def bar_plan_target(
+    quantized, tokenizer: BeatTokenizer, position: np.ndarray, source_grid: BeatGrid, S: int
+) -> np.ndarray:
+    """原曲の小節ごとの、カバーの強さと音の多さ (1 拍あたりの音の数の log) をカバーの中で標準化したもの [S, 2]
+    (piano_cover.data.plan_target の小節版)。position はカバーの拍ごとの原曲の拍の番号。カバーが弾いていない小節と、
+    強さを測れない小節は NaN"""
+    out = np.full((S, 2), np.nan, dtype=np.float32)
+    note = quantized.kind == KIND_NOTE
+    if note.sum() < 10:
         return out
+    beats = quantized.tick[note] / tokenizer.ticks_per_beat
+    source_beats = np.interp(beats, np.arange(len(position)), position)
+    bar = np.searchsorted(source_grid.bar_starts[: S + 1], source_beats, side="right") - 1
+    inside_note = (bar >= 0) & (bar < S)
+    bar, velocity = bar[inside_note], quantized.velocity[note][inside_note].astype(np.float64)
+    count = np.bincount(bar, minlength=S).astype(np.float64)
+    mean = np.bincount(bar, weights=velocity, minlength=S) / np.maximum(count, 1)
+    lo, hi = (int(bar.min()) + 1, int(bar.max())) if len(bar) else (0, 0)
+    inside = np.zeros(S, dtype=bool)
+    inside[max(lo, 0) : max(hi, 0)] = True
+    loud = inside & (count >= DYNAMICS_MIN_NOTES)
+    if loud.sum() >= 5 and mean[loud].std() > 0:
+        out[loud, 0] = (mean[loud] - mean[loud].mean()) / mean[loud].std()
+    density = np.log1p(count / np.maximum(source_grid.bar_beats[:S], 1))[inside]
+    if inside.sum() >= 5 and density.std() > 0:
+        out[inside, 1] = (density - density.mean()) / density.std()
+    return out

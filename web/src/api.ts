@@ -15,6 +15,8 @@ export type Params = {
   span: number;
   arrangement: boolean;
   seconds: number | null;
+  // 好みのベクトル (Style) の id。あれば演奏者の番号 (channel) の代わりに使う
+  style: string | null;
 };
 
 export type ModelEntry = {
@@ -27,7 +29,7 @@ export type ModelEntry = {
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
-export const API_VERSION = 3;
+export const API_VERSION = 4;
 
 export type Config = {
   models: ModelEntry[];
@@ -126,6 +128,42 @@ export type SourceView = {
 export type CoverNote = [number, number, number, number, number];
 export type CoverView = { duration: number; notes: CoverNote[]; pedals: [number, number][] };
 
+// お気に入りから学習した好みのベクトル (cover_studio/styles.py)。学習したモデルでだけ使える
+export type Style = {
+  id: string;
+  name: string;
+  created: string;
+  state: "queued" | "running" | "done" | "error" | "cancelled";
+  error: string | null;
+  model: { id: string; label: string };
+  takes: { project: string; take: string }[];
+  init: number[];
+  used?: number;
+  loss_before?: number;
+  loss_after?: number;
+  distance?: number;
+  trained?: string;
+  job?: string;
+  progress?: number | null;
+  message?: string;
+  log?: string[];
+};
+
+// 全曲のお気に入り (学習に使う候補)
+export type FavoriteTake = {
+  project: string;
+  title: string;
+  take: string;
+  number: number;
+  name: string;
+  model: string;
+  channel: number;
+  style: string | null;
+  audio: boolean;
+};
+
+export type StylesData = { styles: Style[]; favorites: FavoriteTake[] };
+
 export type LiveStem = { stem: string; duration: number; pos: number; done: boolean };
 // 今の段階の進み具合 (ステム分離の "分離し終えた塊 / 全体の塊")
 export type LiveProgress = { done: number; total: number };
@@ -204,6 +242,10 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, `${res.status} ${res.statusText}`);
     return res.text();
   },
+  styles: () => request<StylesData>("/api/styles"),
+  createStyle: (body: { name: string; model: string | null }) => request<Style>("/api/styles", json("POST", body)),
+  renameStyle: (sid: string, name: string) => request<Style>(`/api/styles/${sid}`, json("PATCH", { name })),
+  deleteStyle: (sid: string) => request<void>(`/api/styles/${sid}`, { method: "DELETE" }),
   cancelJob: (jobId: string) => request<unknown>(`/api/jobs/${jobId}`, { method: "DELETE" }),
 };
 

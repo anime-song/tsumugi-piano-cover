@@ -180,6 +180,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
     run(async () => {
       await api.updateTake(pid, take.id, body);
       refresh();
+      // お気に入りの数は好みの学習の欄に出る
+      if (body.favorite !== undefined) void qc.invalidateQueries({ queryKey: ["styles"] });
     });
   const deleteTake = (take: Take) =>
     run(async () => {
@@ -187,6 +189,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
       await api.deleteTake(pid, take.id);
       if (selected === take.id) setSelected(null);
       refresh();
+      if (take.favorite) void qc.invalidateQueries({ queryKey: ["styles"] });
     });
   const reuse = (take: Take) => {
     setDraft({ ...draft, params: { ...config.defaults, ...take.params }, model: take.model.id, seed: take.seed });

@@ -4,7 +4,7 @@ import type { useT } from "./i18n";
 
 type Dict = ReturnType<typeof useT>;
 
-export type NumberKey = Exclude<keyof Params, "arrangement" | "seconds" | "channel">;
+export type NumberKey = Exclude<keyof Params, "arrangement" | "seconds" | "channel" | "style">;
 
 export type SliderDef = { key: NumberKey; min: number; max: number; step: number };
 
@@ -55,12 +55,19 @@ export function formatValue(value: number, step: number): string {
   return value.toFixed(digits);
 }
 
+/** 演奏者の欄の表示 (好みを使ったテイクは好みの名前。消した好みなら styleName が null を返す) */
+export function performerText(params: Params, t: Dict, styleName: (id: string) => string | null): string {
+  if (params.style) return t.chipStyle(styleName(params.style) ?? t.deletedStyle);
+  return params.channel ? `#${params.channel}` : t.notSpecified;
+}
+
 /** 既定値から変えた項目 (テイクの一覧に出す) */
-export function diffChips(params: Params, defaults: Params, t: Dict): string[] {
+export function diffChips(params: Params, defaults: Params, t: Dict, styleName: (id: string) => string | null): string[] {
   const chips: string[] = [];
-  if (params.channel) chips.push(t.chipPerformer(params.channel));
+  if (params.style) chips.push(t.chipStyle(styleName(params.style) ?? t.deletedStyle));
+  else if (params.channel) chips.push(t.chipPerformer(params.channel));
   for (const def of ALL_SLIDERS) {
-    if (def.key === "channel_cfg" && !params.channel) continue;
+    if (def.key === "channel_cfg" && !params.channel && !params.style) continue;
     if (!params.arrangement && ["fill", "above", "span"].includes(def.key)) continue;
     const value = params[def.key];
     if (Math.abs(value - defaults[def.key]) > 1e-9) chips.push(`${t.params[def.key].short} ${formatValue(value, def.step)}`);

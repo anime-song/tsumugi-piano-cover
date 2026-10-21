@@ -90,7 +90,7 @@ class LiveTranscription:
 @dataclass
 class Job:
     id: str
-    kind: str  # transcribe | generate | score
+    kind: str  # transcribe | generate | score | style (style は曲に属さないので project が "")
     project: str
     takes: list[str] = field(default_factory=list)
     state: str = "queued"  # queued | running | done | error | cancelled

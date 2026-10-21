@@ -531,8 +531,11 @@ class CoverModel(nn.Module):
     # ------------------------------------------------------------------
     # 学習
     # ------------------------------------------------------------------
-    def forward(self, batch: dict[str, Tensor], num_length_buckets: int = 8) -> dict[str, Tensor]:
-        """num_length_buckets=0 ならパッキング (デコーダの要約・Local と原曲のパッチエンコーダ、Local の cross-attention)"""
+    def forward(
+        self, batch: dict[str, Tensor], num_length_buckets: int = 8, channel_grad: bool = False
+    ) -> dict[str, Tensor]:
+        """num_length_buckets=0 ならパッキング (デコーダの要約・Local と原曲のパッチエンコーダ、Local の cross-attention)。
+        channel_grad なら Planner の損失を演奏者の埋め込みにも流す (好みのベクトルの学習、piano_cover.style)"""
         F_ = self.patch_frames
         if num_length_buckets == 0 and self.training and self.decoder.config.dropout > 0 and not flash_varlen_available():
             # memory-efficient attention の可変長版は dropout のマスクが正しくない (piano_ar.model.Block.forward)
@@ -563,7 +566,7 @@ class CoverModel(nn.Module):
         condition = _TrainingCondition(self, memory, batch, centers, song_of)
         output = self.decoder(batch, num_length_buckets, condition)
         if self.planner is not None and "plan_target" in batch:
-            predicted = self.plan(memory, batch["channel"])
+            predicted = self.plan(memory, batch["channel"], detach_channel=not channel_grad)
             target = batch["plan_target"]
             # 原曲のない batch や編曲の性質を付けない検証では正解の列が少ないので、足りない列は測れない (NaN) とする
             target = F.pad(target, (0, predicted.shape[-1] - target.shape[-1]), value=float("nan"))
@@ -615,17 +618,19 @@ class CoverModel(nn.Module):
             index[:, 2:][~torch.from_numpy(known[:num_patches, :extra]).to(index.device)] = 0
         return index
 
-    def plan(self, memory: SourceMemory, channel: Tensor) -> Tensor:
+    def plan(self, memory: SourceMemory, channel: Tensor, detach_channel: bool = True) -> Tensor:
         """パッチごとの強弱と音の多さ (カバーの中で標準化した値) と編曲の性質の曲線 [B, S, C] を予測する。
 
         Planner の入力 (原曲エンコーダの出力と演奏者の埋め込み) は detach して、Planner の損失を原曲エンコーダと
         デコーダに流さない。正解の大半は原曲から予測できない成分 (同じ曲の他のカバーの平均でも 0.76) なので、
-        流すと原曲エンコーダがカバーごとの曲線を覚える方向に引っ張られる。原曲エンコーダはデコーダの損失だけで学習する"""
+        流すと原曲エンコーダがカバーごとの曲線を覚える方向に引っ張られる。原曲エンコーダはデコーダの損失だけで学習する。
+        detach_channel=False なら演奏者の埋め込みには流す (piano_cover.style の好みのベクトル)"""
         B = memory.song.shape[0]
         K = self.config.source_latents
         song = memory.song.detach().reshape(B, -1, K * memory.song.shape[-1])
         valid = memory.song_valid.reshape(B, -1, K)[..., 0]
-        return self.planner(song, self.decoder.channel_embedding(channel).detach(), valid)
+        channel = self.decoder.channel_embedding(channel)
+        return self.planner(song, channel.detach() if detach_channel else channel, valid)
 
 
 class _TrainingCondition:

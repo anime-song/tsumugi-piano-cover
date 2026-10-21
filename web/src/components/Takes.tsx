@@ -2,9 +2,10 @@
 import { useEffect, useState } from "react";
 import type { Config, Params, Take } from "../api";
 import { progressText, useT } from "../i18n";
-import { ALL_SLIDERS, diffChips, formatTime, formatValue } from "../params";
+import { ALL_SLIDERS, diffChips, formatTime, formatValue, performerText } from "../params";
 import { takeLabel } from "./CreatePanel";
 import { Icon } from "./Icon";
+import { useStyleName } from "./StyleSection";
 
 type CardProps = {
   take: Take;
@@ -32,7 +33,8 @@ export function TakeCard(props: CardProps) {
   const { take } = props;
   const t = useT();
   const active = take.state === "queued" || take.state === "running";
-  const chips = diffChips(take.params, props.defaults, t);
+  const styleName = useStyleName();
+  const chips = diffChips(take.params, props.defaults, t, styleName);
   return (
     <div
       className={`take ${props.selected ? "selected" : ""} ${take.state}`}
@@ -237,6 +239,7 @@ export function TakeDetail(props: DetailProps) {
     setMemo(take.memo);
   }, [take.id, take.name, take.memo]);
   const defaults = config.defaults;
+  const styleName = useStyleName();
   const done = take.state === "done";
 
   return (
@@ -308,15 +311,15 @@ export function TakeDetail(props: DetailProps) {
             <th>{t.length}</th>
             <td>{take.params.seconds == null ? t.fullLength : t.chipSeconds(take.params.seconds)}</td>
           </tr>
-          <tr className={take.params.channel ? "changed" : ""}>
+          <tr className={take.params.channel || take.params.style ? "changed" : ""}>
             <th>{t.performer}</th>
-            <td>{take.params.channel ? `#${take.params.channel}` : t.notSpecified}</td>
+            <td>{performerText(take.params, t, styleName)}</td>
           </tr>
           {ALL_SLIDERS.map((def) => {
             const value = take.params[def.key];
             const changed = Math.abs(value - defaults[def.key]) > 1e-9;
             const off =
-              (def.key === "channel_cfg" && !take.params.channel) ||
+              (def.key === "channel_cfg" && !take.params.channel && !take.params.style) ||
               (!take.params.arrangement && ["fill", "above", "span"].includes(def.key));
             return (
               <tr key={def.key} className={`${changed ? "changed" : ""} ${off ? "off" : ""}`}>

@@ -4,6 +4,7 @@
   プロジェクト : GET/POST /api/projects、GET/PATCH/DELETE /api/projects/{pid}
   原曲         : POST …/transcribe、PUT …/source (手元の MIDI)、GET …/audio、…/source.mid、…/source/view
   テイク       : POST …/takes (生成)、PATCH/DELETE …/takes/{tid}、GET …/takes/{tid}/cover.mid、…/view
+  好み         : GET/POST /api/styles (お気に入りから学習)、PATCH/DELETE /api/styles/{sid}
   ジョブ       : GET /api/jobs、DELETE /api/jobs/{id} (取り消し・停止)
 
 {pid} はプロジェクトのフォルダ名。web/ のビルド (cover_studio/static) があれば / で配る。
@@ -28,12 +29,13 @@ from pydantic import BaseModel, Field
 from .engine import Engine
 from .jobs import Job, LiveTranscription, Runner
 from .project import Project, now, projects, safe_name
+from .styles import StyleStore
 from .web import STATIC_DIR
 
 log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
-API_VERSION = 3
+API_VERSION = 4
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 # 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
@@ -43,9 +45,11 @@ STUDIO_DEFAULTS = {"onset_bias": 4.0, "dynamics": 1.0, "fill": 0.0, "span": 0.0,
 
 
 def studio_params(values: dict | None = None) -> dict:
+    """生成の設定。style は好みのベクトルの id (Cover Studio だけのもの。あれば演奏者の番号の代わりに使う)"""
     from piano_cover.generate import CoverParams
 
-    return asdict(CoverParams.from_dict({**STUDIO_DEFAULTS, **(values or {})}))
+    values = values or {}
+    return {**asdict(CoverParams.from_dict({**STUDIO_DEFAULTS, **values})), "style": values.get("style") or None}
 
 
 class ContinueFrom(BaseModel):
@@ -69,6 +73,15 @@ class ScoreIn(BaseModel):
     model: str | None = None
 
 
+class StyleIn(BaseModel):
+    name: str = ""
+    model: str | None = None
+
+
+class StylePatch(BaseModel):
+    name: str
+
+
 class TakePatch(BaseModel):
     name: str | None = None
     favorite: bool | None = None
@@ -80,6 +93,8 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     root.mkdir(parents=True, exist_ok=True)
     for p in projects(root):
         p.recover()
+    styles = StyleStore(root)
+    styles.recover()
 
     def open_project(pid: str) -> Project:
         d = root / pid
@@ -89,11 +104,25 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     # ------------------------------------------------------------ ジョブの中身
     def handle(job: Job) -> None:
-        p = open_project(job.project)
-
         def progress(value: float | None, message: str) -> None:
             job.progress, job.message = value, message
 
+        if job.kind == "style":  # 曲に属さないジョブ。takes[0] が好みの id
+            style = styles.update(job.takes[0], state="running", error=None)
+            favorites = []
+            for ref in style["takes"]:
+                try:
+                    project = open_project(ref["project"])
+                    favorites.append((project, project.take(ref["take"])))
+                except (HTTPException, KeyError):
+                    job.add_log(f"見つからないので外します: {ref['project']} {ref['take']}")
+            result = engine.train_style(
+                style["model"]["id"], favorites, style["init"], progress, job._stop.is_set, job.add_log
+            )
+            styles.update(job.takes[0], state="done", trained=now(), **result)
+            return
+
+        p = open_project(job.project)
         if job.kind == "transcribe":
             p.update(transcribe={"state": "running", "error": None})
             live = job._live = LiveTranscription()
@@ -111,9 +140,27 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
                 take_id, score={**p.take(take_id)["score"], "state": "done", "measures": measures, "created": now()}
             )
         else:
-            engine.generate(p, job.takes, progress, job._stop.is_set, job.add_log)
+            style = p.take(job.takes[0])["params"].get("style")
+            vector = None
+            if style:
+                try:
+                    vector = styles.get(style).get("vector")
+                except KeyError:
+                    vector = None
+                if vector is None:
+                    raise ValueError("好みのベクトルが見つかりません (消したか、まだ学習が終わっていません)")
+            engine.generate(p, job.takes, progress, job._stop.is_set, job.add_log, style=vector)
 
     def on_end(job: Job) -> None:
+        if job.kind == "style":
+            try:
+                style = styles.get(job.takes[0])
+            except KeyError:
+                return  # 消された
+            if style["state"] in ("queued", "running"):
+                state = "cancelled" if job.state == "cancelled" else "error"
+                styles.update(style["id"], state=state, error=job.error)
+            return
         try:
             p = open_project(job.project)
         except HTTPException:
@@ -353,6 +400,17 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             if source_take["state"] != "done":
                 raise HTTPException(400, "生成が終わったテイクからだけ続きを作れます")
         params = studio_params(body.params)
+        if params["style"]:
+            try:
+                style = styles.get(params["style"])
+            except KeyError as e:
+                raise HTTPException(400, "好みが見つかりません (消したかもしれません)") from e
+            if style["state"] != "done":
+                raise HTTPException(400, "この好みはまだ学習が終わっていません")
+            if style["model"]["id"] != entry.id:
+                raise HTTPException(
+                    400, f"この好みは {style['model']['label']} で学習したものです。同じモデルで使ってください"
+                )
         record = {
             "params": params,
             "model": {"id": entry.id, "label": entry.label},
@@ -458,6 +516,87 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         if not path.is_file():
             raise HTTPException(404, "まだ生成していません")
         return cover_view(path)
+
+    # ------------------------------------------------------------ 好み
+    def style_view(style: dict) -> dict:
+        """一覧に返す形 (ベクトルは除き、学習中なら進み具合を付ける)"""
+        view = {k: v for k, v in style.items() if k != "vector"}
+        job = next((j for j in runner.jobs("") if j.kind == "style" and j.takes[0] == style["id"]), None)
+        if job is not None and job.active:
+            view.update(job=job.id, state=job.state, progress=job.progress, message=job.message)
+        if job is not None:
+            view["log"] = job.log[-40:]
+        return view
+
+    def favorite_takes() -> list[dict]:
+        out = []
+        for p in projects(root):
+            for take in p.takes():
+                if take.get("favorite") and take["state"] == "done":
+                    out.append(
+                        {
+                            "project": p.id,
+                            "title": p.data["title"],
+                            "take": take["id"],
+                            "number": take["number"],
+                            "name": take["name"],
+                            "model": take["model"]["id"],
+                            "channel": int(take["params"].get("channel") or 0),
+                            "style": take["params"].get("style"),
+                            "audio": p.audio_path is not None,
+                        }
+                    )
+        return out
+
+    @app.get("/api/styles")
+    def list_styles():
+        return {"styles": [style_view(s) for s in styles.list()], "favorites": favorite_takes()}
+
+    @app.post("/api/styles")
+    def create_style(body: StyleIn):
+        """今のお気に入り (全曲の、音源のある曲のもの) から、好みのベクトルを学習するジョブを始める"""
+        try:
+            entry = engine.entry(body.model)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        favorites = [f for f in favorite_takes() if f["audio"]]
+        if not favorites:
+            raise HTTPException(400, "音源のある曲のお気に入りがありません")
+        # 初期値: このモデルで作ったお気に入りの演奏者 (なければ全部のお気に入りの演奏者) の埋め込みの平均。
+        # 好みで作ったテイクの演奏者の番号は意味がないので数えない
+        numbered = [f for f in favorites if not f["style"]]
+        init = [f["channel"] for f in numbered if f["model"] == entry.id] or [f["channel"] for f in numbered] or [0]
+        if entry.num_channels:
+            init = [c if c < entry.num_channels else 0 for c in init]
+        name = body.name.strip() or f"好み {len(styles.list()) + 1}"
+        style = styles.create(
+            name,
+            {"id": entry.id, "label": entry.label},
+            [{"project": f["project"], "take": f["take"]} for f in favorites],
+            init,
+        )
+        runner.submit("style", "", [style["id"]])
+        return style_view(style)
+
+    def find_style(sid: str) -> dict:
+        try:
+            return styles.get(sid)
+        except KeyError as e:
+            raise HTTPException(404, f"好みがありません: {sid}") from e
+
+    @app.patch("/api/styles/{sid}")
+    def rename_style(sid: str, body: StylePatch):
+        find_style(sid)
+        if not body.name.strip():
+            raise HTTPException(400, "名前が空です")
+        return style_view(styles.update(sid, name=body.name.strip()))
+
+    @app.delete("/api/styles/{sid}", status_code=204)
+    def delete_style(sid: str):
+        find_style(sid)
+        if any(j.kind == "style" and j.takes[0] == sid for j in runner.active_for("")):
+            raise HTTPException(409, "学習中・待ちの好みは先に止めてください")
+        styles.delete(sid)
 
     # ------------------------------------------------------------ ジョブ
     @app.get("/api/jobs")

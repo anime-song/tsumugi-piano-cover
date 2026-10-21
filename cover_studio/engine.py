@@ -5,6 +5,9 @@
   checkpoint 学習のチェックポイント (既定 checkpoints/**/best.pt。隣に planner*.pt があれば差し替えた版も)
   hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPOS の V2・V1。初回にダウンロードする)。一覧の先頭 (既定) は V2
 
+好みのベクトル (piano_cover.style) は、カバーモデルの演奏者の埋め込みの表の後ろに 1 行足して入れる。学習 (train_style) は
+お気に入りのカバーから、生成 (generate の style) はその行を演奏者として使う。
+
 楽譜化のモデル (find_score_models、テイクを楽譜 (MusicXML) にする piano_perf2score) も同じ 3 種類から探す。
 Hugging Face の重みは V2 の repository の piano_perf2score/ (V1 にはない)。カバーモデルと楽譜化のモデルは
 VRAM を空けるため同時には持たず、使う方を読み直す。
@@ -244,11 +247,13 @@ class Engine:
             return self._model
         self.unload()
         from piano_cover.hub import load_cover
+        from piano_cover.style import style_slot
 
         log(f"モデルを読んでいます: {entry.label}")
         self._model = load_cover(entry.spec, planner=entry.planner, device=self.device)
         self._model_id = entry.id
         entry.num_channels = self._model.decoder.config.num_channels
+        style_slot(self._model)  # 好みのベクトルを入れる行
         return self._model
 
     def score_model(self, entry: ModelEntry, log: Callable[[str], None] = print):
@@ -409,8 +414,10 @@ class Engine:
         progress: Callable[[float, str], None],
         should_stop: Callable[[], bool],
         log: Callable[[str], None],
+        style: list[float] | None = None,
     ) -> None:
-        """take.json (Project.new_takes で作ったもの) の設定で、take_ids の本数を一度に生成して書き込む"""
+        """take.json (Project.new_takes で作ったもの) の設定で、take_ids の本数を一度に生成して書き込む。
+        style (好みのベクトル) を渡すと、演奏者の番号の代わりにそれを使う"""
         import torch
 
         from piano_ar.evaluation import events_end_frame
@@ -424,7 +431,11 @@ class Engine:
             progress(0.0, "loading")  # 画面が言語に合わせて訳す (web/src/i18n.ts の progressText)
             model = self.model(entry, log)
             params = CoverParams.from_dict(first["params"])
-            if params.channel and entry.num_channels and params.channel >= entry.num_channels:
+            if style is not None:
+                from piano_cover.style import set_style
+
+                params.channel = set_style(model, style)
+            elif params.channel and entry.num_channels and params.channel >= entry.num_channels:
                 raise ValueError(f"演奏者の番号は 1〜{entry.num_channels - 1} です")
             source = self._source(project, model, progress, log)
             tokenizer = model.tokenizer
@@ -497,6 +508,79 @@ class Engine:
                 source_beats=source_beats,
                 metadata_copied=metadata_copied,
             )
+
+    # ------------------------------------------------------------ 好みの学習
+    def train_style(
+        self,
+        model_id: str,
+        favorites: list[tuple[Project, dict]],
+        init: list[int],
+        progress: Callable[[float, str], None],
+        should_stop: Callable[[], bool],
+        log: Callable[[str], None],
+    ) -> dict:
+        """favorites (お気に入りのテイク) から好みのベクトルを学習する (piano_cover.style)。init の演奏者の埋め込みの平均から始める。
+        原曲が作り直されたテイクと、音源のない曲 (原曲の拍とメロディを作れない) は使わない。結果を dict で返す"""
+        import torch
+
+        from piano_ar.beat_tokenizer import BeatTokenizer
+        from piano_ar.config import TokenizerConfig
+        from piano_ar.tokenizer import PianoTokenizer
+        from piano_cover.style import StyleExample, StyleSettings, style_slot, train_style
+
+        with self._lock:
+            entry = self.entry(model_id)
+            progress(0.0, "loading")
+            model = self.model(entry, log)
+            if not isinstance(model.tokenizer, BeatTokenizer):
+                raise ValueError("好みの学習は拍のトークンのモデル (V2 以降) だけで使えます")
+            reader = PianoTokenizer(TokenizerConfig(frame_rate=model.tokenizer.config.frame_rate))
+            examples = []
+            for i, (project, take) in enumerate(favorites):
+                if should_stop():
+                    raise Cancelled()
+                progress(0.0, f"prepare:{i + 1}/{len(favorites)}")
+                label = f"{project.data['title']} {take.get('name') or '#' + str(take['number'])}"
+                source_created = (project.data.get("source") or {}).get("created")
+                midi = project.take_midi(take["id"])
+                if take.get("source_created") not in (None, source_created) or not midi.is_file():
+                    log(f"使えないので外します (原曲を作り直した後か、MIDI がない): {label}")
+                    continue
+                try:
+                    source = self._source(project, model, progress, log)
+                except FileNotFoundError as e:
+                    log(f"使えないので外します ({e}): {label}")
+                    continue
+                patches = None
+                if take["model"]["id"] == entry.id and (project.take_dir(take["id"]) / "patches.json").is_file():
+                    patches = project.take_patches(take["id"])
+                    events = model.tokenizer.patches_to_events(patches, source.grid)
+                else:  # 別のモデルのテイクは MIDI から (原曲の時刻のまま)
+                    events, _ = reader.midi_to_events(midi, trim=False)
+                examples.append(StyleExample(source, events, patches))
+                log(f"使います: {label}")
+            if not examples:
+                raise ValueError("使えるお気に入りがありません")
+
+            base = style_slot(model).base.weight.detach()
+            start = base[torch.tensor(init or [0], device=base.device)].float().mean(0)
+            settings = StyleSettings()
+
+            def on_step(done: int, total: int, loss: float) -> None:
+                if should_stop():
+                    raise Cancelled()
+                progress(done / total, f"style:{done}/{total}:{loss:.3f}")
+
+            log(f"{len(examples)} 本で学習します (更新 {settings.steps} 回)")
+            result = train_style(model, examples, start, settings, on_step)
+        log(f"損失 {result.loss_before:.4f} -> {result.loss_after:.4f}、初期値からの距離 {result.distance:.2f}")
+        return {
+            "vector": [round(float(v), 6) for v in result.vector],
+            "used": len(examples),
+            "loss_before": result.loss_before,
+            "loss_after": result.loss_after,
+            "distance": result.distance,
+        }
 
     # ------------------------------------------------------------ 楽譜化
     def score(

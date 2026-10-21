@@ -67,6 +67,23 @@ const ja = {
   addPerformerHelp: "今の番号をよく使う演奏者に登録する",
   removePerformer: (n: number) => `#${n} を外す`,
   performerHelp: (max?: number) => `0 で指定なし${max ? ` (1〜${max})` : ""}`,
+  styleTitle: "好み",
+  styleNote: "お気に入りのテイクに寄せた演奏者を 1 人分学習し、番号の代わりに使います。学習したモデルでだけ使えます (V2 以降)",
+  learnStyle: (n: number, songs: number) => `お気に入り ${n} 件 (${songs} 曲) から学習`,
+  learnStyleHelp: "全曲の、音源のある曲のお気に入りを使います。いろいろな曲から 10 件以上あると安定します",
+  noStyleFavorites: "お気に入り (音源のある曲) がまだありません",
+  styleQueued: "学習の順番待ち",
+  styleTraining: "学習しています",
+  styleFailed: "学習に失敗しました",
+  styleCancelled: "止めました",
+  styleUnusable: "選んでいる好みはこのモデルでは使えません",
+  styleName: "好みの名前",
+  styleInfo: (used: number, before: number, after: number) =>
+    `${used} テイクで学習・損失 ${before.toFixed(3)} → ${after.toFixed(3)} (ダブルクリックで名前を変える)`,
+  deleteStyle: (name: string) => `${name} を削除`,
+  confirmDeleteStyle: (name: string) => `好み「${name}」を削除しますか？`,
+  stylePrepare: (i: number, n: number) => `曲を準備しています ${i} / ${n}`,
+  styleSteps: (done: number, total: number, loss: string) => `${done} / ${total} 回 (損失 ${loss})`,
   countHelp: "同じ設定で一度に作る本数",
   seedHelp: "固定すると同じ設定で同じ結果になります",
   random: "ランダム",
@@ -122,6 +139,8 @@ const ja = {
     onset_bias_width: { label: "寄せる範囲", short: "寄せる範囲", help: "原曲の発音に寄せる範囲 (秒)" },
   } satisfies Record<NumberKey, ParamText>,
   chipPerformer: (n: number) => `演奏者 #${n}`,
+  chipStyle: (name: string) => `好み「${name}」`,
+  deletedStyle: "削除済み",
   chipNoArrangement: "編曲の指定なし",
   chipSeconds: (n: number) => `${n} 秒`,
   // 作業画面
@@ -286,6 +305,24 @@ const en: Dict = {
   addPerformerHelp: "Save this number to your performer presets",
   removePerformer: (n) => `Remove #${n}`,
   performerHelp: (max) => `0 = unspecified${max ? ` (1–${max})` : ""}`,
+  styleTitle: "Your taste",
+  styleNote:
+    "Learn one performer that leans toward your favorite takes and use it instead of a number. Works only with the model it was learned on (V2 and later)",
+  learnStyle: (n, songs) => `Learn from ${n} favorites (${songs} songs)`,
+  learnStyleHelp: "Uses favorites from every song that has audio. 10+ favorites from various songs make it stable",
+  noStyleFavorites: "No favorites yet (in songs with audio)",
+  styleQueued: "Waiting to learn",
+  styleTraining: "Learning",
+  styleFailed: "Learning failed",
+  styleCancelled: "Stopped",
+  styleUnusable: "The selected taste can't be used with this model",
+  styleName: "Name of this taste",
+  styleInfo: (used, before, after) =>
+    `Learned from ${used} takes, loss ${before.toFixed(3)} → ${after.toFixed(3)} (double-click to rename)`,
+  deleteStyle: (name) => `Delete ${name}`,
+  confirmDeleteStyle: (name) => `Delete the taste "${name}"?`,
+  stylePrepare: (i, n) => `Preparing songs ${i} / ${n}`,
+  styleSteps: (done, total, loss) => `${done} / ${total} steps (loss ${loss})`,
   countHelp: "How many takes to make with the same settings",
   seedHelp: "A fixed seed gives the same result for the same settings",
   random: "random",
@@ -348,6 +385,8 @@ const en: Dict = {
     onset_bias_width: { label: "Snap width", short: "snap width", help: "Window for snapping to source onsets (s)" },
   },
   chipPerformer: (n) => `performer #${n}`,
+  chipStyle: (name) => `taste "${name}"`,
+  deletedStyle: "deleted",
   chipNoArrangement: "no arrangement",
   chipSeconds: (n) => `${n}s`,
   noAudio: "no audio",
@@ -508,6 +547,10 @@ export function progressText(t: Dict, message: string | undefined): string | nul
   if (message === "stopping") return t.stopping;
   if (message === "starting") return t.startingTsumugi;
   if (message === "beats") return t.analyzingBeats;
+  const prepare = message.match(/^prepare:(\d+)\/(\d+)$/);
+  if (prepare) return t.stylePrepare(Number(prepare[1]), Number(prepare[2]));
+  const steps = message.match(/^style:(\d+)\/(\d+):(.+)$/);
+  if (steps) return t.styleSteps(Number(steps[1]), Number(steps[2]), steps[3]);
   const bars = message.match(/^bars:(\d+)\/(\d+)$/);
   if (bars) return t.scoreBars(Number(bars[1]), Number(bars[2]));
   const m = message.match(/^(\d+)\/(\d+)$/);
