@@ -15,6 +15,7 @@ MTIME は与えた小節線から決めてモデルには予測させず (transc
 書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直し (tidy.tidy_score)、
 片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
 テンポ (メトロノーム記号と再生のテンポ) は、モデルの見積もりではなく原曲の小節線の秒から決める (beat_tempo)。
+加線の多い所は、小節ごとに 8va などのオクターブ記号と音部記号を選び直して五線に近づける (staves.readable_staves)。
 --chords に原曲の MIDI (Cover Studio の source.mid) を渡すと、tsumugi のコードマーカーをコード記号として置く
 (chords.place_chords)。省略したときは --beat-midi にマーカーがあればそれを使う。
 スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
@@ -46,6 +47,7 @@ from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .playability import make_playable
 from .render import Performance, measure_qpm, render
+from .staves import readable_staves
 from .tidy import tidy_score
 
 PEDAL_THRESHOLD = 64
@@ -570,6 +572,7 @@ def main() -> None:
         print(tidied)
         if not args.no_playable:
             print(make_playable(measures))
+        print(readable_staves(measures))
         apply_bar_tempos(measures, performance, tidied.rests)
         if performance.chords:
             print(f"コード記号 {place_chords(measures, performance, performance.chords, tidied.rests)} 個")
