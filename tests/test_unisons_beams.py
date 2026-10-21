@@ -1,6 +1,6 @@
 from fractions import Fraction
 
-from piano_perf2score.playability import remove_unisons
+from piano_perf2score.synth_score import remove_unisons
 from piano_score.musicxml import beam_starts
 from piano_score.score import Duration, Group, Measure, Note
 

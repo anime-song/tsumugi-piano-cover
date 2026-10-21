@@ -12,9 +12,7 @@
 
 拍の上の演奏 (V2 のカバー、beat_input) は --beat-midi と --sheetsage で渡す。拍の格子から小節線が決まるので、
 MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
-書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直し (tidy.tidy_score)、
-片手で弾けない和音を直し (playability.make_playable、--no-playable で外す)、左手が低音から跳んで弾く中音域の
-和音は右手が弾けるなら右手へ移す (playability.upper_to_right)。
+書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直す (tidy.tidy_score)。
 テンポ (メトロノーム記号と再生のテンポ) は、モデルの見積もりではなく原曲の小節線の秒から決める (beat_tempo)。
 加線の多い所は、小節ごとに 8va などのオクターブ記号と音部記号を選び直して五線に近づける (staves.readable_staves)。
 --chords に原曲の MIDI (Cover Studio の source.mid) を渡すと、tsumugi のコードマーカーをコード記号として置く
@@ -46,7 +44,6 @@ from .beat_tempo import apply_bar_tempos
 from .chords import place_chords, read_chord_markers
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
-from .playability import make_playable, remove_unisons, upper_to_right
 from .render import Performance, measure_qpm, render
 from .staves import readable_staves
 from .tidy import tidy_score
@@ -526,7 +523,6 @@ def main() -> None:
     parser.add_argument(
         "--slur-bias", type=float, default=0.0, help="--beat-midi で、スラーのトークンの logit に足す値"
     )
-    parser.add_argument("--no-playable", action="store_true", help="--beat-midi で、片手で弾けない和音を直さない")
     parser.add_argument(
         "--chords", default=None, help="--beat-midi で、コードマーカーを読む MIDI (原曲。省略で --beat-midi)"
     )
@@ -571,10 +567,6 @@ def main() -> None:
         measures = tokenizer.decode(patches)[0]
         tidied = tidy_score(measures)
         print(tidied)
-        if not args.no_playable:
-            print(make_playable(measures))
-            print(f"両手で重なる同じ音 {remove_unisons(measures)} 個を消した")
-            print(f"左手が跳ぶ所の和音 {upper_to_right(measures)} 音を右手へ移した")
         print(readable_staves(measures))
         apply_bar_tempos(measures, performance, tidied.rests)
         if performance.chords:

@@ -61,9 +61,8 @@ import numpy as np
 from piano_score.score import Duration, Group, Measure, Note, metronome_bpm
 from piano_score.tokenizer import ScoreTokenizer
 
-from .playability import remove_unisons
 from .staves import readable_staves
-from .tidy import _fix_pedals, _in_key, chromatic_spelling, spell_pitch_class
+from .tidy import _drop_dangling_ties, _fix_pedals, _in_key, chromatic_spelling, spell_pitch_class
 
 F = Fraction
 SCALES = {"major": (0, 2, 4, 5, 7, 9, 11), "minor": (0, 2, 3, 5, 7, 8, 10)}
@@ -1071,6 +1070,37 @@ def generate(rng: random.Random) -> Song:
         song.measures += bars
     _finish(song)
     return song
+
+
+def _keep_rank(g: Group, note: Note) -> int:
+    """同じ鍵盤が重なったときに残す順位: 旋律の一番上 > 低音 (下の段の声部 1 の一番下) > 上の段 > 下の段"""
+    if (g.staff, g.voice) == (1, 1) and note.pitch == max(n.pitch for n in g.notes):
+        return 3
+    if (g.staff, g.voice) == (2, 1) and note.pitch == min(n.pitch for n in g.notes):
+        return 2
+    return 1 if g.staff == 1 else 0
+
+
+def remove_unisons(measures: list[Measure]) -> int:
+    """別の声部 (両手や上の段の内声) で同じ鍵盤が同時に鳴る音を、残す順位の低いほうから消す (合成楽譜の書き方の決まり)。消してつながらなくなった
+    タイも消す。消した音の数を返す"""
+    removed = 0
+    for m in measures:
+        groups = [g for g in m.groups if g.duration.grace is None]
+        for g in groups:
+            for note in list(g.notes):
+                for h in groups:
+                    if h is g or (h.staff, h.voice) == (g.staff, g.voice) or not (h.onset < g.end and g.onset < h.end):
+                        continue
+                    other = next((n for n in h.notes if n.pitch == note.pitch), None)
+                    if other is None or note not in g.notes:
+                        continue
+                    loser, owner = (note, g) if _keep_rank(g, note) < _keep_rank(h, other) else (other, h)
+                    owner.notes.remove(loser)
+                    removed += 1
+        m.groups = [g for g in m.groups if g.notes]
+    _drop_dangling_ties(measures)
+    return removed
 
 
 def _copy(measure: Measure) -> Measure:
