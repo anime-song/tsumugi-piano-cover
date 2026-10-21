@@ -1010,9 +1010,12 @@ def _slur_marks(measures: list[Measure]) -> dict[int, list[tuple[str, int]]]:
     for _, g, kind, slur_id in pair_slurs(measures):
         if kind == "start":
             used = set(numbers.values())
-            numbers[slur_id] = next(n for n in range(1, 17) if n not in used)
-            marks[id(g)].append(("start", numbers[slur_id]))
-        else:
+            free = next((n for n in range(1, 17) if n not in used), None)
+            if free is None:  # MusicXML の番号 (16 まで) が尽きるほど重なったスラーは書かない
+                continue
+            numbers[slur_id] = free
+            marks[id(g)].append(("start", free))
+        elif slur_id in numbers:
             marks[id(g)].append(("stop", numbers.pop(slur_id)))
     return marks
 

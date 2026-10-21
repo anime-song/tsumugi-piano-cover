@@ -36,7 +36,7 @@ from piano_score.config import ScoreTokenizerConfig
 from piano_score.generate import unseen_tokens
 from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
-from piano_score.tokenizer import EOS, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
+from piano_score.tokenizer import EOS, MLEN, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
 
 from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
 from .chords import place_chords, read_chord_markers
@@ -155,8 +155,12 @@ def transcribe(
     return patches[0]
 
 
-# 拍の上の演奏の最初の小節で試す、1 拍の長さ (4 分音符いくつ分): 4 分・付点 4 分 (複合拍子)・2 分・8 分
+# 拍の上の演奏の最初の小節で試す、1 拍の長さ (4 分音符いくつ分): 4 分・付点 4 分 (複合拍子)。
+# 8 分は小節の拍が 6 つ以上 (6/8 を 8 分で数えた拍)、2 分は 2 つ以下 (2/2) のときだけ試す。
+# 小節の長さを拍の数で決めるので、ここで選んだ値が楽譜の拍子になる。モデルの尤度は密な曲 (16 分の多いカバー) で
+# 8 分を選びやすい (2/4 で 32 分音符を書く) ので、4 分を基本にし、他の値は 1 拍あたり SEARCH_MARGIN 以上よいときだけ選ぶ
 SEARCH_BEAT_QUARTERS = (1.0, 1.5, 2.0, 0.5)
+SEARCH_MARGIN = 0.5
 
 
 @torch.no_grad()
@@ -186,7 +190,9 @@ def transcribe_on_beats(
     common = {"memory": memory, "end_frame": end_frame, "context_measures": context_measures, "banned": banned}
     common["slur_bias"] = slur_bias
     beat_frames = BEAT_SECONDS * FRAMES_PER_SECOND
-    spq = [beat_frames / q for q in SEARCH_BEAT_QUARTERS]
+    bar_beats = np.median(np.diff(starts)) / beat_frames if len(starts) > 1 else 4.0
+    quarters = [q for q in SEARCH_BEAT_QUARTERS if (q != 0.5 or bar_beats >= 6) and (q != 2.0 or bar_beats <= 2)]
+    spq = [beat_frames / q for q in quarters]
     best = 0
     if len(starts) > 1:
         stop = float(starts[min(search_measures, len(starts) - 1)])
@@ -194,7 +200,9 @@ def transcribe_on_beats(
             model, tokenizer, first_spq=spq, max_measures=len(starts), stop_frame=stop, temperature=0.0, top_p=1.0,
             given_starts=starts, **common,
         )  # fmt: skip
-        best = int(np.argmax([lp / max(cv, 1.0) for lp, cv in zip(logprob, covered)]))
+        per_beat = np.array([lp / max(cv, 1.0) for lp, cv in zip(logprob, covered)]) * beat_frames
+        per_beat[1:] -= SEARCH_MARGIN
+        best = int(np.argmax(per_beat))
     patches, _, _ = _decode(
         model, tokenizer, first_spq=[spq[best]], max_measures=len(starts), stop_frame=None,
         temperature=temperature, top_p=top_p, given_starts=starts, **common,
@@ -286,7 +294,9 @@ def _decode(
     行ごとに (小節ごとのトークン列, 選んだトークンの対数尤度の和, 生成した小節が覆う時間 (フレーム)) を返す。
     stop_frame を渡すと、そこより後に始まる小節の手前でその行を止める。
     given_starts (各小節の開始のフレーム) を渡すと、MTIME はそこから決めて (予測させず)、小節の開始と基準の時刻もその値を
-    そのまま使い (学習の data.exact_measure_times と同じ)、その小節の数だけ生成する"""
+    そのまま使い (学習の data.exact_measure_times と同じ)、その小節の数だけ生成する。小節の長さも、小節線の間の拍の数 x
+    行ごとの 1 拍の 4 分音符の長さ (最初の小節の first_spq から) に決め、その長さの拍子だけを選ばせて MLEN は使わせない
+    (拍の時刻の演奏 beat_input 用。拍の数の決まった小節を、途中から別の拍子や短い小節で書かないように)"""
     device = memory.song.device
     decoder = model.decoder
     c = model.config
@@ -315,6 +325,14 @@ def _decode(
     lengths: list[list[float]] = [[] for _ in range(R)]
     open_slurs = [(0, 0)] * R
     active = [True] * R
+    measure_quarters = None  # [小節][行] 決めた小節の長さ (4 分音符単位)。決めない小節は None
+    if given_starts is not None:
+        beat_frames = BEAT_SECONDS * FRAMES_PER_SECOND
+        beats = np.round(np.diff(given_starts) / beat_frames).astype(int).tolist()
+        beats.append(beats[-1] if beats else 0)
+        measure_quarters = [[b * beat_frames / spq for spq in first_spq] if b > 0 else None for b in beats]
+    ts_ids = np.array([i for (kind, _), i in tokenizer.ids.items() if kind == "ts"])
+    ts_quarters = np.array([4 * tokenizer.values[i][0] / tokenizer.values[i][1] for i in ts_ids])
     total_logprob = [0.0] * R
     covered = [0.0] * R
     for p in range(max_measures):
@@ -381,7 +399,17 @@ def _decode(
             ).float()
             if slur_bias:
                 logits[:, [SLUR_START, SLUR_STOP]] += slur_bias
-            allowed = torch.stack([g.allowed() for g in grammars]).to(device)
+            masks = [g.allowed() for g in grammars]
+            if measure_quarters is not None and measure_quarters[p] is not None:
+                for r, g in enumerate(grammars):
+                    fitting = ts_ids[np.abs(ts_quarters - measure_quarters[p][r]) < 1e-6]
+                    if g.stage == "ts" and masks[r][fitting].any():
+                        keep = torch.zeros_like(masks[r])
+                        keep[fitting] = masks[r][fitting]
+                        masks[r] = keep
+                    elif g.stage == "header" and len(fitting):
+                        masks[r][MLEN] = False
+            allowed = torch.stack(masks).to(device)
             logits = logits.masked_fill(~allowed, float("-inf"))
             if s == 0 and given_starts is not None:
                 # 与えた小節線から MTIME を決める (曲の最初の小節は最初の音より前の秒数、それ以降は前の小節の開始から)
