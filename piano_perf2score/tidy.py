@@ -8,16 +8,19 @@
     - 今と同じ強弱記号の繰り返しを消す
     - 調号と綴り: 調号が同じ小節の並びごとに、音名の数え上げから調号を選び直す (はっきり合うときだけ)。
       そのうえで音名ごとに綴りを 1 つに決める。重変化記号と、調号にない白鍵の異名 (Cb・Fb・E#・B#) は使わない
+    - ただし調の外の音が同じ声部の次の音へ半音で進むときは、進む向きで綴る (chromatic_spelling)。上がる音は進む先の
+      1 つ下の幹音に # (ニ長調の E-E#-F#、F#-F##-G#。この形だけ重変化記号も使う)、下がる音は 1 つ上の幹音に b
+      (黒鍵のときだけ。A-Ab は Bbb-Ab と書かない)
 """
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from fractions import Fraction
-from itertools import groupby
+from itertools import groupby, pairwise
 
-from piano_score.score import STEP_PITCH_CLASS, Measure
+from piano_score.score import STEP_PITCH_CLASS, STEPS, Measure, spell
 
 # 五度の並びの上の位置 (C = 0、G = 1、F = -1)。綴りの位置は 幹音の位置 + 7 x 変化記号
 FIFTHS = {"F": -1, "C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5}
@@ -32,6 +35,7 @@ class TidyStats:
     dynamics: int = 0  # 消した繰り返しの強弱記号
     keys: int = 0  # 調号を選び直した小節の並び
     spellings: int = 0  # 綴りを変えた音
+    chromatic: int = 0  # 半音の進みの向きで綴り直した音
 
 
 def _drop_leading_rests(measures: list[Measure]) -> int:
@@ -141,7 +145,52 @@ def spell_pitch_class(pitch_class: int, key: int, preferred: int | None = None) 
     return min(candidates, key=lambda a: (abs(_position(pitch_class, a) - key - 2), -a))
 
 
+def _in_key(pitch_class: int, key: int) -> bool:
+    return any((position := _position(pitch_class, a)) is not None and _diatonic(position, key) for a in (-1, 0, 1))
+
+
+def chromatic_spelling(measures: list[Measure]) -> int:
+    """調の外の音 (1 音だけの塊) が、同じ段・声部の次の塊 (1 音) へ半音で進むとき、進む向きで綴り直し、
+    綴りを変えた音の数を返す。タイでつながる前の音も同じ綴りにそろえる"""
+    lines: dict[tuple[int, int], list] = defaultdict(list)
+    offset = Fraction(0)
+    for m in measures:
+        for g in m.groups:
+            if g.duration.grace is None:
+                lines[(g.staff, g.voice)].append((offset + g.onset, g, m.key))
+        offset += m.length
+    changed = 0
+    for line in lines.values():
+        line.sort(key=lambda item: item[0])
+        for (_, g, key), (_, h, _) in pairwise(line):
+            if len(g.notes) != 1 or len(h.notes) != 1:
+                continue
+            note, target = g.notes[0], h.notes[0]
+            direction = target.pitch - note.pitch
+            if abs(direction) != 1 or _in_key(note.pitch % 12, key):
+                continue
+            step, octave = spell(target.pitch, target.alter)
+            index = STEPS.index(step) - direction  # 上がるなら 1 つ下の幹音、下がるなら 1 つ上の幹音
+            natural = 12 * (octave + index // 7 + 1) + STEP_PITCH_CLASS[STEPS[index % 7]]
+            alter = note.pitch - natural
+            # 上がる音は # と ## (E#・F##) まで、下がる音は黒鍵の b だけ (A-Ab を Bbb-Ab、E-Eb を Fb-Eb とは書かない)
+            allowed = (
+                alter in (1, 2) if direction > 0 else alter == -1 and (note.pitch % 12) not in STEP_PITCH_CLASS.values()
+            )
+            if allowed and alter != note.alter:
+                note.alter = alter
+                changed += 1
+        for (_, g, _), (_, h, _) in reversed(list(pairwise(line))):
+            for note in g.notes:
+                tied = next((n for n in h.notes if n.pitch == note.pitch), None) if note.tie else None
+                if tied is not None:
+                    note.alter = tied.alter
+    return changed
+
+
 def _choose_key(counts: Counter, model_key: int) -> int:
+    if abs(model_key) == 7:  # 嬰ハ長調・変ハ長調 (7 つ) は、同じ音の 5 つの調号にする
+        return model_key - 12 if model_key > 0 else model_key + 12
     total = sum(counts.values())
 
     def fit(key: int) -> int:
@@ -187,4 +236,5 @@ def tidy_score(measures: list[Measure]) -> TidyStats:
     stats.pedals = _fix_pedals(measures)
     stats.dynamics = _drop_repeated_dynamics(measures)
     _respell(measures, stats)
+    stats.chromatic = chromatic_spelling(measures)
     return stats

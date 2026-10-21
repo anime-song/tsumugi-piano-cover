@@ -69,3 +69,15 @@ def test_rechooses_a_clearly_wrong_key():
     stats = tidy_score(measures)
     assert stats.keys == 1 and measures[0].key == -5
     assert {n.alter for g in measures[0].groups for n in g.notes} == {-1, 0}
+
+
+def test_chromatic_steps_are_spelled_by_direction():
+    # ニ長調 (シャープ 2 つ) の E-F-F#-G-G# (F と G は E#・F## と綴るべき半音の上行) と、下行の A-Ab-G
+    line = [(64, 0), (65, 0), (66, 1), (67, 0), (68, 1), (69, 0), (68, 1), (67, 0)]
+    groups = [Group(Fraction(i, 2), 1, 1, Duration("eighth", 0), [Note(p, a)]) for i, (p, a) in enumerate(line)]
+    measures = [measure(groups, key=2)]
+    tidy_score(measures)
+    alters = [g.notes[0].alter for g in measures[0].groups]
+    assert alters[1] == 1  # E#
+    assert alters[3] == 0  # G (調の音のまま)
+    assert alters[6] == -1  # A から G へ下がる G#/Ab は Ab
