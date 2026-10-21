@@ -25,6 +25,7 @@ V2 のカバー -> 楽譜 (拍の上の演奏、piano_perf2score.beat_input) は
         --out-dir checkpoints/piano_perf2score_beat ...
 --melody-rows 1 でメロディの印の列を足し (--init-from の重みに列がなければ、その行だけ新しく初期化する)、
 --drop-durations で音の長さの列を消す窓の割合を決める。
+--swing-prob で、8 分主体の窓をスイングの楽譜に書き換える割合を決める (beat_input.straight_eighths)。
 """
 
 from __future__ import annotations
@@ -70,6 +71,9 @@ def build_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--drop-durations", type=float, default=0.0, help="--beat-input で、音の長さの列を消す窓の割合"
+    )
+    parser.add_argument(
+        "--swing-prob", type=float, default=0.0, help="--beat-input で、8 分主体の窓をスイングの楽譜に書き換える割合"
     )
     parser.add_argument("--window-measures", type=int, default=32)
     parser.add_argument("--context-measures", type=int, default=2, help="窓の前に演奏を描き出す小節数")
@@ -206,9 +210,10 @@ def main() -> None:
             raise SystemExit("--beat-input と --real-cache-dir は一緒に使えない")
         common["ref_noise"] = None  # 小節線は与えられるので、基準のずれは起きない
         beat = {"melody": bool(args.melody_rows), "drop_durations": args.drop_durations}
+        train_beat = {**beat, "swing_prob": args.swing_prob}
         train_set = BeatSynthWindowDataset(
             cache, split="train", augment=augment, song_start_prob=args.song_start_prob,
-            songs=load_songs(cache, "train"), **beat, **common,
+            songs=load_songs(cache, "train"), **train_beat, **common,
         )  # fmt: skip
         val_set = BeatSynthWindowDataset(cache, split="val", songs=load_songs(cache, "val"), **beat, **common)
     else:

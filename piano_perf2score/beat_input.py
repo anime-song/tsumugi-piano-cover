@@ -22,6 +22,11 @@ V2 の拍は SheetSage2-Refined の拍なので、楽譜の拍と階層が違う
 音の長さ (V2 のカバーはペダルで響きを残して鍵盤を早く離す) をそのまま音価に写さないよう、学習では drop_durations の割合の
 窓で長さの列を消す。生成では長さを消して入れる (generate.transcribe_on_beats)。
 
+スイングの曲のカバーは、8 分の裏が 7〜9 刻みの間で曲の中でも揺れる。学習の楽譜のスイングの曲 (2%) だけでは足りないので、
+8 分主体の楽譜の窓 (straight_eighths) を swing_prob の割合でスイングの楽譜に書き換える (全小節を Swing にして
+トークンも作り直す)。描き出し (COVER_RENDER) はスイングの比を拍ごとに揺らすので、入力は揺れたスイング、正解は
+「まっすぐの 8 分 + Swing の指定」になる。
+
     python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth     # beat_songs.npz を作る
 """
 
@@ -31,6 +36,7 @@ import argparse
 import json
 import math
 import random
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +46,8 @@ from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
 from piano_ar.tokenizer import KIND_NOTE, KIND_PEDAL_OFF, KIND_PEDAL_ON
 from piano_score.data import ScoreCache
 from piano_score.quality import low_quality
-from piano_score.tokenizer import ScoreTokenizer
+from piano_score.score import Measure
+from piano_score.tokenizer import EOS, ScoreTokenizer
 
 from .data import FRAMES_PER_SECOND, UNMARKED_TEMPO, PerformanceVocab, SynthWindowDataset, make_item
 from .render import COVER_RENDER, Performance, _score_notes, beat_positions, measure_qpm, render
@@ -53,6 +60,8 @@ SONGS_FILE = "beat_songs.npz"
 MELODY_TICKS = 2  # メロディの音と演奏の音を同じ位置とみなすずれ (刻み)
 MELODY_DROP_SONG = 0.3
 MELODY_DROP_NOTE = 0.1
+OFF_GRID_LIMIT = 0.03  # straight_eighths: 拍の頭と 8 分の裏以外の位置の音の割合の上限
+MIN_OFFBEATS = 0.1  # straight_eighths: 8 分の裏の音の割合の下限 (スイングして変わる音があること)
 
 
 def on_beats(
@@ -108,6 +117,21 @@ def melody_from_annotation(performance: Performance, annotation: dict, grid: Bea
     frames = np.array([float(m["start"]) for m in melody]) * FRAMES_PER_SECOND
     times = grid.beat_position(frames) * BEAT_SECONDS - origin
     return mark_melody(performance, times, np.array([int(m["pitch"]) for m in melody]), octave_free=True)
+
+
+def straight_eighths(measures: list[Measure]) -> bool:
+    """スイングに書き換えてよい窓か: 4 分音符が拍の拍子 (x/4・2/2) だけで、スイングの指定がなく、音の位置がほぼ
+    拍の頭か 8 分の裏 (16 分や 3 連符がほとんどない) で、8 分の裏の音もあること"""
+    if any(m.time_signature[1] != 4 and m.time_signature != (2, 2) for m in measures):
+        return False
+    if any(m.swing != "none" or any(name.startswith("swing_") for _, name in m.directions) for m in measures):
+        return False
+    positions = [g.onset % 1 for m in measures for g in m.groups if g.duration.grace is None]
+    if not positions:
+        return False
+    offbeat = sum(p == Fraction(1, 2) for p in positions) / len(positions)
+    off_grid = sum(p not in (0, Fraction(1, 2)) for p in positions) / len(positions)
+    return off_grid <= OFF_GRID_LIMIT and offbeat >= MIN_OFFBEATS
 
 
 def performance_events(performance: Performance) -> np.ndarray:
@@ -169,6 +193,7 @@ class BeatSynthWindowDataset(SynthWindowDataset):
         level_probs: dict | None = None,
         melody: bool = False,
         drop_durations: float = 0.0,
+        swing_prob: float = 0.0,
         **kwargs,
     ) -> None:
         kwargs.setdefault("render_config", COVER_RENDER)
@@ -179,6 +204,7 @@ class BeatSynthWindowDataset(SynthWindowDataset):
         self.vocab = PerformanceVocab(melody=melody)
         # 長さの列を消す窓の割合。検証は曲ごとに固定 (曲の番号の偶奇で、消す・消さないを半分ずつ)
         self.drop_durations = drop_durations
+        self.swing_prob = swing_prob  # 学習で、8 分主体の窓をスイングの楽譜に書き換える割合
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         song = int(self.songs[index])
@@ -201,6 +227,8 @@ class BeatSynthWindowDataset(SynthWindowDataset):
             if shift:
                 bodies = self._transpose(bodies, shift)
                 measures, _ = self.tokenizer.decode([[self.mtime_first, *b.tolist()] for b in bodies])
+        if self.train and self.swing_prob and random.random() < self.swing_prob and straight_eighths(measures):
+            bodies = self._swing(measures, bodies)
         qpm = measure_qpm(measures, self.cache.song_seconds(song)[first : last + 1])
         if np.all(np.abs(qpm - 120.0) < 0.5) and not any(self.is_metronome[b].any() for b in bodies):
             median, sigma, low, high = UNMARKED_TEMPO
@@ -241,6 +269,15 @@ class BeatSynthWindowDataset(SynthWindowDataset):
             window_measures=W, max_rows=self.max_rows, train=self.train, noise=None, exact_starts=True,
             drop_durations=drop,
         )  # fmt: skip
+
+    def _swing(self, measures: list[Measure], bodies: list[np.ndarray]) -> list[np.ndarray]:
+        """窓の全小節を 8 分のスイングにし (measures をその場で書き換え)、小節のトークン列 (MTIME なし) を作り直す"""
+        for m in measures:
+            m.swing = "8th"
+        return [
+            np.asarray(self.tokenizer.encode_measure(m, 0, bool(b[-1] == EOS))[1:], dtype=b.dtype)
+            for m, b in zip(measures, bodies)
+        ]
 
     def _score_melody(self, measures, performance: Performance, grid: BeatGrid, origin: float, on_grid: Performance):
         """楽譜の上の段の一番上の音を、拍の時刻の演奏の音に写してメロディの印にする"""

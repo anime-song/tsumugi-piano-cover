@@ -45,6 +45,8 @@ DYNAMIC_LEVELS = {
 ACCENT_DYNAMICS = {"sf": 18, "sfz": 20, "sffz": 24, "fz": 18, "rf": 14, "rfz": 16, "fp": 16, "sfp": 18}
 SLOWING = ("tempo_rit", "tempo_rall", "tempo_allarg")
 QUICKENING = ("tempo_accel", "tempo_string")
+SWING_WANDER_KEEP = 0.95
+SWING_RATIO_LIMITS = (1.0, 3.5)  # 揺らしたスイングの比の範囲 (まっすぐ 〜 付点 8 分 + 16 分より少し鋭い)
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,10 @@ class RenderConfig:
     final_rit_prob: float = 0.7  # 曲の最後の 2 小節を遅くする確率
     fermata_ratio: tuple[float, float] = (1.5, 2.5)  # フェルマータの音の長さの倍率
     swing_ratio: tuple[float, float] = (1.5, 2.6)  # スイングの長短の比
+    # 拍ごとのスイングの比の揺れ (対数)。曲の中でゆっくり変わる分 (AR(1) の雑音の標準偏差) と拍ごとの分。
+    # どちらも 0 なら比は曲を通して一定 (乱数も引かない)
+    swing_wander: float = 0.0
+    swing_jitter: float = 0.0
     # タイミング
     onset_jitter: float = 0.008  # 同じ位置の音にまとめてかけるずれ (秒、標準偏差)
     note_jitter: float = 0.005  # 音ごとのずれ
@@ -519,6 +525,14 @@ class _Timeline:
         scale = math.exp(rng.uniform(math.log(c.tempo_scale[0]), math.log(c.tempo_scale[1])))
         self.swing = _swing_spans(measures, offsets)
         self.swing_ratio = rng.uniform(*c.swing_ratio)
+        self.swing_ratios = []  # スイングの範囲ごとの、拍ごとの比 (揺らすときだけ)
+        if c.swing_wander or c.swing_jitter:
+            for start, end, unit in self.swing:
+                drift, ratios = 0.0, []
+                for _ in range(math.ceil((end - start) / unit) + 1):
+                    drift = SWING_WANDER_KEEP * drift + rng.normal(0.0, c.swing_wander)
+                    ratios.append(self.swing_ratio * math.exp(drift + rng.normal(0.0, c.swing_jitter)))
+                self.swing_ratios.append(np.clip(ratios, *SWING_RATIO_LIMITS))
 
         # 拍 (4 分音符) ごとの区切り
         knots = [0.0]
@@ -600,11 +614,13 @@ class _Timeline:
 
     def _swung(self, position: float) -> float:
         """スイングの範囲では、拍 (8 分のスイングなら 4 分音符、16 分なら 8 分音符) の中の前半を長くする"""
-        for start, end, unit in self.swing:
+        for i, (start, end, unit) in enumerate(self.swing):
             if start <= position < end:
-                beat = math.floor((position - start) / unit) * unit + start
+                index = math.floor((position - start) / unit)
+                beat = index * unit + start
                 x = (position - beat) / unit
-                long = self.swing_ratio / (1.0 + self.swing_ratio)
+                ratio = self.swing_ratios[i][index] if self.swing_ratios else self.swing_ratio
+                long = ratio / (1.0 + ratio)
                 y = x * 2 * long if x <= 0.5 else long + (x - 0.5) * 2 * (1 - long)
                 return beat + y * unit
         return position
@@ -818,6 +834,9 @@ def _resolve_overlaps(notes: np.ndarray) -> np.ndarray:
 # ほぼ一定 (8 拍平均のテンポの幅 p90/p10 はカバー 1.045、既定の描き出しは 1.159) なので、揺れと曲の最後の rit. を減らす
 COVER_RENDER = RenderConfig(
     tempo_wander=0.01,
+    swing_ratio=(1.1, 2.5),
+    swing_wander=0.1,
+    swing_jitter=0.2,
     final_rit_prob=0.3,
     release_short_prob=(0.4, 0.8),
     velocity_spread=(1.0, 1.8),
