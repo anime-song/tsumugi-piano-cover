@@ -107,6 +107,7 @@ class Performance:
     beat_measures: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # [B] その拍の小節の番号
     melody: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))  # [N] メロディの印 (notes と同じ並び)
     chords: list = field(default_factory=list)  # [(時刻 (秒), tsumugi のコード名)] 原曲のコード (chords.place_chords)
+    bar_seconds: np.ndarray = field(default_factory=lambda: np.zeros(0))  # [M+1] 原曲の小節線の秒 (beat_tempo)
 
 
 def score_beats(measure: Measure) -> tuple[Fraction, int]:

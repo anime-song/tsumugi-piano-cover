@@ -14,6 +14,7 @@
 MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
 書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直し (tidy.tidy_score)、
 片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
+テンポ (メトロノーム記号と再生のテンポ) は、モデルの見積もりではなく原曲の小節線の秒から決める (beat_tempo)。
 --chords に原曲の MIDI (Cover Studio の source.mid) を渡すと、tsumugi のコードマーカーをコード記号として置く
 (chords.place_chords)。省略したときは --beat-midi にマーカーがあればそれを使う。
 スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
@@ -39,6 +40,7 @@ from piano_score.musicxml import write_musicxml
 from piano_score.tokenizer import EOS, MLEN, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
 
 from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
+from .beat_tempo import apply_bar_tempos
 from .chords import place_chords, read_chord_markers
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
@@ -213,7 +215,8 @@ def transcribe_on_beats(
 def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[float, str]] | None = None) -> Performance:
     """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から、拍の時刻の演奏を作る。
     小節は注釈の小節の頭で区切り、音のある小節だけを残す。注釈のメロディから、メロディの印も付ける。
-    chords (原曲の秒のコード、chords.read_chord_markers) を渡すと、拍の時刻にして performance.chords に入れる"""
+    chords (原曲の秒のコード、chords.read_chord_markers) を渡すと、拍の時刻にして performance.chords に入れる。
+    残した小節の本当の小節線の秒 (と最後の小節の終わり) を performance.bar_seconds に入れる (楽譜のテンポ用)"""
     from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
     from piano_ar.config import TokenizerConfig
     from piano_ar.tokenizer import PianoTokenizer
@@ -229,6 +232,8 @@ def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[floa
     keep = (bar_frames[1:] > first) & (bar_frames[:-1] <= last)
     performance, origin = on_beats(events, grid, bar_frames[:-1][keep], tokenizer)
     performance.melody = melody_from_annotation(performance, annotation, grid, origin)
+    kept = np.flatnonzero(keep)
+    performance.bar_seconds = np.append(bar_frames[kept], bar_frames[kept[-1] + 1]) / fr if len(kept) else np.zeros(0)
     if chords:
         times = grid.beat_position(np.array([t for t, _ in chords]) * fr) * BEAT_SECONDS - origin
         performance.chords = [(float(t), text) for t, (_, text) in zip(times, chords)]
@@ -541,6 +546,7 @@ def main() -> None:
         print(tidied)
         if not args.no_playable:
             print(make_playable(measures))
+        apply_bar_tempos(measures, performance, tidied.rests)
         if performance.chords:
             print(f"コード記号 {place_chords(measures, performance, performance.chords, tidied.rests)} 個")
         write_musicxml(measures, out)
