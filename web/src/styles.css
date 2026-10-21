@@ -2048,6 +2048,38 @@ button.preset {
   border-style: dashed;
 }
 
+/* 好み (演奏者の欄の中) */
+.styles {
+  margin: 6px 0 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+.styles-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 4px;
+}
+.style-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.style-row > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.styles .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 /* 楽譜化 (テイクの詳細の欄) */
 .score-section {
   margin-bottom: 16px;

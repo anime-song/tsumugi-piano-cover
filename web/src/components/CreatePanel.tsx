@@ -4,6 +4,7 @@ import type { Config, ContinueFrom, Params, Take } from "../api";
 import { useT } from "../i18n";
 import { CHANNEL_CFG, GROUPS, LENGTHS, formatTime, formatValue, type SliderDef } from "../params";
 import { Icon } from "./Icon";
+import { StyleSection } from "./StyleSection";
 
 // よく使う演奏者の番号 (テンプレート)。ブラウザに覚え、最初はこの 2 人
 const PERFORMERS_KEY = "cover-studio:performers";
@@ -194,12 +195,15 @@ export function CreatePanel(props: Props) {
         <section className="group">
           <div className="group-title">{t.performer}</div>
           <div className="presets">
-            <button className={`preset ${params.channel === 0 ? "on" : ""}`} onClick={() => set({ channel: 0 })}>
+            <button
+              className={`preset ${params.channel === 0 && !params.style ? "on" : ""}`}
+              onClick={() => set({ channel: 0, style: null })}
+            >
               {t.notSpecified}
             </button>
             {performers.map((n) => (
-              <span key={n} className={`preset ${params.channel === n ? "on" : ""}`}>
-                <button onClick={() => set({ channel: n })}>#{n}</button>
+              <span key={n} className={`preset ${params.channel === n && !params.style ? "on" : ""}`}>
+                <button onClick={() => set({ channel: n, style: null })}>#{n}</button>
                 <button
                   className="preset-remove"
                   title={t.removePerformer(n)}
@@ -210,7 +214,7 @@ export function CreatePanel(props: Props) {
                 </button>
               </span>
             ))}
-            {params.channel > 0 && !performers.includes(params.channel) && (
+            {params.channel > 0 && !params.style && !performers.includes(params.channel) && (
               <button
                 className="preset add"
                 onClick={() => setPerformers([...performers, params.channel])}
@@ -228,11 +232,13 @@ export function CreatePanel(props: Props) {
               min={0}
               max={maxChannel}
               value={params.channel}
+              disabled={!!params.style}
               onChange={(e) => set({ channel: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
             />
             <span className="muted small">{t.performerHelp(maxChannel)}</span>
           </div>
-          {slider(CHANNEL_CFG, !params.channel)}
+          <StyleSection model={model} selected={params.style} onSelect={(style) => set({ style })} />
+          {slider(CHANNEL_CFG, !params.channel && !params.style)}
         </section>
       </div>
 
