@@ -10,6 +10,9 @@
 
 ## 📢 Updates
 
+- **2026-10-21 — Sheet music from covers** (`piano_perf2score/` in [anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2))
+  - A V2 cover can now be turned into a two-staff piano score (MusicXML), with bar lines on the beats of the original, chord symbols, and tempo markings.
+  - In Cover Studio, open a take and press **Make score**. The score is drawn in the browser ([Verovio](https://www.verovio.org/)), so no notation software is needed; download it as MusicXML or print it to PDF.
 - **2026-10-20 — V2 released** ([anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2))
   - **Fewer rhythm breakdowns**: covers are now generated bar by bar on the beat grid estimated by [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined).
   - **Closer to the original**: the melody is reproduced more faithfully, because the model also reads the SheetSage2-Refined melody and audio features of the original recording.
@@ -61,6 +64,7 @@ Audio is transcribed once per song. Once loaded, the model stays in memory for f
 - **Synchronized Comparison**: Play back original audio and covers simultaneously on a shared timeline. Switching takes (↑ / ↓) preserves playback position. Includes overlaid source MIDI piano rolls, loop markers, and a source/cover balance slider.
 - **Live Transcription**: Displays detected notes on the piano roll in real-time as tsumugi processes each stem.
 - **Export Options**: Download standard MIDI or render WAV audio directly in-browser using sampled piano soundfonts.
+- **Sheet Music**: Turn a take into a piano score (V2 projects with audio). View it in the browser, download MusicXML, or print to PDF.
 - **Presets & Localization**: Performer presets, bookmarking/notes, and Japanese/English language switching.
 
 ```bash
@@ -131,7 +135,8 @@ The source MIDI must be transcribed with stem separation, instrument refinement,
 | [`cover_studio/`](cover_studio) | Cover Studio backend server (FastAPI) and tsumugi worker |
 | [`web/`](web) | Cover Studio web frontend (React + Vite). `npm run dev` / `npm run build` |
 | [`notebooks/`](notebooks) | Google Colab notebooks |
-| [`piano_score/`](piano_score) | Performance-to-score transcription model (WIP) |
+| [`piano_score/`](piano_score) | Score tokenizer, MusicXML reader/writer, and the score language model |
+| [`piano_perf2score/`](piano_perf2score) | Performance-to-score model (turns covers into MusicXML) |
 
 To export custom checkpoints to the release format: `python -m piano_cover.export --checkpoint <best.pt> --out <dir>` (or `piano_ar.export` for the base piano model).
 
@@ -142,7 +147,7 @@ To export custom checkpoints to the release format: `python -m piano_cover.expor
 - Transcription inaccuracies in the source MIDI (melody, beat grid, chord labels) directly affect generation. Metric rhythm strongly depends on source beat tracking.
 - Swing rhythms may be rendered straight.
 - Sustain pedal durations tend to be longer than human performances.
-- Outputs represent expressive MIDI performances rather than cleanly quantized scores.
+- The cover model outputs expressive MIDI performances. The score model writes what was played, so doublings and wide voicings of the cover stay in the score.
 
 ## License
 
@@ -154,4 +159,6 @@ To export custom checkpoints to the release format: `python -m piano_cover.expor
 - [tsumugi](https://github.com/anime-song/tsumugi) — Multi-instrument automatic music transcription
 - [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) — Beat and melody estimation (V2)
 - [smplr](https://github.com/danigb/smplr) — In-browser piano sample player
+- [Verovio](https://www.verovio.org/) — In-browser music engraving for the score view
+- [PERiScoPe](https://huggingface.co/datasets/SyMuPe/PERiScoPe) — Aligned performances and scores (score model training)
 - [audio2chordpro](https://github.com/anime-song/audio2chordpro) — Architecture reference for Cover Studio

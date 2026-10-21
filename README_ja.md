@@ -10,6 +10,9 @@
 
 ## 📢 更新情報
 
+- **2026-10-21 — カバーを楽譜にできるようになりました**（[anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2) の `piano_perf2score/`）
+  - V2 で作ったカバーを、ピアノの大譜表の楽譜（MusicXML）にできます。小節線は原曲の拍に合わせ、コード記号とテンポも書きます。
+  - Cover Studio ではテイクを開いて「楽譜にする」を押します。楽譜はブラウザ内（[Verovio](https://www.verovio.org/)）で描くので楽譜ソフトは要りません。MusicXML のダウンロードと、印刷・PDF 保存ができます。
 - **2026-10-20 — V2 を公開しました**（[anime-song/tsumugi-piano-cover-v2](https://huggingface.co/anime-song/tsumugi-piano-cover-v2)）
   - **リズムの崩れが減りました**: [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) で推定した拍の上で、小節ごとに生成するようにしました。
   - **原曲の再現度が上がりました**: SheetSage2-Refined のメロディと原曲音源の特徴もモデルに渡すことで、メロディがよく再現されるようになりました。
@@ -61,6 +64,7 @@ Cover Studio は上記パスを自動検出し、tsumugi 環境の Python で採
 - **同期再生とテイク比較**: 原曲音源とカバーを同一タイムライン上で同期再生。テイク切り替え時（↑ / ↓）も再生位置を保持。原曲 MIDI をオーバーレイ表示するピアノロール、ループ再生、原曲/カバーの音量バランス調整に対応
 - **リアルタイム採譜表示**: tsumugi がパート（ステム）ごとに採譜したノートをピアノロール上へ順次描画
 - **エクスポート**: 標準 MIDI 出力、ブラウザ内サンプリング音源による WAV レンダリング
+- **楽譜**: テイクをピアノの楽譜にする（音源のある V2 のプロジェクト）。ブラウザで表示し、MusicXML のダウンロードと印刷・PDF 保存ができます
 - **各種機能**: お気に入り登録、メモ機能、演奏者プリセット、日本語/英語 UI 切り替え
 
 ```bash
@@ -131,7 +135,8 @@ python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --second
 | [`cover_studio/`](cover_studio) | Cover Studio バックエンドサーバー（FastAPI）および tsumugi 連携ワーカー |
 | [`web/`](web) | Cover Studio フロントエンド（React + Vite）。`npm run dev` / `npm run build` |
 | [`notebooks/`](notebooks) | Google Colab ノートブック |
-| [`piano_score/`](piano_score) | 演奏MIDIから楽譜データを起こすモデル（開発中） |
+| [`piano_score/`](piano_score) | 楽譜のトークン化・MusicXML の読み書き・楽譜の言語モデル |
+| [`piano_perf2score/`](piano_perf2score) | 演奏から楽譜を起こすモデル（カバーを MusicXML にする） |
 
 学習済みチェックポイントを公開フォーマットへエクスポートするコマンド: `python -m piano_cover.export --checkpoint <best.pt> --out <dir>`（事前学習ピアノモデルは `piano_ar.export`）。
 
@@ -142,7 +147,7 @@ python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --second
 - tsumugi による採譜の誤り（主旋律の取り違え、ビート推定やコード認識のズレ）は生成されるカバーにそのまま反映されます。特にリズム生成は入力 MIDI の拍グリッドに強く依存します。
 - シャッフルやスウィングのリズムがイーブン（均等割り）に平準化される傾向があります。
 - 人間の生演奏と比較して、サステインペダルを踏み続ける時間が長くなる傾向があります。
-- 出力結果はニュアンスを含む演奏表現としての MIDI であり、クオンタイズされた楽譜データではありません。
+- カバーモデルの出力はニュアンスを含む演奏表現としての MIDI です。楽譜化のモデルは弾いた音をそのまま書くので、カバーの重ねた音や広い和音は楽譜にも残ります。
 
 ## ライセンス
 
@@ -154,4 +159,6 @@ python -m piano_ar.generate --checkpoint anime-song/tsumugi-piano-cover --second
 - [tsumugi](https://github.com/anime-song/tsumugi) — 原曲音源のマルチトラック自動採譜
 - [SheetSage2-Refined](https://huggingface.co/anime-song/SheetSage2-Refined) — 拍とメロディの推定（V2）
 - [smplr](https://github.com/danigb/smplr) — Cover Studio のブラウザ内ピアノ再生音源
+- [Verovio](https://www.verovio.org/) — Cover Studio のブラウザ内の楽譜表示
+- [PERiScoPe](https://huggingface.co/datasets/SyMuPe/PERiScoPe) — 演奏と楽譜の対応データ（楽譜化のモデルの学習）
 - [audio2chordpro](https://github.com/anime-song/audio2chordpro) — Cover Studio の設計ベース

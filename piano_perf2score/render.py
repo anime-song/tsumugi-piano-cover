@@ -13,12 +13,13 @@
 楽譜に書いていない演奏の要素 (テンポの揺れ・rit. などの速度の変化・強弱・アーティキュレーション・タイミングのずれ・
 ペダル) は乱数で付ける。ペダル記号のない曲にも確率でペダルを足し、自動採譜の誤り (音の抜け・余計な音・オクターブの誤り)
 も確率で混ぜる。小節の開始時刻 (MTIME の正解) は、最初の音ではなくテンポから決まる小節線の時刻。
+楽譜の拍の時刻 (Performance.beat_times、score_beats の数え方) も返す (拍のトークンの入力 beat_input で使う)。
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
@@ -44,6 +45,8 @@ DYNAMIC_LEVELS = {
 ACCENT_DYNAMICS = {"sf": 18, "sfz": 20, "sffz": 24, "fz": 18, "rf": 14, "rfz": 16, "fp": 16, "sfp": 18}
 SLOWING = ("tempo_rit", "tempo_rall", "tempo_allarg")
 QUICKENING = ("tempo_accel", "tempo_string")
+SWING_WANDER_KEEP = 0.95
+SWING_RATIO_LIMITS = (1.0, 3.5)  # 揺らしたスイングの比の範囲 (まっすぐ 〜 付点 8 分 + 16 分より少し鋭い)
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,10 @@ class RenderConfig:
     final_rit_prob: float = 0.7  # 曲の最後の 2 小節を遅くする確率
     fermata_ratio: tuple[float, float] = (1.5, 2.5)  # フェルマータの音の長さの倍率
     swing_ratio: tuple[float, float] = (1.5, 2.6)  # スイングの長短の比
+    # 拍ごとのスイングの比の揺れ (対数)。曲の中でゆっくり変わる分 (AR(1) の雑音の標準偏差) と拍ごとの分。
+    # どちらも 0 なら比は曲を通して一定 (乱数も引かない)
+    swing_wander: float = 0.0
+    swing_jitter: float = 0.0
     # タイミング
     onset_jitter: float = 0.008  # 同じ位置の音にまとめてかけるずれ (秒、標準偏差)
     note_jitter: float = 0.005  # 音ごとのずれ
@@ -69,6 +76,10 @@ class RenderConfig:
     staccatissimo: tuple[float, float] = (0.18, 0.3)
     detached: tuple[float, float] = (0.82, 0.97)  # スラーもテヌートもない音
     legato_overlap: tuple[float, float] = (0.0, 0.04)  # スラーの中で次の音に重ねる秒数
+    # 早く離す音 (カバーの弾き方: ペダルで響きを残して鍵盤は早く離す)。曲ごとに割合を選び、その割合の音を
+    # 楽譜どおりの長さの release_short 倍で離す。(0, 0) なら使わない (乱数も引かない)
+    release_short_prob: tuple[float, float] = (0.0, 0.0)
+    release_short: tuple[float, float] = (0.25, 0.7)  # 次の打鍵までの間隔に対する比
     # 強さ
     velocity_spread: tuple[float, float] = (0.6, 1.2)  # 強弱記号の差をどれだけ付けるか
     velocity_shift: tuple[float, float] = (-10.0, 8.0)
@@ -76,6 +87,10 @@ class RenderConfig:
     melody_boost: tuple[float, float] = (3.0, 10.0)
     # ペダル
     auto_pedal_prob: float = 0.75  # ペダル記号のない曲にペダルを足す確率
+    # 足したペダルの踏み替えで、踏み直さずに次の踏み替えまで上げておく割合 (曲ごとに選ぶ) と、上げる時刻を
+    # 踏み替えの位置より前にずらす秒数。どちらも (0, 0) なら使わない
+    pedal_rest_prob: tuple[float, float] = (0.0, 0.0)
+    pedal_lift_early: tuple[float, float] = (0.0, 0.0)
     # 自動採譜の誤り
     noise_prob: float = 0.5  # 誤りを混ぜる曲の割合
     drop_rate: tuple[float, float] = (0.0, 0.03)
@@ -88,6 +103,46 @@ class Performance:
     notes: np.ndarray  # [N, 4] 打鍵の時刻・離鍵の時刻 (秒)・音高・ベロシティ。打鍵の順
     pedal: np.ndarray  # [K, 2] 時刻・踏んでいるか (1 / 0)。時刻の順
     measure_starts: np.ndarray  # [M] 各小節の小節線の時刻 (秒)。最初の音 = 0
+    beat_times: np.ndarray = field(default_factory=lambda: np.zeros(0))  # [B] 楽譜の拍の時刻 (秒、score_beats)
+    beat_measures: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # [B] その拍の小節の番号
+    melody: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))  # [N] メロディの印 (notes と同じ並び)
+    chords: list = field(default_factory=list)  # [(時刻 (秒), tsumugi のコード名)] 原曲のコード (chords.place_chords)
+    bar_seconds: np.ndarray = field(default_factory=lambda: np.zeros(0))  # [M+1] 原曲の小節線の秒 (beat_tempo)
+    meters: list = field(default_factory=list)  # [M] 注釈の小節の拍子 (拍の数, 拍の音符)。分からない小節は None
+
+
+def score_beats(measure: Measure) -> tuple[Fraction, int]:
+    """楽譜の拍 (拍の長さ (4 分音符単位), 1 小節の拍の数)。複合拍子 (分子が 6・9・12… で分母が 8・16) は付点の拍、
+    それ以外は拍子の分母の音符 (ASAP の注釈と同じ数え方)"""
+    n, d = measure.time_signature
+    if d in (8, 16) and n % 3 == 0 and n > 3:
+        return Fraction(12, d), n // 3
+    return Fraction(4, d), n
+
+
+def beat_positions(measures: list[Measure], offsets: np.ndarray) -> tuple[list[float], list[int]]:
+    """各小節の拍の位置 (曲の頭からの 4 分音符単位) と小節の番号。弱起などの短い小節は、小節の終わりから数える"""
+    positions, owners = [], []
+    for i, m in enumerate(measures):
+        unit, _ = score_beats(m)
+        start = Fraction(offsets[i]).limit_denominator(1 << 16)
+        end = start + m.length
+        if m.length < m.nominal_length:
+            items = []
+            q = end - unit
+            while q >= start - Fraction(1, 64):
+                items.append(q)
+                q -= unit
+            items.reverse()
+        else:
+            items = []
+            q = start
+            while q < end - Fraction(1, 64):
+                items.append(q)
+                q += unit
+        positions += [float(q) for q in items]
+        owners += [i] * len(items)
+    return positions, owners
 
 
 @dataclass
@@ -138,11 +193,14 @@ def render(
         "detached": rng.uniform(*c.detached),
         "lead": rng.uniform(*c.melody_lead),
         "spread": rng.uniform(*c.velocity_spread),
+        "noise": c.velocity_noise,
         "shift": rng.uniform(*c.velocity_shift),
         "boost": rng.uniform(*c.melody_boost),
         "rate": rng.uniform(*c.ornament_rate),
         "arpeggio": rng.uniform(*c.arpeggio_gap),
     }
+    if c.release_short_prob[1] > 0:
+        song["short"] = rng.uniform(*c.release_short_prob)
     dynamics = _Dynamics(measures, offsets, rng)
 
     # 位置ごとのずれ (同じ位置の音はまとめてずらす)
@@ -161,6 +219,9 @@ def render(
     roll_offset = {
         (on, p): k * song["arpeggio"] for on, pitches in rolls.items() for k, p in enumerate(sorted(set(pitches)))
     }
+
+    # 次の (別の位置の) 打鍵の位置 (早く離す音の長さの基準)
+    positions = np.unique([n.on for n in notes]) if notes else np.zeros(0)
 
     out: list[list[float]] = []  # [on, off, pitch, velocity]
     for n in notes:
@@ -181,6 +242,12 @@ def render(
             off = written_end + (rng.uniform(*c.legato_overlap) if id(n.group) in legato else 0.0)
         else:
             off = on + span * song["detached"] * rng.uniform(0.97, 1.03)
+        if "short" in song and not n.cut and not {"staccato", "staccatissimo"} & set(arts):
+            k = int(np.searchsorted(positions, n.on, side="right"))
+            gap = timeline.time(positions[k]) - timeline.time(n.on) if k < len(positions) else span
+            # 次の打鍵より長く書いた音 (伸ばしておく低音など) は早く離すことが少ない
+            if rng.random() < song["short"] * (1.0 if span <= gap * 1.5 else 0.3):
+                off = on + min(span, gap) * rng.uniform(*c.release_short)
         off = max(off, on + 0.03)
         velocity = dynamics.velocity(n, song, rng)
         if n.ornament is not None:
@@ -215,13 +282,15 @@ def render(
         performance = _transcription_errors(performance, rng, c)
     performance = _resolve_overlaps(performance)
     starts = np.array([timeline.time(offsets[i]) for i in range(len(measures))])
+    positions, owners = beat_positions(measures, offsets)
+    beat_times = np.array([timeline.time(q) for q in positions], dtype=np.float64)
 
     # 最初の音を 0 秒にする
     origin = performance[:, 0].min() if len(performance) else 0.0
     performance[:, :2] -= origin
     if len(pedal):
         pedal[:, 0] -= origin
-    return Performance(performance, pedal, starts - origin)
+    return Performance(performance, pedal, starts - origin, beat_times - origin, np.asarray(owners, dtype=np.int64))
 
 
 # ----------------------------------------------------------------------
@@ -458,6 +527,14 @@ class _Timeline:
         scale = math.exp(rng.uniform(math.log(c.tempo_scale[0]), math.log(c.tempo_scale[1])))
         self.swing = _swing_spans(measures, offsets)
         self.swing_ratio = rng.uniform(*c.swing_ratio)
+        self.swing_ratios = []  # スイングの範囲ごとの、拍ごとの比 (揺らすときだけ)
+        if c.swing_wander or c.swing_jitter:
+            for start, end, unit in self.swing:
+                drift, ratios = 0.0, []
+                for _ in range(math.ceil((end - start) / unit) + 1):
+                    drift = SWING_WANDER_KEEP * drift + rng.normal(0.0, c.swing_wander)
+                    ratios.append(self.swing_ratio * math.exp(drift + rng.normal(0.0, c.swing_jitter)))
+                self.swing_ratios.append(np.clip(ratios, *SWING_RATIO_LIMITS))
 
         # 拍 (4 分音符) ごとの区切り
         knots = [0.0]
@@ -539,11 +616,13 @@ class _Timeline:
 
     def _swung(self, position: float) -> float:
         """スイングの範囲では、拍 (8 分のスイングなら 4 分音符、16 分なら 8 分音符) の中の前半を長くする"""
-        for start, end, unit in self.swing:
+        for i, (start, end, unit) in enumerate(self.swing):
             if start <= position < end:
-                beat = math.floor((position - start) / unit) * unit + start
+                index = math.floor((position - start) / unit)
+                beat = index * unit + start
                 x = (position - beat) / unit
-                long = self.swing_ratio / (1.0 + self.swing_ratio)
+                ratio = self.swing_ratios[i][index] if self.swing_ratios else self.swing_ratio
+                long = ratio / (1.0 + ratio)
                 y = x * 2 * long if x <= 0.5 else long + (x - 0.5) * 2 * (1 - long)
                 return beat + y * unit
         return position
@@ -636,7 +715,7 @@ class _Dynamics:
             v += song["boost"]
         elif n.group.staff == 2:
             v -= 3
-        v += rng.normal(0.0, 5.0)
+        v += rng.normal(0.0, song["noise"])
         return float(np.clip(v, 8, 127))
 
 
@@ -663,6 +742,8 @@ def _pedal(
             else:
                 events.append((t + rng.uniform(0.04, 0.12), 1))
     elif rng.random() < c.auto_pedal_prob:
+        rest = rng.uniform(*c.pedal_rest_prob) if c.pedal_rest_prob[1] > 0 else 0.0
+        early = c.pedal_lift_early[1] > 0
         # 拍の頭にある下段の音で、最も低い音が前と変わるところ。スタッカートの多い小節では踏まない
         bass: dict[float, int] = {}
         for n in notes:
@@ -688,10 +769,16 @@ def _pedal(
                 continue
             t = timeline.time(at)
             if down:
-                events.append((t + rng.uniform(0.0, 0.03), 0))
+                lift = t + rng.uniform(0.0, 0.03)
+                if early:  # 前の踏み込みより前には戻さない
+                    lift = max(lift - rng.uniform(*c.pedal_lift_early), events[-1][0] + 0.05)
+                events.append((lift, 0))
+            previous = bass[at]
+            if rest and rng.random() < rest:
+                down = False
+                continue
             events.append((t + rng.uniform(0.05, 0.14), 1))
             down = True
-            previous = bass[at]
         if down:
             events.append((timeline.time(offsets[-1]) + rng.uniform(0.2, 1.0), 0))
     events.sort()
@@ -742,3 +829,22 @@ def _resolve_overlaps(notes: np.ndarray) -> np.ndarray:
     notes = notes[keep]
     notes[:, 1] = np.maximum(notes[:, 1], notes[:, 0] + 0.01)
     return notes[np.argsort(notes[:, 0], kind="stable")]
+
+
+# V2 のカバー -> 楽譜の学習で使う描き出し。実際のカバーの分布 (local/probe_score_input_gap.py) に合わせて、
+# 早く離す音を足し、強さの幅を広げて平均を上げ、ペダルを踏む曲を増やす。カバーは原曲に合わせて弾くのでテンポは
+# ほぼ一定 (8 拍平均のテンポの幅 p90/p10 はカバー 1.045、既定の描き出しは 1.159) なので、揺れと曲の最後の rit. を減らす
+COVER_RENDER = RenderConfig(
+    tempo_wander=0.01,
+    swing_ratio=(1.1, 2.5),
+    swing_wander=0.1,
+    swing_jitter=0.2,
+    final_rit_prob=0.3,
+    release_short_prob=(0.4, 0.8),
+    velocity_spread=(1.0, 1.8),
+    velocity_shift=(0.0, 18.0),
+    velocity_noise=8.5,
+    auto_pedal_prob=0.95,
+    pedal_rest_prob=(0.0, 0.3),
+    pedal_lift_early=(0.0, 0.25),
+)

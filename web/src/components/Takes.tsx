@@ -141,7 +141,90 @@ type DetailProps = {
   onContinue: (seconds: number) => void;
   onWav: () => Promise<void>;
   onDelete: () => void;
+  // 楽譜化 (原曲の音源のないプロジェクトでは scoreBlocked に理由を入れる)
+  scoreModel: string | null;
+  scoreBlocked: string | null;
+  scoreUrl: string;
+  onScoreModel: (id: string) => void;
+  onScore: () => void;
+  onCancelScore: () => void;
+  onOpenScore: () => void;
 };
+
+function ScoreSection(props: DetailProps) {
+  const { take, config } = props;
+  const t = useT();
+  const score = take.score;
+  const active = score?.state === "queued" || score?.state === "running";
+  const done = score?.state === "done";
+  const models = config.score_models ?? [];
+  const blocked = props.scoreBlocked ?? (models.length ? null : t.noScoreModels);
+  return (
+    <div className="score-section">
+      <div className="score-section-head">
+        <Icon name="score" size={16} />
+        <b>{t.score}</b>
+        {done && <span className="muted small">{t.scoreDone(score.measures ?? null)} · {shortModel(score.model.label)}</span>}
+      </div>
+      {models.length > 1 && (
+        <div className="field">
+          <label>{t.scoreModel}</label>
+          <select
+            value={props.scoreModel ?? models[0].id}
+            onChange={(e) => props.onScoreModel(e.target.value)}
+            disabled={active}
+          >
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {shortModel(m.label)}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {active ? (
+        <div className="take-progress">
+          <div className="bar">
+            <div style={{ width: `${Math.round((score.progress ?? 0) * 100)}%` }} />
+          </div>
+          <span className="muted small">
+            {score.state === "queued" ? t.scoreQueued : (progressText(t, score.message) ?? t.scoring)}
+          </span>
+          {score.job && (
+            <button className="icon-btn" onClick={props.onCancelScore} title={t.stop}>
+              <Icon name="stop" size={14} />
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="detail-actions">
+          {done && (
+            <>
+              <button className="btn primary" onClick={props.onOpenScore}>
+                <Icon name="score" size={16} /> {t.openScore}
+              </button>
+              <a className="btn" href={props.scoreUrl} download>
+                <Icon name="download" size={16} /> MusicXML
+              </a>
+            </>
+          )}
+          <button
+            className={`btn ${done ? "" : "primary"}`}
+            disabled={take.state !== "done" || !!blocked}
+            onClick={props.onScore}
+            title={blocked ?? t.scoreHelp}
+          >
+            {done ? t.remakeScore : t.makeScore}
+          </button>
+        </div>
+      )}
+      {blocked && !done && <div className="muted small">{blocked}</div>}
+      {(score?.state === "error" || score?.state === "cancelled") && (
+        <div className="error small">{score.state === "cancelled" ? t.stopped : score.error}</div>
+      )}
+    </div>
+  );
+}
 
 export function TakeDetail(props: DetailProps) {
   const { take, config } = props;
@@ -212,6 +295,8 @@ export function TakeDetail(props: DetailProps) {
           <Icon name="trash" size={16} />
         </button>
       </div>
+
+      <ScoreSection {...props} />
 
       <table className="params">
         <tbody>

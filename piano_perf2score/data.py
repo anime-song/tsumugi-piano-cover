@@ -26,6 +26,7 @@ MTIME の正解をずらした基準から測り直す (本当の小節線に戻
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import random
@@ -53,18 +54,27 @@ UNMARKED_TEMPO = (102.0, 0.33, 40.0, 220.0)  # 中央値・対数の標準偏差
 
 
 class PerformanceVocab:
-    """演奏の行の特徴 (種類・音高・ベロシティ・長さ) を 1 つの埋め込み表で引くための番号。0 は使わない (パディング)"""
+    """演奏の行の特徴 (種類・音高・ベロシティ・長さ) を 1 つの埋め込み表で引くための番号。0 は使わない (パディング)。
+    melody なら 5 列目にメロディの印を足す (印のある音だけ番号を入れ、ない音は 0)"""
 
     TYPES = ("note", "pedal_down", "pedal_up")
 
     def __init__(
-        self, velocity_bins: int = 16, duration_bins: int = 24, min_duration: float = 0.01, max_duration: float = 10.0
+        self,
+        velocity_bins: int = 16,
+        duration_bins: int = 24,
+        min_duration: float = 0.01,
+        max_duration: float = 10.0,
+        melody: bool = False,
     ) -> None:
         self.velocity_bins = velocity_bins
         self.duration_bins = duration_bins
         self.min_duration = min_duration
         self.max_duration = max_duration
+        self.melody = melody
         sizes = {"type": len(self.TYPES), "pitch": 128, "velocity": velocity_bins, "duration": duration_bins}
+        if melody:
+            sizes["melody"] = 1
         self.offset: dict[str, int] = {}
         start = 1
         for name, size in sizes.items():
@@ -73,10 +83,10 @@ class PerformanceVocab:
         self.size = start
 
     def rows(self, performance: Performance) -> tuple[np.ndarray, np.ndarray]:
-        """演奏の行の特徴 [n, 4] (埋め込み表の番号。使わない列は 0) と打鍵 (ペダル) の時刻のフレーム [n]"""
+        """演奏の行の特徴 [n, 4 (melody なら 5)] (埋め込み表の番号。使わない列は 0) と打鍵 (ペダル) の時刻のフレーム [n]"""
         o = self.offset
         notes = performance.notes
-        features = np.zeros((len(notes) + len(performance.pedal), 4), dtype=np.int64)
+        features = np.zeros((len(notes) + len(performance.pedal), 5 if self.melody else 4), dtype=np.int64)
         onset = np.zeros(len(features), dtype=np.int64)
         n = len(notes)
         if n:
@@ -88,6 +98,8 @@ class PerformanceVocab:
             scale = (self.duration_bins - 1) / math.log(self.max_duration / self.min_duration)
             features[:n, 3] = o["duration"] + np.round(np.log(duration / self.min_duration) * scale).astype(np.int64)
             onset[:n] = np.round(notes[:, 0] * FRAMES_PER_SECOND).astype(np.int64)
+            if self.melody and len(performance.melody) == n:
+                features[:n, 4] = np.where(performance.melody, o["melody"], 0)
         if len(performance.pedal):
             down = performance.pedal[:, 1] > 0
             features[n:, 0] = o["type"] + np.where(down, 1, 2)
@@ -107,7 +119,7 @@ def patch_rows(
     patch = onset // PATCH_FRAMES
     counts = np.bincount(patch, minlength=S)
     R = max(1, min(max_rows, int(counts.max()) if len(counts) else 1))
-    out_features = np.zeros((S, R, features.shape[1] if len(features) else 4), dtype=np.int64)
+    out_features = np.zeros((S, R, features.shape[1] if features.ndim == 2 else 4), dtype=np.int64)
     out_onset = np.zeros((S, R), dtype=np.int64)
     valid = np.zeros((S, R), dtype=bool)
     starts = np.concatenate([[0], np.cumsum(counts)])
@@ -154,6 +166,15 @@ def measure_times(
     return bins, decoded * FRAMES_PER_SECOND, ref * FRAMES_PER_SECOND
 
 
+def exact_measure_times(tokenizer: ScoreTokenizer, starts: np.ndarray) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """measure_times と同じ形で、開始と基準の時刻を本当の時刻 (フレーム) にしたもの。MTIME のビンは前の小節の本当の開始から測る"""
+    starts = np.asarray(starts, dtype=np.float64)
+    bins = [tokenizer.mtime_bin(max(-float(starts[0]), 0.0))] if len(starts) else []
+    bins += [tokenizer.mtime_bin(max(float(b - a), 0.0)) for a, b in itertools.pairwise(starts)]
+    ref = np.concatenate([[0.0], starts[:-1]]) if len(starts) else np.zeros(0)
+    return bins, starts * FRAMES_PER_SECOND, ref * FRAMES_PER_SECOND
+
+
 def make_item(
     tokenizer: ScoreTokenizer,
     vocab: PerformanceVocab,
@@ -168,9 +189,14 @@ def make_item(
     max_rows: int,
     train: bool,
     noise: RefNoise | None,
+    exact_starts: bool = False,
+    drop_durations: bool = False,
 ) -> dict[str, torch.Tensor]:
     """窓の前の文脈 first..start-1・窓 start..stop-1・その後ろの小節のトークン列 (bodies、MTIME なし) と、それを弾いた演奏
-    (measure_starts は bodies と同じ小節の並び) から、学習の 1 件を作る"""
+    (measure_starts は bodies と同じ小節の並び) から、学習の 1 件を作る。
+
+    exact_starts なら、小節の開始と基準の時刻に MTIME から戻した時刻ではなく本当の時刻を使う (拍の上の演奏
+    beat_input: 生成でも小節線が与えられるので、MTIME のビンの粗さで 4 分音符の長さの見積もりをずらさない)。drop_durations なら音の長さの列を消す (0、ペダルの行と同じ扱い)"""
     W = window_measures
     window = range(start - first, stop - first)
     noisy = None
@@ -178,7 +204,10 @@ def make_item(
         # DataLoader のワーカーごとに種が変わるのは random の方なので、numpy の乱数は使わない
         noisy = np.zeros(len(bodies), dtype=bool)
         noisy[list(window)] = [random.random() < noise.prob for _ in window]
-    bins, decoded, ref_all = measure_times(tokenizer, performance.measure_starts, noisy, noise)
+    if exact_starts:
+        bins, decoded, ref_all = exact_measure_times(tokenizer, performance.measure_starts)
+    else:
+        bins, decoded, ref_all = measure_times(tokenizer, performance.measure_starts, noisy, noise)
     ref = np.array([ref_all[k] for k in window])
     spq = np.array([(decoded[k] - ref_all[k]) / lengths[k - 1] if k > 0 else DEFAULT_SPQ for k in window])
     if start == 0 and len(decoded) > 1:
@@ -198,6 +227,8 @@ def make_item(
     patch_valid[: stop - start] = True
 
     features, onset = vocab.rows(performance)
+    if drop_durations:
+        features[:, 3] = 0
     end_frame = int(onset.max()) + 1 if len(onset) else 1
     perf_features, perf_onset, perf_valid = patch_rows(features, onset, max_rows, end_frame)
     pad = W - len(window)

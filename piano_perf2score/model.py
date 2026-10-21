@@ -49,6 +49,8 @@ class Perf2ScoreConfig:
     local_ahead: int = 1100
     # ScoreOnsetHead (位置のトークンに、対応する時刻の近くの打鍵の量を足す) の幅。0 なら使わない
     onset_head_dim: int = 64
+    # 演奏の行にメロディの印の列を足す (1 なら使う。拍の上の演奏 beat_input で、メロディを上の段に書かせるため)
+    melody_rows: int = 0
 
 
 def perf2score_config(values: dict) -> Perf2ScoreConfig:
@@ -75,7 +77,7 @@ class Perf2ScoreModel(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
         self.decoder = PianoARModel(model_config, tokenizer)
-        self.vocab = PerformanceVocab()
+        self.vocab = PerformanceVocab(melody=bool(config.melody_rows))
 
         dim = config.perf_dim or model_config.dim
         heads = dim // (model_config.dim // model_config.heads)
