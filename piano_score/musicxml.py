@@ -1217,6 +1217,9 @@ def _write_direction(parent: ET.Element, name: str) -> None:
     if kind == "metronome":
         _write_metronome(parent, *value.rsplit("_", 1))
         return
+    if kind == "chord":
+        _write_harmony(parent, value)
+        return
     direction = _sub(parent, "direction", placement="above" if kind in ("tempo", "mark") else "below")
     direction_type = _sub(direction, "direction-type")
     if kind == "mark":
@@ -1236,6 +1239,42 @@ def _write_direction(parent: ET.Element, name: str) -> None:
         _sub(direction_type, "pedal", type=value, line="yes")
         staff = 2
     _sub(direction, "staff", staff)
+
+
+# コード記号の種類 (書き出しのコード名の根音より後ろ) -> MusicXML の kind。表示は kind の text にコード名のまま書き、
+# kind はいちばん近い種類にする (前から順に、最初に当てはまる接頭辞)
+HARMONY_KINDS = (
+    ("mM7", "major-minor"), ("m7-5", "half-diminished"), ("m7", "minor-seventh"), ("m6", "minor-sixth"),
+("madd9", "minor"), ("m", "minor"), ("M7", "major-seventh"), ("7sus4", "suspended-fourth"),
+    ("7", "dominant"), ("augM7", "augmented"), ("aug7", "augmented-seventh"), ("aug", "augmented"),
+    ("dim7", "diminished-seventh"), ("dim", "diminished"), ("sus4", "suspended-fourth"), ("sus2", "suspended-second"),
+    ("6", "major-sixth"), ("5", "power"), ("", "major"),
+)  # fmt: skip
+HARMONY_NAME = re.compile(r"^([A-G])([#b]?)(.*?)(?:/([A-G])([#b]?))?$")
+
+
+def _write_harmony(parent: ET.Element, symbol: str) -> None:
+    """コード記号 ("Gbm7/Db"、"N.C.") を <harmony> にする"""
+    harmony = _sub(parent, "harmony", placement="above")
+    match = HARMONY_NAME.match(symbol)
+    if match is None:
+        # コードなし (N.C.) は MusicXML では kind = none で、根音は形だけ置く
+        _sub(_sub(harmony, "root"), "root-step", "C").set("text", "")
+        _sub(harmony, "kind", "none").set("text", symbol)
+    else:
+        step, accidental, quality, bass_step, bass_accidental = match.groups()
+        root = _sub(harmony, "root")
+        _sub(root, "root-step", step)
+        if accidental:
+            _sub(root, "root-alter", 1 if accidental == "#" else -1)
+        kind = next(k for prefix, k in HARMONY_KINDS if quality.startswith(prefix))
+        _sub(harmony, "kind", kind).set("text", quality)
+        if bass_step:
+            bass = _sub(harmony, "bass")
+            _sub(bass, "bass-step", bass_step)
+            if bass_accidental:
+                _sub(bass, "bass-alter", 1 if bass_accidental == "#" else -1)
+    _sub(harmony, "staff", 1)
 
 
 def _write_metronome(parent: ET.Element, unit: str, bpm: str) -> None:

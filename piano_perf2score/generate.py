@@ -14,6 +14,8 @@
 MTIME は与えた小節線から決めてモデルには予測させず (transcribe_on_beats)、最初の小節は拍が楽譜の何分音符かだけを選ぶ。
 書き出す前に、小節をまたぐ記譜の不整合 (タイ・ペダル・強弱の繰り返し・調号と綴り) を直し (tidy.tidy_score)、
 片手で弾けない和音を直す (playability.make_playable、--no-playable で外す)。
+--chords に原曲の MIDI (Cover Studio の source.mid) を渡すと、tsumugi のコードマーカーをコード記号として置く
+(chords.place_chords)。省略したときは --beat-midi にマーカーがあればそれを使う。
 スラーは確率が半分を超えないと選ばれず少なくなるので、--slur-bias でスラーの始まりと終わりのトークンの logit に足せる。
 
     python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
@@ -37,6 +39,7 @@ from piano_score.musicxml import write_musicxml
 from piano_score.tokenizer import EOS, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
 
 from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
+from .chords import place_chords, read_chord_markers
 from .data import FRAMES_PER_SECOND, PerformanceVocab, collate, patch_rows
 from .model import Perf2ScoreModel, perf2score_config
 from .playability import make_playable
@@ -199,9 +202,10 @@ def transcribe_on_beats(
     return patches[0]
 
 
-def beat_performance(midi: str | Path, annotation: dict) -> Performance:
+def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[float, str]] | None = None) -> Performance:
     """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から、拍の時刻の演奏を作る。
-    小節は注釈の小節の頭で区切り、音のある小節だけを残す。注釈のメロディから、メロディの印も付ける"""
+    小節は注釈の小節の頭で区切り、音のある小節だけを残す。注釈のメロディから、メロディの印も付ける。
+    chords (原曲の秒のコード、chords.read_chord_markers) を渡すと、拍の時刻にして performance.chords に入れる"""
     from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
     from piano_ar.config import TokenizerConfig
     from piano_ar.tokenizer import PianoTokenizer
@@ -217,6 +221,9 @@ def beat_performance(midi: str | Path, annotation: dict) -> Performance:
     keep = (bar_frames[1:] > first) & (bar_frames[:-1] <= last)
     performance, origin = on_beats(events, grid, bar_frames[:-1][keep], tokenizer)
     performance.melody = melody_from_annotation(performance, annotation, grid, origin)
+    if chords:
+        times = grid.beat_position(np.array([t for t, _ in chords]) * fr) * BEAT_SECONDS - origin
+        performance.chords = [(float(t), text) for t, (_, text) in zip(times, chords)]
     return performance
 
 
@@ -460,6 +467,9 @@ def main() -> None:
         "--slur-bias", type=float, default=0.0, help="--beat-midi で、スラーのトークンの logit に足す値"
     )
     parser.add_argument("--no-playable", action="store_true", help="--beat-midi で、片手で弾けない和音を直さない")
+    parser.add_argument(
+        "--chords", default=None, help="--beat-midi で、コードマーカーを読む MIDI (原曲。省略で --beat-midi)"
+    )
     parser.add_argument("--out", default=None, help="--midi のときの出力 (省略で MIDI と同じ名前の .musicxml)")
     parser.add_argument("--val-songs", type=int, default=0, help="検証曲を合成演奏にして楽譜に戻す曲数")
     parser.add_argument("--val-measures", type=int, default=16, help="--val-songs で使う冒頭の小節数")
@@ -490,7 +500,8 @@ def main() -> None:
         import json
 
         annotation = json.loads(Path(args.sheetsage).read_text(encoding="utf-8"))
-        performance = beat_performance(args.beat_midi, annotation)
+        chords = read_chord_markers(args.chords or args.beat_midi)
+        performance = beat_performance(args.beat_midi, annotation, chords)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             patches = transcribe_on_beats(
                 model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned,
@@ -498,9 +509,12 @@ def main() -> None:
             )  # fmt: skip
         out = Path(args.out or Path(args.beat_midi).with_suffix(".musicxml"))
         measures = tokenizer.decode(patches)[0]
-        print(tidy_score(measures))
+        tidied = tidy_score(measures)
+        print(tidied)
         if not args.no_playable:
             print(make_playable(measures))
+        if performance.chords:
+            print(f"コード記号 {place_chords(measures, performance, performance.chords, tidied.rests)} 個")
         write_musicxml(measures, out)
         print(f"{len(patches)} 小節 -> {out}")
     if args.midi:

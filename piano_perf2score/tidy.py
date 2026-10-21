@@ -129,6 +129,18 @@ def _spellings(pitch_class: int, key: int) -> list[int]:
     ]
 
 
+def spell_pitch_class(pitch_class: int, key: int, preferred: int | None = None) -> int:
+    """調号 key での音名の綴り (変化記号)。調の音ならその綴り、そうでなければ preferred (使えるとき)、
+    それもなければ調の中心に近い綴り (同じ近さなら #、短調の導音)"""
+    candidates = _spellings(pitch_class, key)
+    diatonic = [a for a in candidates if _diatonic(_position(pitch_class, a), key)]
+    if diatonic:
+        return diatonic[0]
+    if preferred in candidates:
+        return preferred
+    return min(candidates, key=lambda a: (abs(_position(pitch_class, a) - key - 2), -a))
+
+
 def _choose_key(counts: Counter, model_key: int) -> int:
     total = sum(counts.values())
 
@@ -155,15 +167,10 @@ def _respell(measures: list[Measure], stats: TidyStats) -> None:
         votes = Counter((n.pitch % 12, n.alter) for n in notes)
         spelling = {}
         for pc in counts:
-            candidates = _spellings(pc, key)
-            diatonic = [a for a in candidates if _diatonic(_position(pc, a), key)]
-            if diatonic:
-                spelling[pc] = diatonic[0]
-            elif key == model_key and any(votes[(pc, a)] for a in candidates):
-                spelling[pc] = max(candidates, key=lambda a: votes[(pc, a)])
-            else:
-                # 調の中心に近い綴り。同じ近さなら # (短調の導音)
-                spelling[pc] = min(candidates, key=lambda a: (abs(_position(pc, a) - key - 2), -a))
+            # 調号を変えていなければ、モデルの綴りの多いほうを使う
+            voted = [a for a in _spellings(pc, key) if votes[(pc, a)]]
+            preferred = max(voted, key=lambda a: votes[(pc, a)]) if voted and key == model_key else None
+            spelling[pc] = spell_pitch_class(pc, key, preferred)
         for n in notes:
             if n.alter != spelling[n.pitch % 12]:
                 n.alter = spelling[n.pitch % 12]
