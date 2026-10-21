@@ -335,7 +335,9 @@ def notation_rich(cache: ScoreCache) -> np.ndarray:
     (半分以上の曲にスラーがなく、生成のスラーが少ない原因なので、追加学習ではこういう曲に寄せる)"""
     tok = ScoreTokenizer(cache.tokenizer_config)
     is_pitch = np.array([kind == "pitch" for kind in tok.kinds])
-    is_dynamic = np.array([kind == "direction" and str(value).startswith("dyn_") for kind, value in zip(tok.kinds, tok.values)])
+    is_dynamic = np.array(
+        [kind == "direction" and str(value).startswith("dyn_") for kind, value in zip(tok.kinds, tok.values)]
+    )
     tokens = np.load(cache.cache_dir / "tokens.npy", mmap_mode="r")
     rich = np.zeros(len(cache.ids), dtype=bool)
     for song in range(len(cache.ids)):

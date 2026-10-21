@@ -237,9 +237,8 @@ def main() -> None:
         )  # fmt: skip
         # 2 つの重みの合計を 1 - ratio : ratio にする (それぞれの中は小節数に比例)
         extra_weights = sampler_weights(extra)
-        weights = np.concatenate(
-            [weights / weights.sum() * (1 - args.beat_extra_ratio), extra_weights / extra_weights.sum() * args.beat_extra_ratio]
-        )
+        ratio = args.beat_extra_ratio
+        weights = np.concatenate([weights / weights.sum() * (1 - ratio), extra_weights / extra_weights.sum() * ratio])
         datasets.append(extra)
         print(f"{args.beat_extra_cache} の {len(extra)} 曲を {args.beat_extra_ratio:.0%} の割合で混ぜる")
     real_val_set = None
