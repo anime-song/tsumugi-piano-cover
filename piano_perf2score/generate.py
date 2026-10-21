@@ -21,6 +21,9 @@ MTIME は与えた小節線から決めてモデルには予測させず (transc
 
     python -m piano_perf2score.generate --checkpoint checkpoints/piano_perf2score_beat/best.pt \\
         --beat-midi projects/<曲>/takes/t0001/cover.mid --sheetsage projects/<曲>/sheetsage.json --out 楽譜.musicxml
+
+--checkpoint には公開した重み (Hugging Face の anime-song/tsumugi-piano-cover-v2 の piano_perf2score/、
+piano_perf2score.export の出力) も渡せる。
 """
 
 from __future__ import annotations
@@ -35,7 +38,6 @@ import torch
 from piano_ar.config import ModelConfig
 from piano_ar.model import _sample
 from piano_score.config import ScoreTokenizerConfig
-from piano_score.generate import unseen_tokens
 from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
 from piano_score.score import Measure
@@ -555,7 +557,9 @@ def _decode(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint", required=True, help="学習のチェックポイント (.pt)・export の出力・Hugging Face の repository"
+    )
     parser.add_argument("--midi", default=None, help="楽譜にする演奏の MIDI")
     parser.add_argument(
         "--beat-midi", default=None, help="拍の上で作った演奏の MIDI (V2 のカバー)。--sheetsage と一緒に"
@@ -584,8 +588,10 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device)
-    model, tokenizer, checkpoint = load_checkpoint(args.checkpoint, device)
-    banned = unseen_tokens(checkpoint["token_counts"], tokenizer) if checkpoint.get("token_counts") is not None else None
+    from .hub import load_perf2score
+
+    # 学習のチェックポイント (.pt)・export の出力・Hugging Face の repository のどれでもよい
+    model, tokenizer, banned = load_perf2score(args.checkpoint, device)
     options = {"temperature": args.temperature, "top_p": args.top_p, "banned": banned, "first_qpm": args.first_qpm}
 
     def run(performance: Performance, max_measures: int, first_qpm: float | None = None) -> list[list[int]]:
