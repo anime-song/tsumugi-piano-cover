@@ -6,8 +6,12 @@
     - 旋律の音高と時間の連続性: 順次進行の多い乱歩、2・4 小節のフレーズ、フレーズの終わりは長い音か休符
     - 重なる音と独立したリズム: 上の段の伸ばす内声 (声部 2、1 音か 2〜3 音の和音。同じコードの間は小節線をまたいで
       タイでつなぎ、ときどき 8 分の和音 + 休符で区切る)、下の段の伸ばす低音と刻み (声部 1・2)
-    - 同時に鳴らす和音のまとまり: コードから片手で届く配置 (10 度以内) の和音
-    - 分散和音・オクターブなどの反復: 区間ごとに伴奏型を選び、同じ区間を繰り返すときは同じ書き方
+    - 同時に鳴らす和音のまとまり: コードから片手で届く配置 (10 度以内) の和音。コードは曲ごとに 7 度・9 度を入れる割合を
+      変え (Δ9・m9・7(b9) など)、右手の和音は 3 度・7 度・9 度で組む。コードは 1 小節に 2 つ・1 つ・2 小節に 1 つ
+    - 右手の書き方を区間ごとに選ぶ: 旋律だけ / 和音つきの旋律 (音ごとに下に 2 音、8 分にスタッカート) / オクターブ /
+      旋律 (4 分と 2 分にテヌート) + 下の声部の裏拍の和音 (8 分休符 + 8 分の和音、符尾は下)
+    - 分散和音・オクターブなどの反復: 区間ごとに伴奏型を選び、同じ区間を繰り返すときは同じ書き方。広い分散和音
+      (根音 -> 10 度 -> 5 度 -> 7 度を 8 分で、コードの区間ごとに折り返す) も入れる
     - 動くベースライン: 4 分音符で次のコードの根音へ順次進行でつなぎ、最後は半音で近づく (ときどきオクターブの跳躍)
     - 旋律はフレーズの頭を拍の休符から入ることがあり、拍の頭の音へ下から半音で近づく経過音も入れる
     - 声部の切り替わり: 内声を出し入れする頻度を曲ごとに変える
@@ -60,7 +64,12 @@ METERS = (
     ((6, 4), 2), ((9, 8), 2), ((3, 8), 2),
 )  # fmt: skip
 MELODY_RANGE = (60, 84)  # 旋律の音域 (C4〜C6)
-LH_PATTERNS = ("block", "oompah", "broken", "alberti", "octave", "pop8", "two_voice", "handoff", "bassline", "bassline")
+LOWEST_RIGHT = 55  # 右手の旋律の下に付ける和音の一番下 (G3。これより下は濁るので付けない)
+LH_PATTERNS = (
+    "block", "oompah", "broken", "alberti", "octave", "pop8", "two_voice", "handoff", "bassline", "bassline", "wide", "wide",
+)  # fmt: skip
+# 右手の書き方: 旋律 (拍の頭にときどき和音) / 和音つきの旋律 / オクターブ / 旋律 + 下の声部の裏拍の和音
+TEXTURES = ("plain", "plain", "chordal", "octave", "offbeat", "offbeat")
 INNER_STYLES = ("note", "pad", "pad_punct")  # 内声: 1 音を伸ばす / 和音を伸ばす / 和音を伸ばして最後に 8 分で区切る
 DYNAMIC_LEVELS = ("pp", "p", "mp", "mf", "f", "ff")
 # 拍のまとまり (4 分音符単位の長さ) の候補。ここにない拍子は拍子で決まる (複合拍子は付点 4 分、x/4 は 4 分、2/2 は 2 分)
@@ -90,6 +99,7 @@ class Song:
     inner_voice: float  # 上の段に内声を入れる小節の割合
     slur_phrases: float  # フレーズにスラーを付ける割合
     grouping: tuple[Fraction, ...] = ()  # 拍のまとまりの長さ (4 分音符単位)
+    tension: float = 0.3  # コードに 7 度を入れる割合 (9 度はその 6 割)
     measures: list[Measure] = field(default_factory=list)
 
     @property
@@ -162,6 +172,7 @@ def new_song(rng: random.Random) -> Song:
         qpm=rng.uniform(64, 176) * (1.5 if compound else 1.0), grid=grid, swing=swing,
         detached=rng.choice((0.0, 0.0, 0.15, 0.4)), syncopation=rng.uniform(0.0, 0.5),
         inner_voice=rng.choice((0.0, 0.0, 0.3, 0.7)), slur_phrases=rng.choice((0.3, 0.6, 0.9)), grouping=grouping,
+        tension=rng.choice((0.0, 0.3, 0.7)),
     )  # fmt: skip
 
 
@@ -210,9 +221,11 @@ def _groups(onset, length, pitches, staff, voice, song, articulations=(), alters
 # ----------------------------------------------------------------------
 # 和声
 # ----------------------------------------------------------------------
-def chord_pitch_classes(song: Song, degree: int, seventh: bool) -> list[int]:
+def chord_pitch_classes(song: Song, degree: int, seventh: bool, ninth: bool = False) -> list[int]:
+    """度数のコードの音名 [根音, 3 度, 5 度 (, 7 度 (, 9 度))]。9 度を入れるときは 7 度も入れる"""
     scale = SCALES[song.mode]
-    pcs = [(song.tonic + scale[(degree - 1 + k) % 7]) % 12 for k in (0, 2, 4, 6)[: 4 if seventh else 3]]
+    steps = (0, 2, 4) + ((6,) if seventh or ninth else ()) + ((8,) if ninth else ())
+    pcs = [(song.tonic + scale[(degree - 1 + k) % 7]) % 12 for k in steps]
     if song.mode == "minor" and degree == 5:
         pcs[1] = (pcs[1] + 1) % 12  # 短調の属和音は導音を上げる
     return pcs
@@ -231,6 +244,25 @@ def voicing(pcs: list[int], low: int, size: int) -> list[int]:
     while notes[-1] - notes[0] > 14 and len(notes) > 2:
         notes.pop()
     return notes
+
+
+def color_voicing(pcs: list[int], top: int, size: int) -> list[int]:
+    """top より下に置く右手の和音 (size 音、1 オクターブ以内)。7 度・9 度があれば 3 度・7 度・9 度、なければ 3 度・5 度・根音"""
+    order = (
+        [pcs[1], pcs[3], pcs[4]]
+        if len(pcs) >= 5
+        else [pcs[1], pcs[3], pcs[2]]
+        if len(pcs) == 4
+        else [pcs[1], pcs[2], pcs[0]]
+    )
+    notes = []
+    for pc in order[:size]:
+        pitch = top - 1
+        while pitch % 12 != pc:
+            pitch -= 1
+        notes.append(pitch)
+    notes = [p for p in notes if top - p <= 12]
+    return sorted(notes)
 
 
 # ----------------------------------------------------------------------
@@ -252,10 +284,11 @@ def beat_cells(song: Song, length: Fraction) -> list[list[tuple[Fraction, Fracti
 
 
 def melody_rhythm(
-    song: Song, rng: random.Random, phrase_end: bool, phrase_start: bool = False
+    song: Song, rng: random.Random, phrase_end: bool, phrase_start: bool = False, simple: bool = False
 ) -> list[tuple[Fraction, Fraction]]:
     """1 小節の旋律の (位置, 長さ)。フレーズの終わりは長い音と休符。フレーズの頭は拍の休符から入ることがある
-    (4 分休符 + 4 分音符の並びなど)"""
+    (4 分休符 + 4 分音符の並びなど)。simple なら拍の音符 (4 分と、ときどき 2 分や 8 分 2 つ) で歌う
+    (下の声部で裏拍の和音を刻むとき)"""
     pulses = song.pulses
     if phrase_end:
         held = song.bar if len(pulses) < 2 or rng.random() < 0.5 else song.bar - pulses[-1][1]
@@ -263,15 +296,25 @@ def melody_rhythm(
     notes = []
     rest_start = phrase_start and len(pulses) >= 2 and rng.random() < 0.35
     plain = rest_start and rng.random() < 0.5  # 休符のあとは拍の音符だけで歌う
-    for start, length in pulses[1 if rest_start else 0 :]:
+    skip = False
+    for k, (start, length) in enumerate(pulses[1 if rest_start else 0 :], start=1 if rest_start else 0):
+        if skip:
+            skip = False
+            continue
         cells = beat_cells(song, length)
-        if plain:
+        if simple and length == 1 and k + 1 < len(pulses) and pulses[k + 1][1] == 1 and rng.random() < 0.25:
+            notes.append((start, F(2)))  # 2 拍を 2 分音符で
+            skip = True
+            continue
+        if plain or (simple and rng.random() < 0.65):
             cell = cells[0]
+        elif simple:
+            cell = cells[1] if len(cells) > 1 else cells[0]
         else:
             cell = rng.choice(cells[:3]) if rng.random() < 0.4 else rng.choice(cells)
         notes += [(start + a, d) for a, d in cell]
     # シンコペーション: 4 分の拍の頭の音を消して、前の裏の音を伸ばす
-    if all(length == 1 for _, length in pulses) and rng.random() < song.syncopation:
+    if not simple and all(length == 1 for _, length in pulses) and rng.random() < song.syncopation:
         heads = [i for i, (a, _) in enumerate(notes) if i > 0 and a % 1 == 0 and notes[i - 1][0] % 1 == F(1, 2)]
         if heads:
             i = rng.choice(heads)
@@ -296,7 +339,7 @@ def melody_pitches(song: Song, rhythm, chords, rng: random.Random, state: list[i
             position = state[0] - step
         pitch = pitch_of(position)
         if onset in song.pulse_starts and rng.random() < 0.7:
-            chord = chords(onset)
+            chord = chords(onset)[:3]
             pitch = min((pitch + d for d in range(-3, 4)), key=lambda p: (p % 12 not in chord, abs(p - pitch)))
             position = next(
                 (q for q in range(position - 2, position + 3) if pitch_of(q) == pitch),
@@ -313,124 +356,160 @@ def melody_pitches(song: Song, rhythm, chords, rng: random.Random, state: list[i
 def left_hand(
     song: Song,
     pattern: str,
-    pcs: list[int],
+    spans: list[tuple[Fraction, Fraction, list[int], list[int]]],
     rng: random.Random,
     measure: Measure,
     melody_rests: bool,
-    next_pcs: list[int] | None = None,
     bass: dict | None = None,
 ) -> None:
-    """1 小節の左手 (と handoff では右手の上の分散和音) を measure に足す。bass はベースラインの続き
-    (次の小節の頭の音) を小節の間で受け渡す"""
-    bar, beat = song.bar, song.beat
-    root = 36 + (pcs[0] - 36) % 12  # C2〜B2
-    chord = voicing(pcs, 45 + (pcs[0] - 45) % 12 if rng.random() < 0.5 else 50, 3)  # A2〜D4 から
-    add = measure.groups.extend
-    if pattern == "block":
-        add(_groups(F(0), bar, [root, *chord], 2, 1, song))
-    elif pattern == "oompah":
-        staccato = ("staccato",) * (rng.random() < 0.6)
-        groups = song.groups
-        if song.irregular:
-            # まとまりごとに、頭で低音、残りで和音 (7/8 の 2+2+3 なら 低-和 低-和 低-和和)
-            for start, length in groups:
-                head = F(1, 2) if song.meter[1] == 8 else F(1)
-                add(_groups(start, head, [root], 2, 1, song))
-                add(_groups(start + head, length - head, chord, 2, 1, song, articulations=staccato))
-        else:
-            for k, (start, length) in enumerate(groups):
-                low = k == 0 or (len(groups) != 3 and k % 2 == 0)  # 3 拍子は 低-和-和
-                add(_groups(start, length, [root] if low else chord, 2, 1, song, () if low else staccato))
-    elif pattern in ("broken", "alberti", "handoff"):
-        unit = F(1, 2)
-        if pattern == "alberti":
-            cycle = [chord[0], chord[-1], chord[1], chord[-1]]
-        else:
-            third = next(p for p in range(root + 13, root + 25) if p % 12 in pcs[1:3])  # オクターブ上の 3 度か 5 度
-            cycle = [root, root + 7, root + 12, third]
-            cycle += cycle[-2:0:-1]
-        steps = int(bar / unit)
-        upper = pattern == "handoff" and melody_rests
-        line = [cycle[i % len(cycle)] for i in range(steps)]
-        if song.irregular and unit == F(1, 2):  # まとまりの頭で分散和音を折り返す
-            line = [cycle[i % len(cycle)] for _, length in song.groups for i in range(int(length / unit))]
-        if upper:  # 手をまたいで上がる分散和音: 後半を右手で 1 オクターブ上へ
-            line = [root, root + 7, *[p for k in range(4) for p in voicing(pcs, root + 12 * (1 + k), 3)]][:steps]
-        for i, pitch in enumerate(line):
-            staff = 1 if upper and pitch >= 60 else 2
-            group = _groups(i * unit, unit, [pitch], staff, 1, song)[0]
-            if i == 0:
-                group.slur_start = 1
-            if i == len(line) - 1:
-                group.slur_stop = 1
-            add([group])
-    elif pattern == "octave":
-        unit = beat if rng.random() < 0.5 else min(beat, F(1, 2))
-        t = F(0)
-        while t < bar:
-            add(_groups(t, unit, [root, root + 12], 2, 1, song))
-            t += unit
-    elif pattern == "pop8":
-        hits = [F(0), F(3, 2), F(2), F(7, 2)] if song.meter == (4, 4) else [F(0)]
-        for i, t in enumerate(hits):
-            length = (hits[i + 1] if i + 1 < len(hits) else bar) - t
-            add(_groups(t, length, [root] if i % 2 == 0 else chord, 2, 1, song))
-    elif pattern == "bassline":
-        units = song.groups if song.irregular else song.pulses  # まとまり (7/8 の 2+2+3) か拍ごとに 1 音
-        steps = len(units)
-        bass = {} if bass is None else bass
-        start = bass.get("next")
-        if start is None or start % 12 != pcs[0] or not 36 <= start <= 55:  # 音域から外れたら戻す
-            start = 40 + (pcs[0] - 40) % 12  # E2〜D#3
-        goal = (next_pcs or pcs)[0]
-        target = min((p for p in range(start - 6, start + 7) if p % 12 == goal), key=lambda p: abs(p - start))
-        scale = [p for p in range(24, 72) if _in_key(p % 12, song.key)]
-        if target == start:  # 同じコードが続くときは、コードの音を上がって戻る
-            tones = [p for p in range(start + 1, start + 13) if p % 12 in pcs[1:3]]
-            line = ([start, *tones, start + 12, *tones[::-1]] * 2)[:steps]
-        else:
-            line = [start]
-            for k in range(1, steps):
-                current = line[-1]
-                if k == steps - 1 and rng.random() < 0.5:
-                    line.append(target - 1 if target >= current else target + 1)  # 次の根音へ半音で近づく
-                    continue
-                direction = (target > current) - (target < current) or rng.choice((1, -1))
-                ordered = scale if direction > 0 else scale[::-1]
-                line.append(next(p for p in ordered if (p - current) * direction > 0))
-        if steps >= 3 and rng.random() < 0.25:
-            k = rng.randrange(1, steps - 1)
-            line[k] += 12 if line[k] < 48 else -12  # オクターブの跳躍 (次の音への半音の進みは崩さない)
-        bass["next"] = target
-        for (start, length), pitch in zip(units, line):
-            add(_groups(start, length, [pitch], 2, 1, song))
-    elif pattern == "two_voice":
-        add(_groups(F(0), bar, [root], 2, 1, song))
-        t = beat if beat <= 1 else F(1, 2)
-        unit = min(beat, F(1, 2)) if beat != 2 else F(1)
-        while t < bar:
-            add(_groups(t, unit, chord, 2, 2, song))
-            t += unit
+    """1 小節の左手 (と handoff では右手の上の分散和音) を measure に足す。spans は小節の中のコードの区間
+    [(位置, 長さ, コードの音名, 次のコードの音名)] で、伴奏型は区間ごとに頭から組み立てる (1 小節に 2 つのコード)。
+    bass はベースラインの続き (次の小節の頭の音) を小節の間で受け渡す"""
+    bass = {} if bass is None else bass
+    octave_unit = song.beat if rng.random() < 0.5 else min(song.beat, F(1, 2))
+    staccato = ("staccato",) * (rng.random() < 0.6)
+    for span_start, bar, pcs, next_pcs in spans:
+
+        def put(t, length, pitches, staff=2, voice=1, articulations=(), span_start=span_start):
+            groups = _groups(span_start + t, length, pitches, staff, voice, song, articulations)
+            measure.groups.extend(groups)
+            return groups
+
+        groups = [(s - span_start, n) for s, n in song.groups if span_start <= s < span_start + bar]
+        pulses = [(s - span_start, n) for s, n in song.pulses if span_start <= s < span_start + bar]
+        root = 36 + (pcs[0] - 36) % 12  # C2〜B2
+        chord = voicing(pcs[:3], 45 + (pcs[0] - 45) % 12 if rng.random() < 0.5 else 50, 3)  # A2〜D4 から
+        if pattern == "block":
+            put(F(0), bar, [root, *chord])
+        elif pattern == "oompah":
+            if song.irregular:
+                # まとまりごとに、頭で低音、残りで和音 (7/8 の 2+2+3 なら 低-和 低-和 低-和和)
+                for start, length in groups:
+                    head = F(1, 2) if song.meter[1] == 8 else F(1)
+                    put(start, head, [root])
+                    put(start + head, length - head, chord, articulations=staccato)
+            else:
+                for k, (start, length) in enumerate(groups):
+                    low = k == 0 or (len(groups) != 3 and k % 2 == 0)  # 3 拍子は 低-和-和
+                    put(start, length, [root] if low else chord, articulations=() if low else staccato)
+        elif pattern in ("broken", "alberti", "handoff", "wide"):
+            unit = F(1, 2)
+            if pattern == "alberti":
+                cycle = [chord[0], chord[-1], chord[1], chord[-1]]
+            elif pattern == "wide":
+                # 広い分散和音: 根音 -> 10 度 -> 5 度 (+8 度) -> 7 度か 10 度。上の音が高くなりすぎないよう根音は B♭1〜A2
+                root = 34 + (pcs[0] - 34) % 12
+                tenth = next(p for p in range(root + 13, root + 25) if p % 12 == pcs[1])
+                fifth = next(p for p in range(root + 13, root + 25) if p % 12 == pcs[2])
+                top = next((p for p in range(tenth + 1, tenth + 13) if len(pcs) > 3 and p % 12 == pcs[3]), tenth)
+                cycle = [root, tenth, fifth, top]
+            else:
+                third = next(p for p in range(root + 13, root + 25) if p % 12 in pcs[1:3])  # オクターブ上の 3 度か 5 度
+                cycle = [root, root + 7, root + 12, third]
+                cycle += cycle[-2:0:-1]
+            steps = int(bar / unit)
+            upper = pattern == "handoff" and melody_rests and len(spans) == 1
+            line = [cycle[i % len(cycle)] for i in range(steps)]
+            if song.irregular:  # まとまりの頭で分散和音を折り返す
+                line = [cycle[i % len(cycle)] for _, length in groups for i in range(int(length / unit))]
+            if upper:  # 手をまたいで上がる分散和音: 後半を右手で 1 オクターブ上へ
+                line = [root, root + 7, *[p for k in range(4) for p in voicing(pcs[:3], root + 12 * (1 + k), 3)]]
+                line = line[:steps]
+            for i, pitch in enumerate(line):
+                group = put(i * unit, unit, [pitch], staff=1 if upper and pitch >= 60 else 2)[0]
+                if pattern != "wide" and i == 0:
+                    group.slur_start = 1
+                if pattern != "wide" and i == len(line) - 1:
+                    group.slur_stop = 1
+        elif pattern == "octave":
+            t = F(0)
+            while t < bar:
+                put(t, octave_unit, [root, root + 12])
+                t += octave_unit
+        elif pattern == "pop8":
+            hits = {F(4): [F(0), F(3, 2), F(2), F(7, 2)], F(2): [F(0), F(3, 2)]}.get(bar, [F(0)])
+            for i, t in enumerate(hits):
+                length = (hits[i + 1] if i + 1 < len(hits) else bar) - t
+                put(t, length, [root] if i % 2 == 0 else chord)
+        elif pattern == "bassline":
+            units = groups if song.irregular else pulses  # まとまり (7/8 の 2+2+3) か拍ごとに 1 音
+            steps = len(units)
+            start = bass.get("next")
+            if start is None or start % 12 != pcs[0] or not 36 <= start <= 55:  # 音域から外れたら戻す
+                start = 40 + (pcs[0] - 40) % 12  # E2〜D#3
+            goal = next_pcs[0]
+            target = min((p for p in range(start - 6, start + 7) if p % 12 == goal), key=lambda p: abs(p - start))
+            scale = [p for p in range(24, 72) if _in_key(p % 12, song.key)]
+            if target == start:  # 同じコードが続くときは、コードの音を上がって戻る
+                tones = [p for p in range(start + 1, start + 13) if p % 12 in pcs[1:3]]
+                line = ([start, *tones, start + 12, *tones[::-1]] * 2)[:steps]
+            else:
+                line = [start]
+                for k in range(1, steps):
+                    current = line[-1]
+                    if k == steps - 1 and rng.random() < 0.5:
+                        line.append(target - 1 if target >= current else target + 1)  # 次の根音へ半音で近づく
+                        continue
+                    direction = (target > current) - (target < current) or rng.choice((1, -1))
+                    ordered = scale if direction > 0 else scale[::-1]
+                    line.append(next(p for p in ordered if (p - current) * direction > 0))
+            if steps >= 3 and rng.random() < 0.25:
+                k = rng.randrange(1, steps - 1)
+                line[k] += 12 if line[k] < 48 else -12  # オクターブの跳躍 (次の音への半音の進みは崩さない)
+            bass["next"] = target
+            for (start, length), pitch in zip(units, line):
+                put(start, length, [pitch])
+        elif pattern == "two_voice":
+            put(F(0), bar, [root])
+            beat = song.beat
+            t = beat if beat <= 1 else F(1, 2)
+            unit = min(beat, F(1, 2)) if beat != 2 else F(1)
+            while t < bar:
+                put(t, unit, chord, voice=2)
+                t += unit
 
 
-def right_hand(song: Song, rhythm, pitches, chords, rng: random.Random, measure: Measure, octave: bool) -> None:
+def right_hand(song: Song, rhythm, pitches, chords, rng: random.Random, measure: Measure, texture: str) -> None:
+    """旋律 (上の段の声部 1)。texture: plain (拍の頭にときどき和音) / chordal (音ごとに下に 2 音の和音) /
+    octave (オクターブで重ねる) / offbeat (旋律だけ。下の声部で裏拍の和音を刻む)"""
     for (onset, length), pitch in zip(rhythm, pitches):
         notes = [pitch]
-        if octave:
+        if texture == "octave":
             notes.append(pitch - 12)
-        elif onset in song.pulse_starts and rng.random() < 0.35:
-            below = [p for p in range(pitch - 9, pitch) if p % 12 in chords(onset)]
+        elif texture == "chordal" and length >= F(1, 2):
+            notes += [p for p in color_voicing(chords(onset), pitch, 2) if p >= LOWEST_RIGHT]
+        elif texture == "plain" and onset in song.pulse_starts and rng.random() < 0.35:
+            below = [p for p in range(pitch - 9, pitch) if p % 12 in chords(onset)[:3]]
             notes += below[-rng.choice((1, 2)) :] if below else []
-        written = length
         articulations = ()
         group_head = song.irregular and onset in {start for start, _ in song.groups[1:]}
-        if rng.random() < song.detached and length <= max(song.grouping):
+        if texture == "offbeat" and length >= 1 and rng.random() < 0.6:
+            articulations = ("tenuto",)  # 裏拍の和音の上で歌う旋律の拍の音
+        elif texture == "chordal" and length == F(1, 2) and rng.random() < 0.35:
+            articulations = ("staccato",)
+        elif texture == "chordal" and length >= 1 and rng.random() < 0.3:
+            articulations = ("tenuto",)
+        elif rng.random() < song.detached and length <= max(song.grouping):
             articulations = ("staccato",)  # 短く切る音は音価を詰めずにスタッカートで書く
         elif group_head and rng.random() < 0.25:
             articulations = ("accent",)  # 変拍子のまとまりの頭を見せる
         elif onset not in song.pulse_starts and rng.random() < 0.05:
             articulations = ("accent",)
-        measure.groups.extend(_groups(onset, written, notes, 1, 1, song, articulations))
+        measure.groups.extend(_groups(onset, length, notes, 1, 1, song, articulations))
+
+
+def offbeat_chords(song: Song, chords, melody_low: int, measure: Measure, rng: random.Random) -> None:
+    """上の段の下の声部 (声部 2) で裏拍の和音を刻む: 4 分の拍は 8 分休符 + 8 分の和音、付点 4 分の拍は裏の 8 分 2 つ"""
+    top = min(melody_low, 72)
+    if top <= 62:
+        return
+    staccato = ("staccato",) * (rng.random() < 0.4)
+    for start, length in song.pulses:
+        offsets = {F(1): [F(1, 2)], F(3, 2): [F(1, 2), F(1)]}.get(length, [])
+        for offset in offsets:
+            notes = [p for p in color_voicing(chords(start + offset), top, rng.choice((2, 3))) if p >= LOWEST_RIGHT]
+            if notes:
+                measure.groups.extend(_groups(start + offset, F(1, 2), notes, 1, 2, song, staccato))
 
 
 def inner_voice(
@@ -502,25 +581,32 @@ def generate(rng: random.Random) -> Song:
             continue
         pattern = rng.choice(LH_PATTERNS)
         level = rng.choice(DYNAMIC_LEVELS[1:5])
-        octave = label != "A" and rng.random() < 0.3
+        texture = rng.choice(TEXTURES) if label != "A" or rng.random() < 0.6 else "plain"
         inner_style = rng.choice(INNER_STYLES)
-        slow_harmony = rng.random() < 0.3  # コードを 2 小節ずつ (内声の和音が小節線をまたいでタイでつながる)
+        # コードは 1 小節に 2 つ (半分ずつ)、1 つ、2 小節に 1 つ (内声の和音が小節線をまたいでタイでつながる)
+        even = not song.irregular and len(song.groups) % 2 == 0 and song.bar >= 2
+        rate = rng.choices(("half", "bar", "slow"), weights=(0.35 if even else 0.0, 0.4, 0.25))[0]
         count = phrase * rng.choice((1, 2))
-        harmony = [
-            chord_pitch_classes(
-                song, progression[(k // 2 if slow_harmony else k) % len(progression)], rng.random() < 0.3
-            )
-            for k in range(count + 1)
-        ]
-        if slow_harmony:
-            harmony = [harmony[k - k % 2] for k in range(count + 1)]
+        per_bar = 2 if rate == "half" else 1
+        slots = []
+        for k in range(count * per_bar + 1):
+            degree = progression[(k // 2 if rate == "slow" else k) % len(progression)]
+            ninth = rng.random() < song.tension * 0.6
+            slots.append(chord_pitch_classes(song, degree, rng.random() < song.tension, ninth))
+        if rate == "slow":
+            slots = [slots[k - k % 2] for k in range(len(slots))]
         bars, held, bass = [], None, {}
         for i in range(count):
             measure = Measure(song.meter, song.key, ("G2", "F4"), song.bar, swing="8th" if song.swing else "none")
-            pcs = harmony[i]
+            half = song.bar / per_bar
+            spans = [(half * j, half, slots[i * per_bar + j], slots[i * per_bar + j + 1]) for j in range(per_bar)]
+
+            def chords(t, spans=spans):
+                return next(pcs for start, length, pcs, _ in spans if start <= t < start + length)
+
             phrase_end = i % phrase == phrase - 1
-            rhythm = melody_rhythm(song, rng, phrase_end, phrase_start=i % phrase == 0)
-            pitches = melody_pitches(song, rhythm, lambda _t, pcs=pcs: pcs, rng, melody_state)
+            rhythm = melody_rhythm(song, rng, phrase_end, phrase_start=i % phrase == 0, simple=texture == "offbeat")
+            pitches = melody_pitches(song, rhythm, chords, rng, melody_state)
             for k in range(len(rhythm) - 1):
                 # 拍の頭の音へ下から半音で近づく経過音 (裏の音を置き換える)
                 on, nxt = rhythm[k][0], rhythm[k + 1][0]
@@ -535,15 +621,21 @@ def generate(rng: random.Random) -> Song:
             handoff = phrase_end and pattern == "handoff"  # フレーズの終わりは旋律を休み、分散和音を右手へ渡す
             held_next = None
             if not handoff:
-                right_hand(song, rhythm, pitches, lambda _t, pcs=pcs: pcs, rng, measure, octave)
-                if rng.random() < song.inner_voice and not octave:
+                right_hand(song, rhythm, pitches, chords, rng, measure, texture)
+                if texture == "offbeat" and not phrase_end:
+                    offbeat_chords(song, chords, min(pitches), measure, rng)
+                elif texture == "plain" and per_bar == 1 and rng.random() < song.inner_voice:
                     # 和音を 2 小節伸ばすときは、1 小節目は伸ばしきり 2 小節目の終わりで区切る
-                    style = "pad" if inner_style == "pad_punct" and slow_harmony and i % 2 == 0 else inner_style
-                    held_next = inner_voice(song, pcs, min(pitches), measure, style, held)
+                    style = "pad" if inner_style == "pad_punct" and rate == "slow" and i % 2 == 0 else inner_style
+                    held_next = inner_voice(song, spans[0][2], min(pitches), measure, style, held)
             held = held_next
-            left_hand(song, pattern, pcs, rng, measure, handoff, harmony[i + 1], bass)
-            if pattern in ("block", "broken", "alberti", "two_voice", "handoff", "octave") and rng.random() < 0.9:
-                measure.directions += [(F(0), "pedal_stop"), (F(0), "pedal_start")]
+            left_hand(song, pattern, spans, rng, measure, handoff, bass)
+            if (
+                pattern in ("block", "broken", "alberti", "two_voice", "handoff", "octave", "wide")
+                and rng.random() < 0.9
+            ):
+                for start, _, _, _ in spans:
+                    measure.directions += [(start, "pedal_stop"), (start, "pedal_start")]
             if i == 0:
                 measure.directions.append((F(0), f"dyn_{level}"))
             bars.append(measure)
