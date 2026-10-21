@@ -26,6 +26,8 @@ V2 のカバー -> 楽譜 (拍の上の演奏、piano_perf2score.beat_input) は
 --melody-rows 1 でメロディの印の列を足し (--init-from の重みに列がなければ、その行だけ新しく初期化する)、
 --drop-durations で音の長さの列を消す窓の割合を決める。
 --swing-prob で、8 分主体の窓をスイングの楽譜に書き換える割合を決める (beat_input.straight_eighths)。
+--songs-file で使う曲の一覧 (beat_songs_rich.npz など) を選び、--beat-extra-cache で別の楽譜のキャッシュ
+(PERiScoPe の楽譜など) を --beat-extra-ratio の割合で混ぜる。検証は --cache-dir の曲のまま。
 """
 
 from __future__ import annotations
@@ -75,6 +77,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument(
         "--swing-prob", type=float, default=0.0, help="--beat-input で、8 分主体の窓をスイングの楽譜に書き換える割合"
     )
+    parser.add_argument("--songs-file", default="beat_songs.npz", help="--beat-input で使う曲の一覧 (キャッシュの中)")
+    parser.add_argument("--beat-extra-cache", default=None, help="--beat-input で混ぜる別の楽譜のキャッシュ")
+    parser.add_argument("--beat-extra-ratio", type=float, default=0.3, help="--beat-extra-cache を混ぜる割合")
     parser.add_argument("--window-measures", type=int, default=32)
     parser.add_argument("--context-measures", type=int, default=2, help="窓の前に演奏を描き出す小節数")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -213,7 +218,7 @@ def main() -> None:
         train_beat = {**beat, "swing_prob": args.swing_prob}
         train_set = BeatSynthWindowDataset(
             cache, split="train", augment=augment, song_start_prob=args.song_start_prob,
-            songs=load_songs(cache, "train"), **train_beat, **common,
+            songs=load_songs(cache, "train", args.songs_file), **train_beat, **common,
         )  # fmt: skip
         val_set = BeatSynthWindowDataset(cache, split="val", songs=load_songs(cache, "val"), **beat, **common)
     else:
@@ -224,6 +229,19 @@ def main() -> None:
     val_set.songs = val_set.songs[: args.val_songs]
     weights = sampler_weights(train_set, args.rare_meter_weight)
     datasets: list = [train_set]
+    if args.beat_input and args.beat_extra_cache:
+        extra_cache = ScoreCache(args.beat_extra_cache)
+        extra = BeatSynthWindowDataset(
+            extra_cache, split="train", augment=augment, song_start_prob=args.song_start_prob,
+            songs=load_songs(extra_cache, "train"), **train_beat, **common,
+        )  # fmt: skip
+        # 2 つの重みの合計を 1 - ratio : ratio にする (それぞれの中は小節数に比例)
+        extra_weights = sampler_weights(extra)
+        weights = np.concatenate(
+            [weights / weights.sum() * (1 - args.beat_extra_ratio), extra_weights / extra_weights.sum() * args.beat_extra_ratio]
+        )
+        datasets.append(extra)
+        print(f"{args.beat_extra_cache} の {len(extra)} 曲を {args.beat_extra_ratio:.0%} の割合で混ぜる")
     real_val_set = None
     if args.real_cache_dir:
         real_cache = PairCache(args.real_cache_dir)

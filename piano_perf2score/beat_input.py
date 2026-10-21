@@ -28,6 +28,8 @@ V2 の拍は SheetSage2-Refined の拍なので、楽譜の拍と階層が違う
 「まっすぐの 8 分 + Swing の指定」になる。
 
     python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth     # beat_songs.npz を作る
+    python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth --rich   # 記号の丁寧な曲 (beat_songs_rich.npz)
+    python -m piano_perf2score.beat_input --cache-dir data/piano_score/periscope_scores --all   # 全曲 (PERiScoPe の楽譜)
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from piano_ar.tokenizer import KIND_NOTE, KIND_PEDAL_OFF, KIND_PEDAL_ON
 from piano_score.data import ScoreCache
 from piano_score.quality import low_quality
 from piano_score.score import Measure
-from piano_score.tokenizer import EOS, ScoreTokenizer
+from piano_score.tokenizer import EOS, SLUR_START, ScoreTokenizer
 
 from .data import FRAMES_PER_SECOND, UNMARKED_TEMPO, PerformanceVocab, SynthWindowDataset, make_item
 from .render import COVER_RENDER, Performance, _score_notes, beat_positions, measure_qpm, render
@@ -57,6 +59,8 @@ MIN_PITCH_SPAN = 39  # カバーの音域の下位 25% (local/probe_score_input_
 # 丸める格子の拍: 楽譜の拍 1 つを何拍にするか。0.5 は 2 拍をまとめて 1 拍 (小節の拍の数が偶数のときだけ)
 LEVEL_PROBS = {1: 0.7, 2: 0.15, 0.5: 0.1, 3: 0.05}
 SONGS_FILE = "beat_songs.npz"
+RICH_SONGS_FILE = "beat_songs_rich.npz"
+RICH_SLURS = 0.01  # 記号の丁寧な曲: スラーの数 / 音の数の下限 (強弱記号も 1 つ以上あること)
 MELODY_TICKS = 2  # メロディの音と演奏の音を同じ位置とみなすずれ (刻み)
 MELODY_DROP_SONG = 0.3
 MELODY_DROP_NOTE = 0.1
@@ -326,8 +330,25 @@ def select_songs(
     return {"songs": np.flatnonzero(ok), "spans": spans}
 
 
-def load_songs(cache: ScoreCache, split: str) -> np.ndarray:
-    data = np.load(cache.cache_dir / SONGS_FILE)
+def notation_rich(cache: ScoreCache) -> np.ndarray:
+    """曲ごとに、スラーが RICH_SLURS 以上 (音あたり) あり、強弱記号もあるか [S]。今のコーパスの約 16%
+    (半分以上の曲にスラーがなく、生成のスラーが少ない原因なので、追加学習ではこういう曲に寄せる)"""
+    tok = ScoreTokenizer(cache.tokenizer_config)
+    is_pitch = np.array([kind == "pitch" for kind in tok.kinds])
+    is_dynamic = np.array([kind == "direction" and str(value).startswith("dyn_") for kind, value in zip(tok.kinds, tok.values)])
+    tokens = np.load(cache.cache_dir / "tokens.npy", mmap_mode="r")
+    rich = np.zeros(len(cache.ids), dtype=bool)
+    for song in range(len(cache.ids)):
+        lo = cache.token_offsets[cache.measure_offsets[song]]
+        hi = cache.token_offsets[cache.measure_offsets[song + 1]]
+        t = np.asarray(tokens[lo:hi], dtype=np.int64)
+        notes = max(1, int(is_pitch[t].sum()))
+        rich[song] = (t == SLUR_START).sum() / notes >= RICH_SLURS and bool(is_dynamic[t].any())
+    return rich
+
+
+def load_songs(cache: ScoreCache, split: str, name: str = SONGS_FILE) -> np.ndarray:
+    data = np.load(cache.cache_dir / name)
     songs = data["songs"]
     return songs[cache.is_val[songs]] if split == "val" else songs[~cache.is_val[songs]]
 
@@ -337,15 +358,23 @@ def main() -> None:
     parser.add_argument("--cache-dir", default="data/piano_score/synth")
     parser.add_argument("--quality", default="data/piano_score/quality.json")
     parser.add_argument("--min-pitch-span", type=float, default=MIN_PITCH_SPAN)
+    parser.add_argument("--rich", action="store_true", help="選んだ曲のうち記号の丁寧な曲だけを beat_songs_rich.npz に書く")
+    parser.add_argument("--all", action="store_true", help="品質と音域で選ばず全曲を beat_songs.npz に書く (PERiScoPe)")
     args = parser.parse_args()
     cache = ScoreCache(args.cache_dir)
-    selected = select_songs(cache, args.quality, args.min_pitch_span)
-    np.savez(cache.cache_dir / SONGS_FILE, **selected, min_span=args.min_pitch_span)
+    name = RICH_SONGS_FILE if args.rich else SONGS_FILE
+    if args.all:
+        selected = {"songs": np.arange(len(cache.ids)), "spans": song_pitch_spans(cache)}
+    else:
+        selected = select_songs(cache, args.quality, args.min_pitch_span)
+    if args.rich:
+        selected["songs"] = selected["songs"][notation_rich(cache)[selected["songs"]]]
+    np.savez(cache.cache_dir / name, **selected, min_span=args.min_pitch_span)
     songs = selected["songs"]
     measures = int(sum(cache.num_measures(int(s)) for s in songs))
     print(
         f"{len(songs)} / {len(cache.ids)} 曲 (検証 {int(cache.is_val[songs].sum())})、{measures} 小節を "
-        f"{cache.cache_dir / SONGS_FILE} に書いた"
+        f"{cache.cache_dir / name} に書いた"
     )
 
 

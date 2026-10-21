@@ -1,6 +1,7 @@
 """事前学習用の楽譜 (Dataset/piano_musicxml) をまとめて小節ごとのトークン列のキャッシュにする。
 
     python -m piano_score.prepare
+    python -m piano_score.prepare --dir Dataset/PERiScoPe/PERiScoPe-1.1/data --glob "**/score.m*"         --out-dir data/piano_score/periscope_scores --visible-only     # PERiScoPe の楽譜 (曲 ID はフォルダの相対パス)
 
 反復記号は展開してから並べる。読めない楽譜 (段の構成が違う・対応していない記号など) は飛ばし、理由ごとの数を meta.json に残す。
 MTIME (演奏上の小節の開始時刻) は学習時に決める (楽譜だけの事前学習ではテンポ記号から、合成演奏では描き出した時刻から)
@@ -56,6 +57,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="動作確認用に先頭から何曲だけ使うか (0 なら全部)")
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument(
+        "--glob", default=None, help="--dir の下を再帰的に探すパターン (省略で --dir 直下の *.musicxml)。曲 ID は親フォルダの相対パス"
+    )
+    parser.add_argument(
         "--visible-only",
         action="store_true",
         help="見えない音符と cue サイズの音符を除く (合成演奏と組にする 2 段目のデータ。musicxml._hidden_note)",
@@ -65,7 +69,10 @@ def main() -> None:
     tokenizer = ScoreTokenizer()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    names = sorted(n for n in os.listdir(args.dir) if n.endswith(".musicxml"))
+    if args.glob:
+        names = sorted(str(p.relative_to(args.dir)).replace(os.sep, "/") for p in Path(args.dir).glob(args.glob))
+    else:
+        names = sorted(n for n in os.listdir(args.dir) if n.endswith(".musicxml"))
     if args.limit:
         names = names[: args.limit]
     print(f"楽譜 {len(names)} 曲")
@@ -84,7 +91,7 @@ def main() -> None:
                 if len(patches) < args.min_measures:
                     errors["小節が少なすぎる"] += 1
                 else:
-                    song_id = name.removesuffix(".musicxml")
+                    song_id = str(Path(name).parent).replace(os.sep, "/") if args.glob else name.removesuffix(".musicxml")
                     tokens_list += patches
                     token_lengths += [len(p) for p in patches]
                     seconds_list.append(seconds)
