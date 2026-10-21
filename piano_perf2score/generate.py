@@ -26,6 +26,7 @@ MTIME は与えた小節線から決めてモデルには予測させず (transc
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,7 @@ from piano_score.config import ScoreTokenizerConfig
 from piano_score.generate import unseen_tokens
 from piano_score.grammar import ScoreGrammar
 from piano_score.musicxml import write_musicxml
+from piano_score.score import Measure
 from piano_score.tokenizer import EOS, MLEN, PAD, SLUR_START, SLUR_STOP, ScoreTokenizer
 
 from .beat_input import BEAT_SECONDS, melody_from_annotation, on_beats
@@ -179,12 +181,14 @@ def transcribe_on_beats(
     search_measures: int = 8,
     drop_durations: bool = True,
     slur_bias: float = 0.0,
+    on_measure: Callable[[int, int], None] | None = None,
 ) -> list[list[int]]:
     """拍の時刻の演奏 (beat_input.on_beats、measure_starts に小節線) から楽譜を生成する。小節の開始は与えたものを使い、
     MTIME はそこから決める。拍子は performance.meters (SheetSage2-Refined の小節の拍子) があればそれに決め、1 拍は
     その拍子の分母の音符にする。なければ、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭 search_measures 小節を
     生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ (スラーの足し値は掛けずに比べる)。
-    drop_durations なら音の長さを消して入れる (カバーの短い打鍵をそのまま音価にしない)"""
+    drop_durations なら音の長さを消して入れる (カバーの短い打鍵をそのまま音価にしない)。
+    on_measure は本番の生成 (拍の探索の後) の小節ごとに呼ぶ (_decode)"""
     device = next(model.parameters()).device
     batch = performance_batch(performance, vocab=model.vocab, drop_durations=drop_durations)
     batch = {k: v.to(device) for k, v in batch.items()}
@@ -213,9 +217,42 @@ def transcribe_on_beats(
         best = int(np.argmax(per_beat))
     patches, _, _ = _decode(
         model, tokenizer, first_spq=[spq[best]], max_measures=len(starts), stop_frame=None,
-        temperature=temperature, top_p=top_p, given_starts=starts, **common,
+        temperature=temperature, top_p=top_p, given_starts=starts, on_measure=on_measure, **common,
     )  # fmt: skip
     return patches[0]
+
+
+def score_from_cover(
+    model: Perf2ScoreModel,
+    tokenizer: ScoreTokenizer,
+    midi: str | Path,
+    annotation: dict,
+    chords_midi: str | Path | None = None,
+    *,
+    banned: torch.Tensor | None = None,
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    slur_bias: float = 0.0,
+    on_measure: Callable[[int, int], None] | None = None,
+) -> list[Measure]:
+    """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から楽譜の小節を作る。
+    生成の後に、記譜の不整合の手直し (tidy)・オクターブ記号と音部記号 (staves)・原曲の小節線の秒からのテンポ (beat_tempo)・
+    chords_midi (原曲の MIDI、省略で midi) のコードマーカーからのコード記号 (chords) を入れる。write_musicxml で書き出す"""
+    chords = read_chord_markers(chords_midi or midi)
+    performance = beat_performance(midi, annotation, chords)
+    device = next(model.parameters()).device
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        patches = transcribe_on_beats(
+            model, tokenizer, performance, temperature=temperature, top_p=top_p, banned=banned,
+            slur_bias=slur_bias, on_measure=on_measure,
+        )  # fmt: skip
+    measures = tokenizer.decode(patches)[0]
+    tidied = tidy_score(measures)
+    readable_staves(measures)
+    apply_bar_tempos(measures, performance, tidied.rests)
+    if performance.chords:
+        place_chords(measures, performance, performance.chords, tidied.rests)
+    return measures
 
 
 def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[float, str]] | None = None) -> Performance:
@@ -309,6 +346,7 @@ def _decode(
     given_starts: np.ndarray | None = None,
     slur_bias: float = 0.0,
     time_signatures: list[tuple[int, int] | None] | None = None,
+    on_measure: Callable[[int, int], None] | None = None,
 ) -> tuple[list[list[list[int]]], list[float], list[float]]:
     """小節を 1 つずつ生成する。first_spq の数だけの行 (曲の最初の小節の 4 分音符の長さだけが違う) を、バッチとして同時に
     進める。Local は 1 トークンずつ KV cache で計算し、演奏の行の k / v は小節ごとに作り置く。文法は行ごとに CPU で確かめる。
@@ -318,7 +356,8 @@ def _decode(
     そのまま使い (学習の data.exact_measure_times と同じ)、その小節の数だけ生成する。小節の長さも、小節線の間の拍の数 x
     行ごとの 1 拍の 4 分音符の長さ (最初の小節の first_spq から) に決め、その長さの拍子だけを選ばせて MLEN は使わせない
     (拍の時刻の演奏 beat_input 用。拍の数の決まった小節を、途中から別の拍子や短い小節で書かないように)。
-    time_signatures (小節ごとの拍子、SheetSage2-Refined の小節の meter) を渡すと、その小節はその拍子に決める"""
+    time_signatures (小節ごとの拍子、SheetSage2-Refined の小節の meter) を渡すと、その小節はその拍子に決める。
+    on_measure(小節の番号, 小節の数の上限) は小節を生成し始めるたびに呼ぶ (進み具合。例外を投げれば止まる)"""
     device = memory.song.device
     decoder = model.decoder
     c = model.config
@@ -365,6 +404,8 @@ def _decode(
     for p in range(max_measures):
         if given_starts is not None and p >= len(given_starts):
             break
+        if on_measure is not None:
+            on_measure(p, len(given_starts) if given_starts is not None else max_measures)
         if not any(active):
             break
         for r in range(R):
@@ -556,23 +597,13 @@ def main() -> None:
         import json
 
         annotation = json.loads(Path(args.sheetsage).read_text(encoding="utf-8"))
-        chords = read_chord_markers(args.chords or args.beat_midi)
-        performance = beat_performance(args.beat_midi, annotation, chords)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            patches = transcribe_on_beats(
-                model, tokenizer, performance, temperature=args.temperature, top_p=args.top_p, banned=banned,
-                slur_bias=args.slur_bias,
-            )  # fmt: skip
+        measures = score_from_cover(
+            model, tokenizer, args.beat_midi, annotation, args.chords, banned=banned, temperature=args.temperature,
+            top_p=args.top_p, slur_bias=args.slur_bias,
+        )  # fmt: skip
         out = Path(args.out or Path(args.beat_midi).with_suffix(".musicxml"))
-        measures = tokenizer.decode(patches)[0]
-        tidied = tidy_score(measures)
-        print(tidied)
-        print(readable_staves(measures))
-        apply_bar_tempos(measures, performance, tidied.rests)
-        if performance.chords:
-            print(f"コード記号 {place_chords(measures, performance, performance.chords, tidied.rests)} 個")
         write_musicxml(measures, out)
-        print(f"{len(patches)} 小節 -> {out}")
+        print(f"{len(measures)} 小節 -> {out}")
     if args.midi:
         patches = run(read_performance(args.midi), args.max_measures)
         out = Path(args.out or Path(args.midi).with_suffix(".musicxml"))
