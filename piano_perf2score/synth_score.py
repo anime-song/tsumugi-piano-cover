@@ -33,9 +33,10 @@
       (山なり・上り・下り) か、盛り上がる区間の前に 1 つ
     - 旋律のスラーは 2 小節か、フレーズ全体 (2〜4 小節) にかける。駆け上がりにもスラー
     - フレーズの終わりの伸ばす和音と、左手の広げた和音にはときどきアルペジオ記号
-    - 拍子は 4/4 を中心に 3/4・6/8・12/8・2/4・2/2・5/4・7/8 など。8 分主体の曲の一部は Swing。5/8・7/8・5/4 は
-      曲ごとにまとまり (7/8 なら 2+2+3 など) を決め、旋律のリズム・伴奏の低音・分散和音の折り返し・タイの区切りを
-      まとまりに合わせ、まとまりの頭にときどきアクセントを付ける (連桁は書き出しが音の並びから同じまとまりを選ぶ)
+    - 拍子は 4/4 を中心に 3/4・6/8・12/8・2/4・2/2・5/4・7/8 など。8 分主体の曲の一部は Swing (区間ごとに決め、
+      ときどきまっすぐの区間を挟む)。5/8・7/8・5/4 は曲ごとにまとまり (7/8 なら 2+2+3 など) を決め、旋律の
+      リズム・伴奏の低音・分散和音の折り返し・タイの区切りをまとまりに合わせ、まとまりの頭にときどきアクセントを
+      付ける (連桁は書き出しが音の並びから同じまとまりを選ぶ)
     - 両手 (と同じ段の別の声部) で同じ鍵盤を同時に鳴らさない: 旋律の一番上の音と低音を残し、他の声部の同じ音を消す
 書き出す前に staves.readable_staves で 8va と音部記号を選び、綴りは調号に合わせ (tidy.spell_pitch_class)、半音で
 進む調の外の音は進む向きで綴る (tidy.chromatic_spelling)。
@@ -79,6 +80,7 @@ METERS = (
 MELODY_RANGE = (60, 84)  # 旋律の音域 (C4〜C6)
 # 右手の書き方ごとの旋律の音域。和音を下に付ける書き方は高めに置く (人の楽譜では和音つきの旋律は C5〜F5 あたり)
 MELODY_RANGES = {"plain": MELODY_RANGE, "chordal": (67, 88), "octave": (64, 86), "offbeat": (64, 86), "pulse": (67, 88)}
+SWING_SECTIONS = 0.75  # スイングの曲で、区間をスイングにする割合
 LOWEST_RIGHT = 55  # 右手の旋律の下に付ける和音の一番下 (G3。これより下は濁るので付けない)
 LH_PATTERNS = (
     "block", "oompah", "broken", "alberti", "octave", "pop8", "two_voice", "handoff", "bassline", "bassline", "wide", "wide",
@@ -972,8 +974,10 @@ def generate(rng: random.Random) -> Song:
         if rate == "slow":
             slots = [slots[k - k % 2] for k in range(len(slots))]
         bars, held, bass, runs, kime_bars = [], None, {}, [], set()
+        # スイングの曲でも、区間によってはまっすぐの 8 分 (イントロや間奏) にする
+        swing = "8th" if song.swing and rng.random() < SWING_SECTIONS else "none"
         for i in range(count):
-            measure = Measure(song.meter, song.key, ("G2", "F4"), song.bar, swing="8th" if song.swing else "none")
+            measure = Measure(song.meter, song.key, ("G2", "F4"), song.bar, swing=swing)
             half = song.bar / per_bar
             spans = [(half * j, half, slots[i * per_bar + j], slots[i * per_bar + j + 1]) for j in range(per_bar)]
 

@@ -23,9 +23,11 @@ V2 の拍は SheetSage2-Refined の拍なので、楽譜の拍と階層が違う
 窓で長さの列を消す。生成では長さを消して入れる (generate.transcribe_on_beats)。
 
 スイングの曲のカバーは、8 分の裏が 7〜9 刻みの間で曲の中でも揺れる。学習の楽譜のスイングの曲 (2%) だけでは足りないので、
-8 分主体の楽譜の窓 (straight_eighths) を swing_prob の割合でスイングの楽譜に書き換える (全小節を Swing にして
-トークンも作り直す)。描き出し (COVER_RENDER) はスイングの比を拍ごとに揺らすので、入力は揺れたスイング、正解は
-「まっすぐの 8 分 + Swing の指定」になる。
+8 分主体の楽譜の窓 (straight_eighths) を swing_prob の割合でスイングの楽譜に書き換える (Swing にしてトークンも
+作り直す)。描き出し (COVER_RENDER) はスイングの比を拍ごとに揺らすので、入力は揺れたスイング、正解は
+「まっすぐの 8 分 + Swing の指定」になる。書き換える窓の SWING_PART_PROB は、窓の前か後ろの続いた小節だけを
+Swing にする。カバーは曲の途中からスイングになることがあり (JAM GEM JUMP! はイントロがまっすぐ)、窓の全体だけを
+書き換えると、曲の頭がまっすぐなら最後までスイングを書かないモデルになる。
 
     python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth     # beat_songs.npz を作る
     python -m piano_perf2score.beat_input --cache-dir data/piano_score/synth --rich   # 記号の丁寧な曲 (beat_songs_rich.npz)
@@ -66,6 +68,7 @@ MELODY_DROP_SONG = 0.3
 MELODY_DROP_NOTE = 0.1
 OFF_GRID_LIMIT = 0.03  # straight_eighths: 拍の頭と 8 分の裏以外の位置の音の割合の上限
 MIN_OFFBEATS = 0.1  # straight_eighths: 8 分の裏の音の割合の下限 (スイングして変わる音があること)
+SWING_PART_PROB = 0.5  # スイングに書き換える窓のうち、前か後ろの続いた小節だけを書き換える割合
 
 
 def on_beats(
@@ -275,8 +278,13 @@ class BeatSynthWindowDataset(SynthWindowDataset):
         )  # fmt: skip
 
     def _swing(self, measures: list[Measure], bodies: list[np.ndarray]) -> list[np.ndarray]:
-        """窓の全小節を 8 分のスイングにし (measures をその場で書き換え)、小節のトークン列 (MTIME なし) を作り直す"""
-        for m in measures:
+        """窓の小節を 8 分のスイングにし (measures をその場で書き換え)、小節のトークン列 (MTIME なし) を作り直す。
+        SWING_PART_PROB の窓は、ランダムな小節線より後ろ (か前) だけをスイングにする"""
+        lo, hi = 0, len(measures)
+        if len(measures) >= 4 and random.random() < SWING_PART_PROB:
+            cut = random.randint(1, len(measures) - 1)
+            lo, hi = (cut, hi) if random.random() < 0.5 else (0, cut)
+        for m in measures[lo:hi]:
             m.swing = "8th"
         return [
             np.asarray(self.tokenizer.encode_measure(m, 0, bool(b[-1] == EOS))[1:], dtype=b.dtype)
