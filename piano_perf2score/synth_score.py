@@ -22,7 +22,11 @@
       3 連符の分散和音、左手の対旋律 (低いオクターブを伸ばし、上の声部で 8 分休符から入る旋律をスラーで)
     - 右手の 8 分で刻む和音 (旋律の音を一番上に下に 3 音。スタッカート / スラー + スタッカート / テヌート、
       裏からときどき拍をまたいでタイ)、旋律の前打音 (斜線の装飾音)
-    - フレーズの終わりの両手のキメ (同じリズムのアクセントの和音、区間ごとに同じリズム)。駆け上がりは右手の 1 本の
+    - 手の割り振りは音域ではなく、どちらの手が弾けるかで決める: 左手が低いオクターブ (根音 G1〜F#2) だけを弾く区間は、
+      右手が旋律の下の和音を D3 あたりまで受け持ち (旋律も中央の C の下まで下がってよい)、左手が根音と 7 度を弾く
+      区間は、右手が旋律の下に 3 度・9 度・5 度を持つ
+    - フレーズの終わりの両手のキメ (同じリズムのアクセントの和音か、1 打目のあと右手の密集した和音と左手の低い
+      オクターブが交互に打つ形。区間ごとに同じリズム)。駆け上がりは右手の 1 本の
       ほか、3 度・6 度の重ね、左手から右手への手渡し、左手が 10 度下で並ぶ形 (その間の左手の伴奏は消す)
     - 声部の切り替わり: 内声を出し入れする頻度を曲ごとに変える
 書き方の決まり (人が書くならこう書く):
@@ -81,13 +85,16 @@ MELODY_RANGE = (60, 84)  # 旋律の音域 (C4〜C6)
 MELODY_RANGES = {"plain": MELODY_RANGE, "chordal": (67, 88), "octave": (64, 86), "offbeat": (64, 86), "pulse": (67, 88)}
 SWING_SECTIONS = 0.75  # スイングの曲で、区間をスイングにする割合
 LOWEST_RIGHT = 55  # 右手の旋律の下に付ける和音の一番下 (G3。これより下は濁るので付けない)
+# 左手が低音域だけを弾く伴奏型 (低いオクターブ) では、右手が旋律の下の和音をここ (D3) まで受け持つ
+RIGHT_FLOOR = 50
+LOW_OCTAVE_ROOT = 31  # 低いオクターブの根音の一番下 (G1。根音は G1〜F#2、上の音は G2〜F#3)
 LH_PATTERNS = (
     "block", "oompah", "broken", "alberti", "octave", "pop8", "two_voice", "handoff", "bassline", "bassline", "wide", "wide",
-    "pairs", "waltz", "held_two", "push", "triplet", "counter",
+    "pairs", "waltz", "held_two", "push", "triplet", "counter", "low_octave", "low_octave", "shell",
 )  # fmt: skip
 # コードの変わり目でペダルを踏み替える伴奏型
 PEDAL_PATTERNS = ("block", "broken", "alberti", "two_voice", "handoff", "octave", "wide", "pairs", "waltz", "held_two",
-                  "push", "triplet", "counter")  # fmt: skip
+                  "push", "triplet", "counter", "low_octave", "shell")  # fmt: skip
 # 左手の上の声部で歌う伴奏型 (右手の旋律は高めに置き、右手の内声は入れない)
 UPPER_LEFT = ("held_two", "counter")
 # 右手の書き方: 旋律 (拍の頭にときどき和音) / 和音つきの旋律 / オクターブ / 旋律 + 下の声部の裏拍の和音 /
@@ -289,15 +296,19 @@ def voicing(pcs: list[int], low: int, size: int) -> list[int]:
     return notes
 
 
-def color_voicing(pcs: list[int], top: int, size: int) -> list[int]:
-    """top より下に置く右手の和音 (size 音、1 オクターブ以内)。7 度・9 度があれば 3 度・7 度・9 度、なければ 3 度・5 度・根音"""
-    order = (
-        [pcs[1], pcs[3], pcs[4]]
-        if len(pcs) >= 5
-        else [pcs[1], pcs[3], pcs[2]]
-        if len(pcs) == 4
-        else [pcs[1], pcs[2], pcs[0]]
-    )
+def color_voicing(pcs: list[int], top: int, size: int, without_seventh: bool = False) -> list[int]:
+    """top より下に置く右手の和音 (size 音、1 オクターブ以内)。7 度・9 度があれば 3 度・7 度・9 度、なければ 3 度・5 度・根音。
+    without_seventh (左手が根音と 7 度を弾くとき) なら 3 度・9 度 (なければ 5 度)・5 度"""
+    if without_seventh:
+        order = [pcs[1], pcs[4] if len(pcs) >= 5 else pcs[2], pcs[2]]
+    else:
+        order = (
+            [pcs[1], pcs[3], pcs[4]]
+            if len(pcs) >= 5
+            else [pcs[1], pcs[3], pcs[2]]
+            if len(pcs) == 4
+            else [pcs[1], pcs[2], pcs[0]]
+        )
     notes = []
     for pc in order[:size]:
         pitch = top - 1
@@ -306,6 +317,30 @@ def color_voicing(pcs: list[int], top: int, size: int) -> list[int]:
         notes.append(pitch)
     notes = [p for p in notes if top - p <= 12]
     return sorted(notes)
+
+
+def low_octave(pcs: list[int]) -> list[int]:
+    """低いオクターブの低音 (根音 G1〜F#2 とその 1 オクターブ上)"""
+    low = LOW_OCTAVE_ROOT + (pcs[0] - LOW_OCTAVE_ROOT) % 12
+    return [low, low + 12]
+
+
+def shell(pcs: list[int]) -> list[int]:
+    """左手の根音と 7 度 (7 度がなければ 10 度)。根音は C2〜B2"""
+    root = 36 + (pcs[0] - 36) % 12
+    if len(pcs) > 3:
+        return [root, next(p for p in range(root + 9, root + 12) if p % 12 == pcs[3])]
+    return [root, next(p for p in range(root + 13, root + 25) if p % 12 == pcs[1])]
+
+
+def right_floor(pattern: str, pcs: list[int]) -> int:
+    """右手の旋律の下に置く和音の一番下。左手が低音域だけを弾く伴奏型では RIGHT_FLOOR (D3) まで下げ、左手が根音と
+    7 度を弾くときはその上から。どちらも左手の一番上の音より上に置く"""
+    if pattern == "low_octave":
+        return max(RIGHT_FLOOR, low_octave(pcs)[1] + 3)
+    if pattern == "shell":
+        return shell(pcs)[1] + 1
+    return LOWEST_RIGHT
 
 
 # ----------------------------------------------------------------------
@@ -511,14 +546,28 @@ def kime_rhythm(song: Song, rng: random.Random) -> list[tuple[Fraction, Fraction
     return hits
 
 
-def place_kime(song: Song, rhythm, pitches, chords, measure: Measure) -> None:
-    """両手のキメ: 右手は旋律の音の下に 2 音の和音、左手は根音のオクターブを、同じリズムでアクセントを付けて弾く"""
-    for (onset, length), top in zip(rhythm, pitches):
+def place_kime(song: Song, rhythm, pitches, chords, measure: Measure, alternate: bool = False) -> None:
+    """両手のキメ: 右手は旋律の音の下に 2 音の和音、左手は根音のオクターブを、同じリズムでアクセントを付けて弾く。
+    alternate なら、1 打目は両手 (右手は旋律の和音、左手は低いオクターブ) で、そのあとは右手の密集した和音
+    (D#3 あたりから、コードの音を 1 オクターブの中に 4〜5 音) と左手の低いオクターブが交互に打つ。
+    伸ばす響きはペダルに任せ、どの音も打つ長さで書く"""
+    for k, ((onset, length), top) in enumerate(zip(rhythm, pitches)):
         pcs = chords(onset)
-        right = [top, *(p for p in color_voicing(pcs, top, 2) if p >= LOWEST_RIGHT)]
-        root = 36 + (pcs[0] - 36) % 12
-        measure.groups.extend(_groups(onset, length, right, 1, 1, song, ("accent",)))
-        measure.groups.extend(_groups(onset, length, [root, root + 12], 2, 1, song, ("accent",)))
+        if not alternate:
+            right = [top, *(p for p in color_voicing(pcs, top, 2) if p >= LOWEST_RIGHT)]
+            root = 36 + (pcs[0] - 36) % 12
+            measure.groups.extend(_groups(onset, length, right, 1, 1, song, ("accent",)))
+            measure.groups.extend(_groups(onset, length, [root, root + 12], 2, 1, song, ("accent",)))
+            continue
+        if k == 0 or k % 2 == 1:
+            if k == 0:
+                right = [top, *(p for p in color_voicing(pcs, top, 2) if p >= LOWEST_RIGHT)]
+            else:
+                low = max(RIGHT_FLOOR + 1, low_octave(pcs)[1] + 3)
+                right = sorted(p for p in range(low, low + 12) if p % 12 in pcs)[:5]
+            measure.groups.extend(_groups(onset, length, right, 1, 1, song, ("accent",)))
+        if k % 2 == 0:
+            measure.groups.extend(_groups(onset, length, low_octave(pcs), 2, 1, song, ("accent",)))
 
 
 # ----------------------------------------------------------------------
@@ -739,6 +788,26 @@ def left_hand(
                 if len(placed) >= 2:
                     placed[0].slur_start += 1
                     placed[-1].slur_stop += 1
+        elif pattern in ("low_octave", "shell"):
+            # 低いオクターブ (右手が旋律の下の和音を D3 あたりまで受け持つ) / 根音と 7 度 (3 度・5 度・9 度は右手)
+            notes = low_octave(pcs) if pattern == "low_octave" else shell(pcs)
+            style = bass.setdefault(
+                "style", rng.choice(("long", "pop", "eighths") if pattern == "low_octave" else ("long", "pop"))
+            )
+            if style == "eighths":
+                hits = [F(k, 2) for k in range(int(bar * 2))]
+            elif style == "pop":
+                hits = {F(4): [F(0), F(3, 2), F(2), F(7, 2)], F(2): [F(0), F(3, 2)]}.get(bar, [F(0)])
+            else:
+                hits = [F(0)]
+            for k, t in enumerate(hits):
+                end = hits[k + 1] if k + 1 < len(hits) else bar
+                put(
+                    t,
+                    end - t if style != "eighths" else F(1, 2),
+                    notes,
+                    articulations=staccato if style == "eighths" else (),
+                )
         elif pattern == "two_voice":
             put(F(0), bar, [root])
             beat = song.beat
@@ -760,15 +829,18 @@ def right_hand(
     texture: str,
     rolled: bool = False,
     pulse_style: str = "plain",
+    floor: int = LOWEST_RIGHT,
+    without_seventh: bool = False,
 ) -> None:
     """旋律 (上の段の声部 1)。texture: plain (拍の頭にときどき和音) / chordal (音ごとに下に 2 音の和音) /
     octave (オクターブで重ねる) / offbeat (旋律だけ。下の声部で裏拍の和音を刻む) / pulse (旋律の音を一番上にした
     和音を 8 分で刻む)。rolled ならフレーズの終わりの伸ばす音に 3 音の和音を付けてアルペジオ記号を付ける。
-    旋律の音には song.graces の割合で前打音を付ける"""
+    旋律の音には song.graces の割合で前打音を付ける。floor は旋律の下に付ける和音の一番下 (right_floor)、
+    without_seventh は左手が根音と 7 度を弾くとき (和音つきの旋律の和音から 7 度を外す)"""
     for (onset, length), pitch in zip(rhythm, pitches):
         notes = [pitch]
         if texture == "pulse" and not rolled and length >= F(1, 2):  # 駆け上がりなどの短い音は 1 音で
-            pulse_chords(song, onset, length, pitch, chords, rng, measure, pulse_style)
+            pulse_chords(song, onset, length, pitch, chords, rng, measure, pulse_style, floor)
             continue
         if not rolled and length >= F(1, 2) and rng.random() < song.graces:
             measure.groups.append(grace_note(song, pitch, onset, rng))
@@ -779,7 +851,7 @@ def right_hand(
         if texture == "octave":
             notes.append(pitch - 12)
         elif texture == "chordal" and length >= F(1, 2):
-            notes += [p for p in color_voicing(chords(onset), pitch, 2) if p >= LOWEST_RIGHT]
+            notes += [p for p in color_voicing(chords(onset), pitch, 2, without_seventh) if p >= floor]
         elif texture == "plain" and onset in song.pulse_starts and rng.random() < 0.35:
             below = [p for p in range(pitch - 9, pitch) if p % 12 in chords(onset)[:3]]
             notes += below[-rng.choice((1, 2)) :] if below else []
@@ -815,7 +887,17 @@ def grace_note(song: Song, pitch: int, onset: Fraction, rng: random.Random) -> G
     return Group(onset, 1, 1, Duration("eighth", 0, None, "slash"), [Note(grace, alter)])
 
 
-def pulse_chords(song: Song, onset, length, pitch, chords, rng: random.Random, measure: Measure, style: str) -> None:
+def pulse_chords(
+    song: Song,
+    onset,
+    length,
+    pitch,
+    chords,
+    rng: random.Random,
+    measure: Measure,
+    style: str,
+    floor: int = LOWEST_RIGHT,
+) -> None:
     """旋律の音 (onset から length) を一番上にした和音 (下に 3 和音の音を 3 つまで) を 8 分で刻む。裏の 8 分からときどき次の拍へ伸ばす
     (シンコペーション、拍をまたぐ所はタイ)。style: staccato / portato (旋律の音ごとにスラー + スタッカート) / tenuto / plain"""
     articulations = {"staccato": ("staccato",), "portato": ("staccato",), "tenuto": ("tenuto",)}.get(style, ())
@@ -824,7 +906,7 @@ def pulse_chords(song: Song, onset, length, pitch, chords, rng: random.Random, m
         piece = min(F(1, 2), end - t)
         if t % 1 == F(1, 2) and end - t >= 1 and rng.random() < 0.15:
             piece = F(1)
-        below = [p for p in range(pitch - 12, pitch - 2) if p % 12 in chords(t)[:3] and p >= LOWEST_RIGHT]
+        below = [p for p in range(pitch - 12, pitch - 2) if p % 12 in chords(t)[:3] and p >= floor]
         notes = [pitch, *below[-3:]]  # 3 和音を閉じて (2 度を作らない)
         placed += _groups(t, piece, notes, 1, 1, song, articulations if piece <= F(1, 2) else ())
         t += piece
@@ -834,16 +916,18 @@ def pulse_chords(song: Song, onset, length, pitch, chords, rng: random.Random, m
     measure.groups.extend(placed)
 
 
-def offbeat_chords(song: Song, chords, melody_low: int, measure: Measure, rng: random.Random) -> None:
+def offbeat_chords(
+    song: Song, chords, melody_low: int, measure: Measure, rng: random.Random, floor: int = LOWEST_RIGHT
+) -> None:
     """上の段の下の声部 (声部 2) で裏拍の和音を刻む: 4 分の拍は 8 分休符 + 8 分の和音、付点 4 分の拍は裏の 8 分 2 つ"""
     top = min(melody_low, 72)
-    if top <= 62:
+    if top <= floor + 7:
         return
     staccato = ("staccato",) * (rng.random() < 0.4)
     for start, length in song.pulses:
         offsets = {F(1): [F(1, 2)], F(3, 2): [F(1, 2), F(1)]}.get(length, [])
         for offset in offsets:
-            notes = [p for p in color_voicing(chords(start + offset), top, rng.choice((2, 3))) if p >= LOWEST_RIGHT]
+            notes = [p for p in color_voicing(chords(start + offset), top, rng.choice((2, 3))) if p >= floor]
             if notes:
                 measure.groups.extend(_groups(start + offset, F(1, 2), notes, 1, 2, song, staccato))
 
@@ -950,11 +1034,18 @@ def generate(rng: random.Random) -> Song:
             pattern = "broken"  # 3 連符の分散和音は 4 分の拍の拍子だけ
         level = rng.choice(DYNAMIC_LEVELS[1:5])
         texture = rng.choice(TEXTURES) if label != "A" or rng.random() < 0.6 else "plain"
+        if pattern == "low_octave" and texture in ("plain", "octave"):
+            texture = rng.choice(("chordal", "offbeat", "pulse"))  # 左手は低音だけなので、和音は右手が持つ
+        elif pattern == "shell":
+            texture = "chordal"
         bounds = MELODY_RANGES[texture]
+        if pattern == "low_octave":
+            bounds = (57, bounds[1])  # 旋律が中央の C の下まで下がっても、右手が和音ごと受け持つ
         if pattern in UPPER_LEFT:
             bounds = (max(bounds[0], 69), max(bounds[1], 88))  # 左手の上の声部の上で歌う
         pulse_style = rng.choice(PULSE_STYLES)
         kime = kime_rhythm(song, rng)  # 区間のキメは同じリズム
+        kime_alternate = rng.random() < 0.5  # 両手が同じリズムで打つか、左右が交互に打つか
         while scale_pitch(song, melody_state[0]) < bounds[0]:  # 区間の音域へオクターブで移る
             melody_state[0] += 7
         while scale_pitch(song, melody_state[0]) > bounds[1]:
@@ -982,6 +1073,8 @@ def generate(rng: random.Random) -> Song:
 
             def chords(t, spans=spans):
                 return next(pcs for start, length, pcs, _ in spans if start <= t < start + length)
+
+            floor = max(right_floor(pattern, pcs) for _, _, pcs, _ in spans)
 
             phrase_end = i % phrase == phrase - 1
             kime_bar = phrase_end and pattern != "handoff" and rng.random() < song.hits  # 両手のキメで締める
@@ -1013,13 +1106,15 @@ def generate(rng: random.Random) -> Song:
             handoff = phrase_end and pattern == "handoff"  # フレーズの終わりは旋律を休み、分散和音を右手へ渡す
             held_next = None
             if kime_bar:
-                place_kime(song, rhythm, pitches, chords, measure)
+                place_kime(song, rhythm, pitches, chords, measure, kime_alternate)
                 kime_bars.add(id(measure))
             elif not handoff:
                 rolled = phrase_end and run_start is None and rng.random() < song.rolled
-                right_hand(song, rhythm, pitches, chords, rng, measure, texture, rolled, pulse_style)
+                right_hand(
+                    song, rhythm, pitches, chords, rng, measure, texture, rolled, pulse_style, floor, pattern == "shell"
+                )
                 if texture == "offbeat" and not phrase_end:
-                    offbeat_chords(song, chords, min(pitches), measure, rng)
+                    offbeat_chords(song, chords, min(pitches), measure, rng, floor)
                 elif (
                     texture == "plain"
                     and per_bar == 1
@@ -1042,6 +1137,8 @@ def generate(rng: random.Random) -> Song:
                 bass.pop("pushed", None)  # 先取りや伸ばした低音のタイはキメの小節でつながない
                 bass.pop("held", None)
                 measure.directions.append((F(0), "pedal_stop"))
+                if kime_alternate:
+                    measure.directions.append((F(0), "pedal_start"))  # 交互に打つキメは響きをペダルで残す
             else:
                 pedal_points = left_hand(song, pattern, spans, rng, measure, handoff, bass, ceiling)
                 if pattern in PEDAL_PATTERNS and rng.random() < 0.9:
