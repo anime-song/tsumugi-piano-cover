@@ -163,6 +163,7 @@ def transcribe(
 # 8 分を選びやすい (2/4 で 32 分音符を書く) ので、4 分を基本にし、他の値は 1 拍あたり SEARCH_MARGIN 以上よいときだけ選ぶ
 SEARCH_BEAT_QUARTERS = (1.0, 1.5, 2.0, 0.5)
 SEARCH_MARGIN = 0.5
+BAR_MATCH_SECONDS = 0.1  # 格子の小節の頭と注釈の小節 (bars) の頭を同じとみなすずれ
 
 
 @torch.no_grad()
@@ -180,8 +181,9 @@ def transcribe_on_beats(
     slur_bias: float = 0.0,
 ) -> list[list[int]]:
     """拍の時刻の演奏 (beat_input.on_beats、measure_starts に小節線) から楽譜を生成する。小節の開始は与えたものを使い、
-    MTIME はそこから決める。最初の小節の 4 分音符の長さは、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭
-    search_measures 小節を生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ。
+    MTIME はそこから決める。拍子は performance.meters (SheetSage2-Refined の小節の拍子) があればそれに決め、1 拍は
+    その拍子の分母の音符にする。なければ、1 拍が SEARCH_BEAT_QUARTERS のどれかとして冒頭 search_measures 小節を
+    生成し、1 拍あたりの対数尤度がいちばん高いものを選ぶ (スラーの足し値は掛けずに比べる)。
     drop_durations なら音の長さを消して入れる (カバーの短い打鍵をそのまま音価にしない)"""
     device = next(model.parameters()).device
     batch = performance_batch(performance, vocab=model.vocab, drop_durations=drop_durations)
@@ -194,13 +196,17 @@ def transcribe_on_beats(
     beat_frames = BEAT_SECONDS * FRAMES_PER_SECOND
     bar_beats = np.median(np.diff(starts)) / beat_frames if len(starts) > 1 else 4.0
     quarters = [q for q in SEARCH_BEAT_QUARTERS if (q != 0.5 or bar_beats >= 6) and (q != 2.0 or bar_beats <= 2)]
+    meters = list(performance.meters) if len(performance.meters) == len(starts) else []
+    if meters and meters[0] is not None:
+        quarters = [4 / meters[0][1]]
+        common["time_signatures"] = meters
     spq = [beat_frames / q for q in quarters]
     best = 0
-    if len(starts) > 1:
+    if len(starts) > 1 and len(spq) > 1:
         stop = float(starts[min(search_measures, len(starts) - 1)])
         _, logprob, covered = _decode(
             model, tokenizer, first_spq=spq, max_measures=len(starts), stop_frame=stop, temperature=0.0, top_p=1.0,
-            given_starts=starts, **common,
+            given_starts=starts, **(common | {"slur_bias": 0.0}),
         )  # fmt: skip
         per_beat = np.array([lp / max(cv, 1.0) for lp, cv in zip(logprob, covered)]) * beat_frames
         per_beat[1:] -= SEARCH_MARGIN
@@ -216,7 +222,8 @@ def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[floa
     """拍の上で作った演奏の MIDI (V2 のカバー) と、その拍 (SheetSage2-Refined の注釈) から、拍の時刻の演奏を作る。
     小節は注釈の小節の頭で区切り、音のある小節だけを残す。注釈のメロディから、メロディの印も付ける。
     chords (原曲の秒のコード、chords.read_chord_markers) を渡すと、拍の時刻にして performance.chords に入れる。
-    残した小節の本当の小節線の秒 (と最後の小節の終わり) を performance.bar_seconds に入れる (楽譜のテンポ用)"""
+    残した小節の本当の小節線の秒 (と最後の小節の終わり) を performance.bar_seconds に、注釈の小節の拍子
+    ((拍の数, 拍の音符)) を performance.meters に入れる"""
     from piano_ar.beat_tokenizer import BeatGrid, BeatTokenizer
     from piano_ar.config import TokenizerConfig
     from piano_ar.tokenizer import PianoTokenizer
@@ -234,6 +241,14 @@ def beat_performance(midi: str | Path, annotation: dict, chords: list[tuple[floa
     performance.melody = melody_from_annotation(performance, annotation, grid, origin)
     kept = np.flatnonzero(keep)
     performance.bar_seconds = np.append(bar_frames[kept], bar_frames[kept[-1] + 1]) / fr if len(kept) else np.zeros(0)
+    bars = annotation.get("bars") or []
+    if bars:
+        bar_starts = np.array([float(b["start"]) for b in bars])
+        nearest = [int(np.argmin(np.abs(bar_starts - t))) for t in bar_frames[kept] / fr]
+        performance.meters = [
+            (int(bars[i]["beats"]), int(bars[i]["unit"])) if abs(bar_starts[i] - t) < BAR_MATCH_SECONDS else None
+            for i, t in zip(nearest, bar_frames[kept] / fr)
+        ]
     if chords:
         times = grid.beat_position(np.array([t for t, _ in chords]) * fr) * BEAT_SECONDS - origin
         performance.chords = [(float(t), text) for t, (_, text) in zip(times, chords)]
@@ -293,6 +308,7 @@ def _decode(
     banned: torch.Tensor | None,
     given_starts: np.ndarray | None = None,
     slur_bias: float = 0.0,
+    time_signatures: list[tuple[int, int] | None] | None = None,
 ) -> tuple[list[list[list[int]]], list[float], list[float]]:
     """小節を 1 つずつ生成する。first_spq の数だけの行 (曲の最初の小節の 4 分音符の長さだけが違う) を、バッチとして同時に
     進める。Local は 1 トークンずつ KV cache で計算し、演奏の行の k / v は小節ごとに作り置く。文法は行ごとに CPU で確かめる。
@@ -301,7 +317,8 @@ def _decode(
     given_starts (各小節の開始のフレーム) を渡すと、MTIME はそこから決めて (予測させず)、小節の開始と基準の時刻もその値を
     そのまま使い (学習の data.exact_measure_times と同じ)、その小節の数だけ生成する。小節の長さも、小節線の間の拍の数 x
     行ごとの 1 拍の 4 分音符の長さ (最初の小節の first_spq から) に決め、その長さの拍子だけを選ばせて MLEN は使わせない
-    (拍の時刻の演奏 beat_input 用。拍の数の決まった小節を、途中から別の拍子や短い小節で書かないように)"""
+    (拍の時刻の演奏 beat_input 用。拍の数の決まった小節を、途中から別の拍子や短い小節で書かないように)。
+    time_signatures (小節ごとの拍子、SheetSage2-Refined の小節の meter) を渡すと、その小節はその拍子に決める"""
     device = memory.song.device
     decoder = model.decoder
     c = model.config
@@ -338,6 +355,11 @@ def _decode(
         measure_quarters = [[b * beat_frames / spq for spq in first_spq] if b > 0 else None for b in beats]
     ts_ids = np.array([i for (kind, _), i in tokenizer.ids.items() if kind == "ts"])
     ts_quarters = np.array([4 * tokenizer.values[i][0] / tokenizer.values[i][1] for i in ts_ids])
+    given_ts = [None] * max_measures  # 小節ごとに決めた拍子のトークン
+    for p, ts in enumerate((time_signatures or [])[:max_measures]):
+        if ts is not None and ("ts", tuple(ts)) in tokenizer.ids:
+            given_ts[p] = tokenizer.ids[("ts", tuple(ts))]
+            measure_quarters[p] = [4 * ts[0] / ts[1]] * R
     total_logprob = [0.0] * R
     covered = [0.0] * R
     for p in range(max_measures):
@@ -408,6 +430,8 @@ def _decode(
             if measure_quarters is not None and measure_quarters[p] is not None:
                 for r, g in enumerate(grammars):
                     fitting = ts_ids[np.abs(ts_quarters - measure_quarters[p][r]) < 1e-6]
+                    if given_ts[p] is not None and masks[r][given_ts[p]]:
+                        fitting = np.array([given_ts[p]])
                     if g.stage == "ts" and masks[r][fitting].any():
                         keep = torch.zeros_like(masks[r])
                         keep[fitting] = masks[r][fitting]
