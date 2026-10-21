@@ -1149,10 +1149,6 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
                 _clef_element(attributes, staff, measure.clefs[staff - 1])
         clefs = list(measure.clefs)
 
-        for position, tempo in measure.tempos:
-            if position == 0:
-                _sub(element, "sound", tempo=f"{tempo:g}")
-
         accidentals = _accidentals(measure, tie_stops, mi)
         voices_per_staff = Counter(s for (s, _), v in voices.items() if any(i.group for i in v))
         cursor = 0
@@ -1169,7 +1165,8 @@ def write_musicxml(measures: list[Measure], path: str | Path, title: str | None 
 
         # 指示 (強弱・松葉・ペダル・音部記号とオクターブ記号の変更・テンポ) は backup / forward で位置を合わせて書く。
         # オクターブ記号は状態で持っているので、次の小節の頭で状態が変わるときはこの小節の終わりで止める
-        extra = [(p, name) for p, name in measure.directions] + [(p, t) for p, t in measure.tempos if p > 0]
+        # 再生のテンポは同じ位置のメトロノーム記号 (丸めた値の <sound>) より後に書き、正確な値を効かせる
+        extra = [(p, name) for p, name in measure.directions] + [(p, float(t)) for p, t in measure.tempos]
         extra += [(Fraction(0), f"ottava{s + 1}_{name}") for s, name in enumerate(measure.ottavas)]
         extra.append((Fraction(0), f"swing_{measure.swing}"))
         if mi + 1 < len(measures):
